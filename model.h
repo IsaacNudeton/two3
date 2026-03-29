@@ -208,6 +208,14 @@ static void moe_expert_forward_real(
     ternary_project_cpu(&expert->gate, x, gate, dim);
     ternary_project_cpu(&expert->up, x, up, dim);
 
+    /* Scale BEFORE squared ReLU — critical: squaring amplifies magnitude.
+     * Same pattern as Layer 1 integration test. */
+    float scale = 1.0f / sqrtf((float)dim);
+    for (int i = 0; i < intermediate; i++) {
+        gate[i] *= scale;
+        up[i] *= scale;
+    }
+
     /* Squared ReLU on gate */
     squared_relu_cpu(gate, gate, intermediate);
 
@@ -483,10 +491,14 @@ static void model_forward_sequence_cpu(
             causal_attention_cpu(q_buf, k_store, v_store, attn_out,
                                  t, NH, NKV, HD);
 
-            /* 6. Output projection — ternary */
+            /* 6. Output projection — ternary + scale */
             ternary_project_cpu(&ly->W_o, attn_out, o_proj, D);
+            {
+                float s = 1.0f / sqrtf((float)D);
+                for (int i = 0; i < D; i++) o_proj[i] *= s;
+            }
 
-            /* 7. Residual add (dequant already happened in ternary_project) */
+            /* 7. Residual add */
             for (int i = 0; i < D; i++)
                 h[i] += o_proj[i];
 
@@ -500,9 +512,12 @@ static void model_forward_sequence_cpu(
             moe_route(&ly->moe.router, normed, &sel);
             moe_forward_real(&ly->moe, normed, moe_out, &sel);
 
-            /* 10. Residual add */
-            for (int i = 0; i < D; i++)
-                h[i] += moe_out[i];
+            /* 10. Scale + Residual add */
+            {
+                float s = 1.0f / sqrtf((float)D);
+                for (int i = 0; i < D; i++)
+                    h[i] += moe_out[i] * s;
+            }
         }
 
         free(k_store);
