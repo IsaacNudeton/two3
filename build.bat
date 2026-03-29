@@ -31,11 +31,15 @@ echo [5/6] Building test_moe...
 nvcc %FLAGS% %ARCH% -o test_moe.exe test_moe.cu two3.cu
 if %ERRORLEVEL% neq 0 (echo FAILED: test_moe & exit /b 1)
 
-echo [6/6] Building test_model...
+echo [6/7] Building test_model...
 nvcc %FLAGS% %ARCH% -o test_model.exe test_model.cu two3.cu
 if %ERRORLEVEL% neq 0 (echo FAILED: test_model & exit /b 1)
 
+echo [7/7] Building test_train...
+nvcc %FLAGS% %ARCH% -o test_train.exe test_train.cu two3.cu
+if %ERRORLEVEL% neq 0 (echo FAILED: test_train & exit /b 1)
+
 echo.
-echo BUILD OK — all 6 targets
+echo BUILD OK — all 7 targets
 echo.
-echo Run: test_model.exe (Layer 2 verification)
+echo Run: test_train.exe (Layer 4 — training with STE)

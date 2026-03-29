@@ -512,12 +512,11 @@ static void model_forward_sequence_cpu(
             moe_route(&ly->moe.router, normed, &sel);
             moe_forward_real(&ly->moe, normed, moe_out, &sel);
 
-            /* 10. Scale + Residual add */
-            {
-                float s = 1.0f / sqrtf((float)D);
-                for (int i = 0; i < D; i++)
-                    h[i] += moe_out[i] * s;
-            }
+            /* 10. Residual add (no extra scaling — internal 1/sqrt(dim)
+             * before squared ReLU is sufficient. External scaling here
+             * would compound to 1/dim, killing FFN gradients.) */
+            for (int i = 0; i < D; i++)
+                h[i] += moe_out[i];
         }
 
         free(k_store);
