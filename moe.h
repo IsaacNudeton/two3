@@ -133,33 +133,6 @@ static void moe_route(
  * ═══════════════════════════════════════════════════════ */
 
 /* CPU reference only — GPU would run two experts in parallel */
-static void moe_forward_cpu_ref(
-    const MoELayer *moe,
-    const float *x,          /* [dim] input */
-    float *output,           /* [dim] output */
-    const MoESelection *sel
-) {
-    int D = moe->dim;
-
-    /* Zero output */
-    for (int i = 0; i < D; i++)
-        output[i] = 0;
-
-    /* For each selected expert, accumulate weighted output */
-    for (int k = 0; k < MOE_TOP_K; k++) {
-        int eid = sel->expert_ids[k];
-        float w = sel->expert_weights[k];
-
-        /* In real GPU path: ternary matmul for gate, up, down.
-         * For CPU reference: simulate with the scale factor.
-         * Output ≈ x * scale * ternary_pattern */
-
-        /* Simulated expert output (just weighted input for testing) */
-        for (int i = 0; i < D; i++)
-            output[i] += w * x[i] * (0.5f + 0.1f * eid);
-    }
-}
-
 /* ═══════════════════════════════════════════════════════
  * Init / Free
  * ═══════════════════════════════════════════════════════ */

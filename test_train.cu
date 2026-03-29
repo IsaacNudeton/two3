@@ -130,8 +130,8 @@ static int test_loss_decreases(void) {
     printf("  first_loss=%.4f  last_loss=%.4f  ratio=%.3f\n",
            first_loss, last_loss, last_loss / first_loss);
 
-    int pass = (last_loss < first_loss);
-    printf("  loss decreased: %s\n", pass ? "YES" : "NO");
+    int pass = (last_loss < 0.9f * first_loss);
+    printf("  loss decreased 10%%+: %s\n", pass ? "YES" : "NO");
     printf("  result: %s\n\n", pass ? "PASS" : "FAIL");
 
     trainable_model_free(&tm);

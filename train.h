@@ -1259,6 +1259,14 @@ static TrainResult trainable_forward_backward(
 
         free(d_attn_out_all);
 
+        /* Phase 2.5: Inverse RoPE on dQ and dK per position.
+         * Attention backward returns gradients in the rotated space.
+         * Must undo rotation before gradients flow into W_q/W_k backward. */
+        for (int t = 0; t < seq_len; t++) {
+            rope_unapply_cpu(dq_all + t * D, dk_store + t * KV,
+                             &tm->model.rope, t, NH, NKV);
+        }
+
         /* Phase 3: Q/K/V projection backward + gain backward per position */
         for (int t = seq_len - 1; t >= 0; t--) {
             float *d_normed_attn = (float*)calloc(D, sizeof(float));

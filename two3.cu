@@ -540,7 +540,12 @@ void two3_backward(
     int M, int K,
     float ste_clip
 ) {
-    int S = 1;  /* single token for now */
+    int S = 1;
+
+    /* DEPRECATED: use two3_backward_fast() with Two3BackwardCtx instead.
+     * This path does 5 cudaMalloc/Free per call. */
+    static int _warned = 0;
+    if (!_warned) { fprintf(stderr, "[two3] WARNING: using old allocating backward path\n"); _warned = 1; }
 
     /* Allocate device buffers */
     float *d_dY, *d_X, *d_dX, *d_W_latent, *d_dW;

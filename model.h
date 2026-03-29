@@ -462,12 +462,15 @@ static void model_forward_sequence_cpu(
     /* Residual scaling for deep models: 1/sqrt(2*L) per residual add */
     float res_scale = 1.0f / sqrtf(2.0f * (float)m->cfg.n_layers);
 
+    /* Pre-allocate KV stores — same size every layer, reuse */
+    float *k_store = (float*)malloc(seq_len * KV * sizeof(float));
+    float *v_store = (float*)malloc(seq_len * KV * sizeof(float));
+
     for (int l = 0; l < m->cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];
 
-        /* Per-layer KV store: all positions for causal attention */
-        float *k_store = (float*)calloc(seq_len * KV, sizeof(float));
-        float *v_store = (float*)calloc(seq_len * KV, sizeof(float));
+        memset(k_store, 0, seq_len * KV * sizeof(float));
+        memset(v_store, 0, seq_len * KV * sizeof(float));
 
         /* ── Pass 1: compute and store Q, K, V for all positions ── */
         /* Then do attention per position (causal: t attends to 0..t) */
@@ -520,9 +523,10 @@ static void model_forward_sequence_cpu(
                 h[i] += res_scale * moe_out[i];
         }
 
-        free(k_store);
-        free(v_store);
     }
+
+    free(k_store);
+    free(v_store);
 
     /* Final gain norm + logits for each position */
     for (int t = 0; t < seq_len; t++) {

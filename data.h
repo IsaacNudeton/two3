@@ -120,9 +120,11 @@ static int dataset_load_file(Dataset *ds, const char *path) {
 
 /* Fisher-Yates shuffle of chunk order */
 static void dataset_shuffle(Dataset *ds, unsigned int seed) {
-    srand(seed);
+    /* Local xorshift32 — doesn't contaminate global srand() state */
+    uint32_t rng = seed ? seed : 1;
     for (int i = ds->n_chunks - 1; i > 0; i--) {
-        int j = rand() % (i + 1);
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        int j = (int)(rng % (uint32_t)(i + 1));
         int tmp = ds->chunk_offsets[i];
         ds->chunk_offsets[i] = ds->chunk_offsets[j];
         ds->chunk_offsets[j] = tmp;

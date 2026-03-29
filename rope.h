@@ -136,4 +136,34 @@ static void rope_apply_cpu(
     }
 }
 
+/* Inverse RoPE: undo rotation on gradients.
+ * Forward: [x0, x1] → [x0*c - x1*s, x0*s + x1*c]
+ * Inverse: [g0, g1] → [g0*c + g1*s, -g0*s + g1*c]  (negate sin) */
+static void rope_unapply_cpu(
+    float *dq, float *dk,
+    const RoPETable *r, int pos,
+    int n_heads, int n_kv_heads
+) {
+    int half = r->head_dim / 2;
+    const float *ct = r->cos_table + pos * half;
+    const float *st = r->sin_table + pos * half;
+
+    for (int h = 0; h < n_heads; h++) {
+        for (int d = 0; d < half; d++) {
+            int i = h * r->head_dim + 2 * d;
+            float g0 = dq[i], g1 = dq[i + 1];
+            dq[i]     =  g0 * ct[d] + g1 * st[d];
+            dq[i + 1] = -g0 * st[d] + g1 * ct[d];
+        }
+    }
+    for (int h = 0; h < n_kv_heads; h++) {
+        for (int d = 0; d < half; d++) {
+            int i = h * r->head_dim + 2 * d;
+            float g0 = dk[i], g1 = dk[i + 1];
+            dk[i]     =  g0 * ct[d] + g1 * st[d];
+            dk[i + 1] = -g0 * st[d] + g1 * ct[d];
+        }
+    }
+}
+
 #endif /* ROPE_H */
