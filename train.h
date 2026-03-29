@@ -105,6 +105,22 @@ static void adam_free(AdamState *s) {
     s->m = s->v = NULL;
 }
 
+/* Gradient norm clipping: scale gradients if L2 norm exceeds max_norm */
+static float clip_grad_norm(float *grads, int size, float max_norm) {
+    float norm_sq = 0;
+    for (int i = 0; i < size; i++)
+        norm_sq += grads[i] * grads[i];
+    float norm = sqrtf(norm_sq);
+    if (norm > max_norm) {
+        float scale = max_norm / norm;
+        for (int i = 0; i < size; i++)
+            grads[i] *= scale;
+    }
+    return norm;
+}
+
+#define GRAD_CLIP_NORM 1.0f
+
 /* Adam update: modifies params in-place */
 static void adam_update(
     float *params,
@@ -1165,29 +1181,41 @@ static TrainResult trainable_train_step(
         /* NOTE: tm->step is incremented ONCE per training call, not per layer.
          * See after the layer loop below. */
 
+        /* Track max gradient BEFORE clipping */
+        for (int i = 0; i < D * D; i++) {
+            if (fabsf(dW_q[i]) > result.max_grad) result.max_grad = fabsf(dW_q[i]);
+        }
+
+        /* Clip gradients before Adam */
+        clip_grad_norm(dW_q, D * D, GRAD_CLIP_NORM);
+        clip_grad_norm(dW_k, KV * D, GRAD_CLIP_NORM);
+        clip_grad_norm(dW_v, KV * D, GRAD_CLIP_NORM);
+        clip_grad_norm(dW_o, D * D, GRAD_CLIP_NORM);
+
         adam_update(tw->W_q, dW_q, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_k, dW_k, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_v, dW_v, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_o, dW_o, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
 
         for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            clip_grad_norm(dW_gate[e], INTER * D, GRAD_CLIP_NORM);
+            clip_grad_norm(dW_up[e], INTER * D, GRAD_CLIP_NORM);
+            clip_grad_norm(dW_down[e], D * INTER, GRAD_CLIP_NORM);
             adam_update(tw->expert_gate[e], dW_gate[e], &tw->adam_gate[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
             adam_update(tw->expert_up[e], dW_up[e], &tw->adam_up[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
             adam_update(tw->expert_down[e], dW_down[e], &tw->adam_down[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         }
 
         /* Router and gain C updates */
+        clip_grad_norm(tm->grad_router[l], D * MOE_NUM_EXPERTS, GRAD_CLIP_NORM);
+        clip_grad_norm(tm->grad_gain_C_attn[l], D, GRAD_CLIP_NORM);
+        clip_grad_norm(tm->grad_gain_C_ffn[l], D, GRAD_CLIP_NORM);
         adam_update(ly->moe.router.W, tm->grad_router[l], &tm->adam_router[l],
                     tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(ly->gain_attn.C, tm->grad_gain_C_attn[l], &tm->adam_gain_C_attn[l],
                     tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(ly->gain_ffn.C, tm->grad_gain_C_ffn[l], &tm->adam_gain_C_ffn[l],
                     tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-
-        /* Track max gradient */
-        for (int i = 0; i < D * D; i++) {
-            if (fabsf(dW_q[i]) > result.max_grad) result.max_grad = fabsf(dW_q[i]);
-        }
 
         /* Free layer gradient buffers */
         free(dW_q); free(dW_k); free(dW_v); free(dW_o);
@@ -1205,6 +1233,8 @@ static TrainResult trainable_train_step(
     }
 
     /* Update embedding and final gain C */
+    clip_grad_norm(tm->grad_embed, 256 * D, GRAD_CLIP_NORM);
+    clip_grad_norm(tm->grad_gain_C_final, D, GRAD_CLIP_NORM);
     adam_update(tm->latent_embed, tm->grad_embed, &tm->adam_embed,
                 tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
     adam_update(tm->model.gain_final.C, tm->grad_gain_C_final, &tm->adam_gain_C_final,
