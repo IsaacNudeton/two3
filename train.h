@@ -217,7 +217,7 @@ typedef struct {
 
 static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     tm->cfg = cfg;
-    tm->lr = 3e-4f;
+    tm->lr = 3e-3f;   /* 10x standard — STE needs larger steps to cross ternary boundaries */
     tm->beta1 = 0.9f;
     tm->beta2 = 0.999f;
     tm->eps = 1e-8f;
@@ -739,6 +739,7 @@ static TrainResult trainable_train_step(
         float *expert_gate_pre;     /* [seq_len × INTER] gate before squared ReLU */
         float *expert_up_out;       /* [seq_len × INTER] up projection output */
         float *moe_out;             /* [seq_len × D] MoE output before residual */
+        float *expert1_out;         /* [seq_len × D] expert 1's raw output (for router grad) */
         int   *selected_experts;    /* [seq_len × MOE_TOP_K] which experts were used */
         float *hidden_pre_attn;     /* [seq_len × D] hidden before attention block */
         float *hidden_pre_ffn;      /* [seq_len × D] hidden before FFN block */
@@ -763,6 +764,7 @@ static TrainResult trainable_train_step(
         sv->expert_gate_pre = (float*)calloc(seq_len * INTER, sizeof(float));
         sv->expert_up_out = (float*)calloc(seq_len * INTER, sizeof(float));
         sv->moe_out = (float*)calloc(seq_len * D, sizeof(float));
+        sv->expert1_out = (float*)calloc(seq_len * D, sizeof(float));
         sv->hidden_pre_attn = (float*)malloc(seq_len * D * sizeof(float));
         sv->hidden_pre_ffn = (float*)malloc(seq_len * D * sizeof(float));
 
@@ -854,6 +856,9 @@ static TrainResult trainable_train_step(
                 /* Down projection */
                 float *expert_out = (float*)malloc(D * sizeof(float));
                 ternary_project_cpu(&ly->moe.experts[eid].down, h_expert, expert_out, INTER);
+
+                /* Save expert 1's raw output for router gradient */
+                memcpy(sv->expert1_out + t * D, expert_out, D * sizeof(float));
 
                 /* Store weighted output */
                 for (int i = 0; i < D; i++)
@@ -964,6 +969,9 @@ static TrainResult trainable_train_step(
         free(d_fn);
     }
 
+    /* Increment step ONCE per training call (not per layer) */
+    tm->step++;
+
     /* Backward through layers (reverse order) */
     for (int l = L - 1; l >= 0; l--) {
         ModelLayer *ly = &tm->model.layers[l];
@@ -1057,11 +1065,12 @@ static TrainResult trainable_train_step(
                 ternary_project_backward_cpu(d_up, normed,
                     tw->expert_up[eid], d_normed_ffn, dW_up[eid], INTER, D);
 
-                /* Router gradient: gradient on expert weights */
+                /* Router gradient: dL/dw_k = dL/d_moe_out · expert_k_output
+                 * For top-1: use saved expert1_out (the raw, unweighted output).
+                 * For top-2: we don't save it, so we skip (accepted approximation). */
                 float d_expert_w[MOE_TOP_K] = {0};
                 for (int i = 0; i < D; i++)
-                    d_expert_w[0] += d_moe_out[i] * (sv->moe_out[t * D + i] / (w0 + 1e-10f));
-                /* Simplified: only backprop weight gradient for top expert */
+                    d_expert_w[0] += d_moe_out[i] * sv->expert1_out[t * D + i];
                 moe_router_backward_cpu(d_expert_w, &sv->moe_sel[t],
                     normed, &ly->moe.router, d_normed_ffn, tm->grad_router[l]);
 
@@ -1153,7 +1162,8 @@ static TrainResult trainable_train_step(
         free(dk_store); free(dv_store);
 
         /* ── Apply STE gradients via Adam ── */
-        tm->step++;
+        /* NOTE: tm->step is incremented ONCE per training call, not per layer.
+         * See after the layer loop below. */
 
         adam_update(tw->W_q, dW_q, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_k, dW_k, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
@@ -1218,7 +1228,7 @@ static TrainResult trainable_train_step(
         free(sv->pre_ffn_normed); free(sv->R_ffn_saved);
         free(sv->moe_sel);
         free(sv->expert_gate_pre); free(sv->expert_up_out);
-        free(sv->moe_out);
+        free(sv->moe_out); free(sv->expert1_out);
         free(sv->hidden_pre_attn); free(sv->hidden_pre_ffn);
     }
     free(saved);
