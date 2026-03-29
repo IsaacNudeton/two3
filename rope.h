@@ -1,0 +1,139 @@
+/*
+ * rope.h — Rotary Position Embedding for {2,3} Architecture
+ *
+ * RoPE rotates query/key vectors by position-dependent angles.
+ * This is the ONE place float arithmetic is unavoidable —
+ * cos/sin are irrational. But it's O(dim), not O(dim²).
+ * The heavy matmul stays integer. RoPE is a thin float layer.
+ *
+ * Precompute rotation tables once. Apply per token.
+ *
+ * Isaac & CC — March 2026
+ */
+
+#ifndef ROPE_H
+#define ROPE_H
+
+#include <math.h>
+#include <stdlib.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* ═══════════════════════════════════════════════════════
+ * RoPE frequency table — precomputed per (position, dim)
+ *
+ * freq[d] = 1.0 / (theta ^ (2d / dim))
+ * For position p: angle = p * freq[d]
+ * Apply: q'[2d]   = q[2d]*cos(a) - q[2d+1]*sin(a)
+ *        q'[2d+1] = q[2d]*sin(a) + q[2d+1]*cos(a)
+ * ═══════════════════════════════════════════════════════ */
+
+typedef struct {
+    float *cos_table;   /* [max_seq × head_dim/2] precomputed */
+    float *sin_table;   /* [max_seq × head_dim/2] precomputed */
+    int    head_dim;
+    int    max_seq;
+    float  theta;
+} RoPETable;
+
+static void rope_init(RoPETable *r, int head_dim, int max_seq, float theta) {
+    r->head_dim = head_dim;
+    r->max_seq = max_seq;
+    r->theta = theta;
+
+    int half = head_dim / 2;
+    r->cos_table = (float*)malloc(max_seq * half * sizeof(float));
+    r->sin_table = (float*)malloc(max_seq * half * sizeof(float));
+
+    for (int pos = 0; pos < max_seq; pos++) {
+        for (int d = 0; d < half; d++) {
+            float freq = 1.0f / powf(theta, (float)(2 * d) / head_dim);
+            float angle = (float)pos * freq;
+            r->cos_table[pos * half + d] = cosf(angle);
+            r->sin_table[pos * half + d] = sinf(angle);
+        }
+    }
+}
+
+static void rope_free(RoPETable *r) {
+    free(r->cos_table); free(r->sin_table);
+    r->cos_table = r->sin_table = NULL;
+}
+
+/* ═══════════════════════════════════════════════════════
+ * CUDA kernel: apply RoPE to Q and K vectors
+ *
+ * One block per head. Threads process dimension pairs.
+ * Works on float vectors (after dequant from int32 accumulators).
+ * ═══════════════════════════════════════════════════════ */
+
+#ifdef __CUDACC__
+
+__global__ void kernel_rope_apply(
+    float       *q,          /* [n_heads × head_dim] — modified in place */
+    float       *k,          /* [n_kv_heads × head_dim] — modified in place */
+    const float *cos_tab,    /* [head_dim/2] for this position */
+    const float *sin_tab,    /* [head_dim/2] for this position */
+    int n_heads, int n_kv_heads, int head_dim
+) {
+    int h = blockIdx.x;   /* head index */
+    int d = threadIdx.x;  /* dimension pair index */
+    int half = head_dim / 2;
+    if (d >= half) return;
+
+    float c = cos_tab[d];
+    float s = sin_tab[d];
+
+    /* Rotate Q heads */
+    if (h < n_heads) {
+        int i = h * head_dim + 2 * d;
+        float q0 = q[i], q1 = q[i + 1];
+        q[i]     = q0 * c - q1 * s;
+        q[i + 1] = q0 * s + q1 * c;
+    }
+
+    /* Rotate K heads (fewer for GQA) */
+    if (h < n_kv_heads) {
+        int i = h * head_dim + 2 * d;
+        float k0 = k[i], k1 = k[i + 1];
+        k[i]     = k0 * c - k1 * s;
+        k[i + 1] = k0 * s + k1 * c;
+    }
+}
+
+#endif /* __CUDACC__ */
+
+/* ═══════════════════════════════════════════════════════
+ * CPU reference
+ * ═══════════════════════════════════════════════════════ */
+
+static void rope_apply_cpu(
+    float *q, float *k,
+    const RoPETable *r, int pos,
+    int n_heads, int n_kv_heads
+) {
+    int half = r->head_dim / 2;
+    const float *ct = r->cos_table + pos * half;
+    const float *st = r->sin_table + pos * half;
+
+    for (int h = 0; h < n_heads; h++) {
+        for (int d = 0; d < half; d++) {
+            int i = h * r->head_dim + 2 * d;
+            float q0 = q[i], q1 = q[i + 1];
+            q[i]     = q0 * ct[d] - q1 * st[d];
+            q[i + 1] = q0 * st[d] + q1 * ct[d];
+        }
+    }
+    for (int h = 0; h < n_kv_heads; h++) {
+        for (int d = 0; d < half; d++) {
+            int i = h * r->head_dim + 2 * d;
+            float k0 = k[i], k1 = k[i + 1];
+            k[i]     = k0 * ct[d] - k1 * st[d];
+            k[i + 1] = k0 * st[d] + k1 * ct[d];
+        }
+    }
+}
+
+#endif /* ROPE_H */
