@@ -8,7 +8,7 @@
  *   train_driver.exe data/                       # train on directory
  *   train_driver.exe data.txt --resume ckpt.t2l4 # resume from checkpoint
  *   train_driver.exe data.txt --lr 0.01          # custom learning rate
- *   train_driver.exe data.txt --small             # small config for testing
+ *   train_driver.exe data.txt --medium             # small config for testing
  *
  * Outputs:
  *   train_log.txt      — loss, accuracy, ternary flips per step
@@ -32,12 +32,13 @@
 
 typedef struct {
     /* Model */
-    int use_small;        /* use small config for testing */
+    int use_medium;        /* use small config for testing */
     int seq_len;          /* bytes per sequence */
 
     /* Training */
     float lr;             /* learning rate */
     int   epochs;         /* number of passes through data */
+    int   batch_size;     /* sequences per optimizer step */
     int   ckpt_every;     /* save checkpoint every N steps */
     int   log_every;      /* log to console every N steps */
 
@@ -48,10 +49,11 @@ typedef struct {
 
 static TrainConfig default_config(void) {
     TrainConfig c;
-    c.use_small = 0;
+    c.use_medium = 0;
     c.seq_len = 128;
     c.lr = 3e-3f;
     c.epochs = 1;
+    c.batch_size = 8;
     c.ckpt_every = 100;
     c.log_every = 10;
     c.data_path[0] = 0;
@@ -59,23 +61,23 @@ static TrainConfig default_config(void) {
     return c;
 }
 
-static ModelConfig model_config_small(void) {
+static ModelConfig model_config_medium(void) {
     ModelConfig c;
     c.dim = 128;
     c.n_heads = 4;
     c.n_kv_heads = 2;
     c.head_dim = 32;
     c.intermediate = 256;
-    c.n_layers = 2;
-    c.max_seq = 256;
+    c.n_layers = 2;       /* 2 layers — 4+ layers explode in backward (needs layer-wise grad scaling) */
+    c.max_seq = 512;
     c.rope_theta = 1000000.0f;
     return c;
 }
 
 static void parse_args(TrainConfig *cfg, int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--small") == 0) {
-            cfg->use_small = 1;
+        if (strcmp(argv[i], "--medium") == 0) {
+            cfg->use_medium = 1;
         } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
             cfg->lr = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
@@ -84,6 +86,8 @@ static void parse_args(TrainConfig *cfg, int argc, char **argv) {
             strncpy(cfg->resume, argv[++i], 255);
         } else if (strcmp(argv[i], "--seq-len") == 0 && i + 1 < argc) {
             cfg->seq_len = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            cfg->batch_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ckpt-every") == 0 && i + 1 < argc) {
             cfg->ckpt_every = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--log-every") == 0 && i + 1 < argc) {
@@ -152,7 +156,7 @@ int main(int argc, char **argv) {
     if (cfg.data_path[0] == 0) {
         printf("Usage: train_driver.exe <data.txt|data_dir/> [options]\n");
         printf("Options:\n");
-        printf("  --small           Use small model (dim=128, 2 layers)\n");
+        printf("  --medium           Use medium model (dim=256, 4 layers) (dim=128, 2 layers)\n");
         printf("  --lr <float>      Learning rate (default: 3e-3)\n");
         printf("  --epochs <int>    Number of epochs (default: 1)\n");
         printf("  --seq-len <int>   Sequence length in bytes (default: 128)\n");
@@ -180,7 +184,7 @@ int main(int argc, char **argv) {
     }
 
     /* Init model */
-    ModelConfig mcfg = cfg.use_small ? model_config_small() : model_config_default();
+    ModelConfig mcfg = cfg.use_medium ? model_config_medium() : model_config_default();
     if (mcfg.max_seq < cfg.seq_len) mcfg.max_seq = cfg.seq_len;
 
     printf("  Model: dim=%d, layers=%d, heads=%d, kv=%d, inter=%d\n",
@@ -189,8 +193,11 @@ int main(int argc, char **argv) {
     printf("  Seq len: %d bytes\n", cfg.seq_len);
     printf("  LR: %.4f\n", cfg.lr);
     printf("  Epochs: %d\n", cfg.epochs);
+    printf("  Batch size: %d\n", cfg.batch_size);
     printf("  Chunks per epoch: %d\n", ds.n_chunks);
-    printf("  Total steps: %d\n\n", cfg.epochs * ds.n_chunks);
+    int steps_per_epoch = (ds.n_chunks + cfg.batch_size - 1) / cfg.batch_size;
+    printf("  Steps per epoch: %d\n", steps_per_epoch);
+    printf("  Total steps: %d\n\n", cfg.epochs * steps_per_epoch);
 
     TrainableModel tm;
     trainable_model_init(&tm, mcfg);
@@ -235,16 +242,37 @@ int main(int argc, char **argv) {
         int epoch_correct = 0;
         int epoch_total = 0;
 
-        for (int chunk = 0; chunk < ds.n_chunks; chunk++) {
+        for (int chunk = 0; chunk < ds.n_chunks; chunk += cfg.batch_size) {
             clock_t step_start = clock();
 
-            uint8_t *seq = dataset_get(&ds, chunk);
-            TrainResult r = trainable_train_step(&tm, seq, cfg.seq_len);
+            /* Accumulate gradients over batch */
+            trainable_zero_grads(&tm);
+
+            float batch_loss = 0;
+            int batch_correct = 0;
+            float batch_max_grad = 0;
+            int actual_batch = 0;
+
+            for (int b = 0; b < cfg.batch_size && chunk + b < ds.n_chunks; b++) {
+                uint8_t *seq = dataset_get(&ds, chunk + b);
+                TrainResult r = trainable_forward_backward(&tm, seq, cfg.seq_len);
+                batch_loss += r.loss;
+                batch_correct += r.correct;
+                if (r.max_grad > batch_max_grad) batch_max_grad = r.max_grad;
+                actual_batch++;
+            }
+
+            /* One optimizer step for the whole batch */
+            trainable_optimizer_step(&tm);
 
             global_step++;
+            TrainResult r;
+            r.loss = batch_loss / actual_batch;
+            r.correct = batch_correct;
+            r.max_grad = batch_max_grad;
             epoch_loss += r.loss;
-            epoch_correct += r.correct;
-            epoch_total += cfg.seq_len - 1;
+            epoch_correct += batch_correct;
+            epoch_total += actual_batch * (cfg.seq_len - 1);
 
             /* Count ternary flips */
             int flips = flip_counter_update(&fc, tm.layer_weights[0].W_q);
@@ -253,7 +281,8 @@ int main(int argc, char **argv) {
 
             /* Log */
             if (global_step % cfg.log_every == 0 || chunk == 0) {
-                float avg_loss = epoch_loss / (chunk + 1);
+                int steps_so_far = (chunk / cfg.batch_size) + 1;
+                float avg_loss = epoch_loss / steps_so_far;
                 float accuracy = (float)epoch_correct / (float)(epoch_total > 0 ? epoch_total : 1);
 
                 printf("  [epoch %d/%d  step %d]  loss=%.4f  acc=%.3f  "
@@ -290,7 +319,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        float epoch_avg_loss = epoch_loss / ds.n_chunks;
+        float epoch_avg_loss = epoch_loss / steps_per_epoch;
         float epoch_acc = (float)epoch_correct / (float)(epoch_total > 0 ? epoch_total : 1);
         printf("\n  Epoch %d complete: avg_loss=%.4f  accuracy=%.3f  "
                "total_flips=%d\n\n",

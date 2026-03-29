@@ -192,6 +192,12 @@ typedef struct {
     float *expert_up[MOE_NUM_EXPERTS];    /* [intermediate × dim] */
     float *expert_down[MOE_NUM_EXPERTS];  /* [dim × intermediate] */
 
+    /* Gradient accumulators (persist across batch for accumulation) */
+    float *grad_Wq, *grad_Wk, *grad_Wv, *grad_Wo;
+    float *grad_gate[MOE_NUM_EXPERTS];
+    float *grad_up[MOE_NUM_EXPERTS];
+    float *grad_down[MOE_NUM_EXPERTS];
+
     /* Adam states for each */
     AdamState adam_Wq, adam_Wk, adam_Wv, adam_Wo;
     AdamState adam_gate[MOE_NUM_EXPERTS];
@@ -297,6 +303,12 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         adam_init(&tw->adam_Wv, KV * D);
         adam_init(&tw->adam_Wo, D * D);
 
+        /* Persistent gradient accumulators for batch accumulation */
+        tw->grad_Wq = (float*)calloc(D * D, sizeof(float));
+        tw->grad_Wk = (float*)calloc(KV * D, sizeof(float));
+        tw->grad_Wv = (float*)calloc(KV * D, sizeof(float));
+        tw->grad_Wo = (float*)calloc(D * D, sizeof(float));
+
         for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
             tw->expert_gate[e] = (float*)malloc(INTER * D * sizeof(float));
             tw->expert_up[e]   = (float*)malloc(INTER * D * sizeof(float));
@@ -309,6 +321,10 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
             adam_init(&tw->adam_gate[e], INTER * D);
             adam_init(&tw->adam_up[e], INTER * D);
             adam_init(&tw->adam_down[e], D * INTER);
+
+            tw->grad_gate[e] = (float*)calloc(INTER * D, sizeof(float));
+            tw->grad_up[e]   = (float*)calloc(INTER * D, sizeof(float));
+            tw->grad_down[e] = (float*)calloc(D * INTER, sizeof(float));
         }
 
         /* Router and gain Adam states */
@@ -414,11 +430,13 @@ static void trainable_model_free(TrainableModel *tm) {
     for (int l = 0; l < L; l++) {
         TrainableLayerWeights *tw = &tm->layer_weights[l];
         free(tw->W_q); free(tw->W_k); free(tw->W_v); free(tw->W_o);
+        free(tw->grad_Wq); free(tw->grad_Wk); free(tw->grad_Wv); free(tw->grad_Wo);
         adam_free(&tw->adam_Wq); adam_free(&tw->adam_Wk);
         adam_free(&tw->adam_Wv); adam_free(&tw->adam_Wo);
 
         for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
             free(tw->expert_gate[e]); free(tw->expert_up[e]); free(tw->expert_down[e]);
+            free(tw->grad_gate[e]); free(tw->grad_up[e]); free(tw->grad_down[e]);
             adam_free(&tw->adam_gate[e]); adam_free(&tw->adam_up[e]);
             adam_free(&tw->adam_down[e]);
         }
@@ -699,6 +717,95 @@ static void moe_router_backward_cpu(
 }
 
 /* ═══════════════════════════════════════════════════════
+ * Batch training API
+ *
+ * Zero → accumulate N sequences → optimize once.
+ *   trainable_zero_grads(&tm);
+ *   for (i = 0; i < batch_size; i++)
+ *       trainable_forward_backward(&tm, seq[i], len, &result);
+ *   trainable_optimizer_step(&tm);
+ * ═══════════════════════════════════════════════════════ */
+
+static void trainable_zero_grads(TrainableModel *tm) {
+    int D = tm->cfg.dim;
+    int KV = tm->cfg.n_kv_heads * tm->cfg.head_dim;
+    int INTER = tm->cfg.intermediate;
+    int L = tm->cfg.n_layers;
+
+    memset(tm->grad_embed, 0, 256 * D * sizeof(float));
+    memset(tm->grad_gain_C_final, 0, D * sizeof(float));
+
+    for (int l = 0; l < L; l++) {
+        TrainableLayerWeights *tw = &tm->layer_weights[l];
+        memset(tw->grad_Wq, 0, D * D * sizeof(float));
+        memset(tw->grad_Wk, 0, KV * D * sizeof(float));
+        memset(tw->grad_Wv, 0, KV * D * sizeof(float));
+        memset(tw->grad_Wo, 0, D * D * sizeof(float));
+        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            memset(tw->grad_gate[e], 0, INTER * D * sizeof(float));
+            memset(tw->grad_up[e], 0, INTER * D * sizeof(float));
+            memset(tw->grad_down[e], 0, D * INTER * sizeof(float));
+        }
+        memset(tm->grad_router[l], 0, D * MOE_NUM_EXPERTS * sizeof(float));
+        memset(tm->grad_gain_C_attn[l], 0, D * sizeof(float));
+        memset(tm->grad_gain_C_ffn[l], 0, D * sizeof(float));
+    }
+}
+
+static void trainable_optimizer_step(TrainableModel *tm) {
+    int D = tm->cfg.dim;
+    int KV = tm->cfg.n_kv_heads * tm->cfg.head_dim;
+    int INTER = tm->cfg.intermediate;
+    int L = tm->cfg.n_layers;
+
+    tm->step++;
+
+    for (int l = 0; l < L; l++) {
+        TrainableLayerWeights *tw = &tm->layer_weights[l];
+        ModelLayer *ly = &tm->model.layers[l];
+
+        /* Clip gradients */
+        clip_grad_norm(tw->grad_Wq, D * D, GRAD_CLIP_NORM);
+        clip_grad_norm(tw->grad_Wk, KV * D, GRAD_CLIP_NORM);
+        clip_grad_norm(tw->grad_Wv, KV * D, GRAD_CLIP_NORM);
+        clip_grad_norm(tw->grad_Wo, D * D, GRAD_CLIP_NORM);
+
+        /* Adam on STE weights */
+        adam_update(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(tw->W_o, tw->grad_Wo, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+
+        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            clip_grad_norm(tw->grad_gate[e], INTER * D, GRAD_CLIP_NORM);
+            clip_grad_norm(tw->grad_up[e], INTER * D, GRAD_CLIP_NORM);
+            clip_grad_norm(tw->grad_down[e], D * INTER, GRAD_CLIP_NORM);
+            adam_update(tw->expert_gate[e], tw->grad_gate[e], &tw->adam_gate[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+            adam_update(tw->expert_up[e], tw->grad_up[e], &tw->adam_up[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+            adam_update(tw->expert_down[e], tw->grad_down[e], &tw->adam_down[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        }
+
+        /* Router and gain C */
+        clip_grad_norm(tm->grad_router[l], D * MOE_NUM_EXPERTS, GRAD_CLIP_NORM);
+        clip_grad_norm(tm->grad_gain_C_attn[l], D, GRAD_CLIP_NORM);
+        clip_grad_norm(tm->grad_gain_C_ffn[l], D, GRAD_CLIP_NORM);
+        adam_update(ly->moe.router.W, tm->grad_router[l], &tm->adam_router[l], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(ly->gain_attn.C, tm->grad_gain_C_attn[l], &tm->adam_gain_C_attn[l], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(ly->gain_ffn.C, tm->grad_gain_C_ffn[l], &tm->adam_gain_C_ffn[l], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+    }
+
+    /* Embedding and final gain */
+    clip_grad_norm(tm->grad_embed, 256 * D, GRAD_CLIP_NORM);
+    clip_grad_norm(tm->grad_gain_C_final, D, GRAD_CLIP_NORM);
+    adam_update(tm->latent_embed, tm->grad_embed, &tm->adam_embed, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+    adam_update(tm->model.gain_final.C, tm->grad_gain_C_final, &tm->adam_gain_C_final, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+
+    /* Sync embedding + requantize */
+    memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
+    trainable_requantize(tm);
+}
+
+/* ═══════════════════════════════════════════════════════
  * Full training step: forward + backward + Adam update
  *
  * Input: sequence of bytes
@@ -712,7 +819,10 @@ typedef struct {
     int   correct;      /* number of correct top-1 predictions */
 } TrainResult;
 
-static TrainResult trainable_train_step(
+/* Forward + backward only — accumulates gradients, does NOT update.
+ * Call trainable_zero_grads before first call in batch,
+ * trainable_optimizer_step after last call in batch. */
+static TrainResult trainable_forward_backward(
     TrainableModel *tm,
     const uint8_t *bytes,    /* [seq_len] input sequence */
     int seq_len              /* must be >= 2 (need input + target) */
@@ -946,17 +1056,9 @@ static TrainResult trainable_train_step(
     result.loss = total_loss / (float)T;
 
     /* ═══════════════════════════════════════════════════════
-     * BACKWARD PASS
+     * BACKWARD PASS — accumulates into persistent grad buffers
+     * (caller must zero first via trainable_zero_grads)
      * ═══════════════════════════════════════════════════════ */
-
-    /* Zero all gradient accumulators */
-    memset(tm->grad_embed, 0, 256 * D * sizeof(float));
-    memset(tm->grad_gain_C_final, 0, D * sizeof(float));
-    for (int l = 0; l < L; l++) {
-        memset(tm->grad_router[l], 0, D * MOE_NUM_EXPERTS * sizeof(float));
-        memset(tm->grad_gain_C_attn[l], 0, D * sizeof(float));
-        memset(tm->grad_gain_C_ffn[l], 0, D * sizeof(float));
-    }
 
     /* d_hidden: gradient on hidden states [seq_len × D] */
     float *d_hidden = (float*)calloc(seq_len * D, sizeof(float));
@@ -985,25 +1087,23 @@ static TrainResult trainable_train_step(
         free(d_fn);
     }
 
-    /* Increment step ONCE per training call (not per layer) */
-    tm->step++;
-
-    /* Backward through layers (reverse order) */
+    /* Backward through layers (reverse order).
+     * Gradients accumulate into persistent tw->grad_* buffers. */
     for (int l = L - 1; l >= 0; l--) {
         ModelLayer *ly = &tm->model.layers[l];
         LayerSaved *sv = &saved[l];
         TrainableLayerWeights *tw = &tm->layer_weights[l];
 
-        /* Allocate gradient buffers for this layer's STE weights */
-        float *dW_q = (float*)calloc(D * D, sizeof(float));
-        float *dW_k = (float*)calloc(KV * D, sizeof(float));
-        float *dW_v = (float*)calloc(KV * D, sizeof(float));
-        float *dW_o = (float*)calloc(D * D, sizeof(float));
+        /* Use persistent gradient buffers (zeroed by trainable_zero_grads) */
+        float *dW_q = tw->grad_Wq;
+        float *dW_k = tw->grad_Wk;
+        float *dW_v = tw->grad_Wv;
+        float *dW_o = tw->grad_Wo;
         float *dW_gate[MOE_NUM_EXPERTS], *dW_up[MOE_NUM_EXPERTS], *dW_down[MOE_NUM_EXPERTS];
         for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            dW_gate[e] = (float*)calloc(INTER * D, sizeof(float));
-            dW_up[e]   = (float*)calloc(INTER * D, sizeof(float));
-            dW_down[e] = (float*)calloc(D * INTER, sizeof(float));
+            dW_gate[e] = tw->grad_gate[e];
+            dW_up[e]   = tw->grad_up[e];
+            dW_down[e] = tw->grad_down[e];
         }
 
         /* ── Backward through FFN block (reverse of forward steps 7-10) ── */
@@ -1177,51 +1277,13 @@ static TrainResult trainable_train_step(
 
         free(dk_store); free(dv_store);
 
-        /* ── Apply STE gradients via Adam ── */
-        /* NOTE: tm->step is incremented ONCE per training call, not per layer.
-         * See after the layer loop below. */
-
-        /* Track max gradient BEFORE clipping */
+        /* Track max gradient for monitoring */
         for (int i = 0; i < D * D; i++) {
             if (fabsf(dW_q[i]) > result.max_grad) result.max_grad = fabsf(dW_q[i]);
         }
 
-        /* Clip gradients before Adam */
-        clip_grad_norm(dW_q, D * D, GRAD_CLIP_NORM);
-        clip_grad_norm(dW_k, KV * D, GRAD_CLIP_NORM);
-        clip_grad_norm(dW_v, KV * D, GRAD_CLIP_NORM);
-        clip_grad_norm(dW_o, D * D, GRAD_CLIP_NORM);
-
-        adam_update(tw->W_q, dW_q, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        adam_update(tw->W_k, dW_k, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        adam_update(tw->W_v, dW_v, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        adam_update(tw->W_o, dW_o, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            clip_grad_norm(dW_gate[e], INTER * D, GRAD_CLIP_NORM);
-            clip_grad_norm(dW_up[e], INTER * D, GRAD_CLIP_NORM);
-            clip_grad_norm(dW_down[e], D * INTER, GRAD_CLIP_NORM);
-            adam_update(tw->expert_gate[e], dW_gate[e], &tw->adam_gate[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-            adam_update(tw->expert_up[e], dW_up[e], &tw->adam_up[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-            adam_update(tw->expert_down[e], dW_down[e], &tw->adam_down[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        }
-
-        /* Router and gain C updates */
-        clip_grad_norm(tm->grad_router[l], D * MOE_NUM_EXPERTS, GRAD_CLIP_NORM);
-        clip_grad_norm(tm->grad_gain_C_attn[l], D, GRAD_CLIP_NORM);
-        clip_grad_norm(tm->grad_gain_C_ffn[l], D, GRAD_CLIP_NORM);
-        adam_update(ly->moe.router.W, tm->grad_router[l], &tm->adam_router[l],
-                    tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        adam_update(ly->gain_attn.C, tm->grad_gain_C_attn[l], &tm->adam_gain_C_attn[l],
-                    tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        adam_update(ly->gain_ffn.C, tm->grad_gain_C_ffn[l], &tm->adam_gain_C_ffn[l],
-                    tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-
-        /* Free layer gradient buffers */
-        free(dW_q); free(dW_k); free(dW_v); free(dW_o);
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            free(dW_gate[e]); free(dW_up[e]); free(dW_down[e]);
-        }
+        /* Gradients accumulated in tw->grad_* — no Adam here.
+         * Caller invokes trainable_optimizer_step after batch. */
     }
 
     /* Embedding gradient: backward through embedding lookup
@@ -1232,19 +1294,7 @@ static TrainResult trainable_train_step(
             tm->grad_embed[b * D + d] += d_hidden[t * D + d];
     }
 
-    /* Update embedding and final gain C */
-    clip_grad_norm(tm->grad_embed, 256 * D, GRAD_CLIP_NORM);
-    clip_grad_norm(tm->grad_gain_C_final, D, GRAD_CLIP_NORM);
-    adam_update(tm->latent_embed, tm->grad_embed, &tm->adam_embed,
-                tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-    adam_update(tm->model.gain_final.C, tm->grad_gain_C_final, &tm->adam_gain_C_final,
-                tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-
-    /* Sync embedding back */
-    memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
-
-    /* Re-quantize latent → ternary */
-    trainable_requantize(tm);
+    /* Adam + requantize deferred to trainable_optimizer_step */
 
     /* ═══════════════════════════════════════════════════════
      * Cleanup
@@ -1267,6 +1317,19 @@ static TrainResult trainable_train_step(
     free(all_logits); free(d_logits_all);
 
     return result;
+}
+
+/* Convenience: zero + forward_backward + optimizer_step in one call.
+ * Same behavior as the old trainable_train_step. */
+static TrainResult trainable_train_step(
+    TrainableModel *tm,
+    const uint8_t *bytes,
+    int seq_len
+) {
+    trainable_zero_grads(tm);
+    TrainResult r = trainable_forward_backward(tm, bytes, seq_len);
+    trainable_optimizer_step(tm);
+    return r;
 }
 
 /* ═══════════════════════════════════════════════════════
