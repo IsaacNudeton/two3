@@ -84,6 +84,76 @@ __global__ void two3_matmul_kernel(
 }
 
 /*
+ * Kernel: two3_backward_dx_kernel
+ *
+ * Backward through ternary matmul for input gradient.
+ * Forward was: Y[s][m] = sum_k W[m][k] * X[s][k]
+ * Backward:    dX[s][k] = sum_m dY[s][m] * W[m][k]
+ *
+ * This is the transposed ternary matmul. Each thread computes
+ * one dX element by accumulating over output dimension M.
+ * Uses same branchless decode as forward.
+ */
+__global__ void two3_backward_dx_kernel(
+    const uint8_t* __restrict__ W,    /* [M, K/4] packed ternary */
+    const float*   __restrict__ dY,   /* [S, M]   gradient from above */
+    float*         __restrict__ dX,   /* [S, K]   output gradient */
+    int S, int M, int K)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;  /* input feature */
+    int s = blockIdx.y * blockDim.y + threadIdx.y;  /* sequence position */
+
+    if (k >= K || s >= S) return;
+
+    int K4 = K / 4;
+    int pk = k / 4;     /* which packed byte */
+    int j  = k % 4;     /* which 2-bit slot within byte */
+
+    float acc = 0.0f;
+
+    for (int m = 0; m < M; m++) {
+        uint8_t packed = W[m * K4 + pk];
+        uint8_t bits = (packed >> (j * 2)) & 0x3;
+        int sign = (int)(bits & 1) - (int)(bits >> 1);
+        acc += (float)sign * dY[s * M + m];
+    }
+
+    dX[s * K + k] += acc;  /* accumulate */
+}
+
+/*
+ * Kernel: two3_backward_dw_kernel
+ *
+ * Gradient for latent weights with STE.
+ * dW_latent[m][k] += dY[m] * X[k]   (outer product)
+ * STE: zero gradient if |w_latent| > clip threshold
+ *
+ * Each thread handles one (m, k) element.
+ */
+__global__ void two3_backward_dw_kernel(
+    const float*   __restrict__ dY,       /* [S, M] gradient */
+    const float*   __restrict__ X,        /* [S, K] input activations */
+    const float*   __restrict__ W_latent, /* [M, K] latent float weights */
+    float*         __restrict__ dW,       /* [M, K] output gradient (accumulate) */
+    int S, int M, int K, float ste_clip)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    int m = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (k >= K || m >= M) return;
+
+    float w = W_latent[m * K + k];
+    if (fabsf(w) > ste_clip) return;  /* STE: zero grad outside clip range */
+
+    float grad = 0.0f;
+    for (int s = 0; s < S; s++) {
+        grad += dY[s * M + m] * X[s * K + k];
+    }
+
+    dW[m * K + k] += grad;  /* accumulate across batch */
+}
+
+/*
  * Kernel: quantize_activations_kernel
  *
  * Per-token absmax quantization: float → int8
@@ -351,6 +421,82 @@ void two3_dequantize_output(const Two3Output* Y,
 
 void two3_free_output(Two3Output* y) {
     if (y->acc) { cudaFree(y->acc); y->acc = NULL; }
+}
+
+/* ---- Backward pass (GPU) ---- */
+
+/*
+ * Backward through ternary projection — GPU accelerated.
+ *
+ * Computes both:
+ *   dX[k] += sum_m dY[m] * W_ternary[m][k]     (transposed ternary matmul)
+ *   dW_latent[m][k] += dY[m] * X[k] * STE_mask  (float outer product)
+ *
+ * All on GPU. Host only provides/receives float arrays.
+ */
+void two3_backward(
+    const Two3Weights* W,     /* packed ternary weights (on device) */
+    const float* dY_host,     /* [1, M] gradient from above */
+    const float* X_host,      /* [1, K] saved input */
+    const float* W_latent,    /* [M, K] latent float weights (host) */
+    float* dX_host,           /* [K] gradient to pass back (ACCUMULATE, host) */
+    float* dW_host,           /* [M, K] gradient for latent (ACCUMULATE, host) */
+    int M, int K,
+    float ste_clip
+) {
+    int S = 1;  /* single token for now */
+
+    /* Allocate device buffers */
+    float *d_dY, *d_X, *d_dX, *d_W_latent, *d_dW;
+    CUDA_CHECK(cudaMalloc(&d_dY, S * M * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_X, S * K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dX, S * K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_W_latent, M * K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dW, M * K * sizeof(float)));
+
+    /* Copy inputs to device */
+    CUDA_CHECK(cudaMemcpy(d_dY, dY_host, S * M * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_X, X_host, S * K * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_dX, 0, S * K * sizeof(float)));
+
+    /* Copy latent weights and existing gradients to device */
+    CUDA_CHECK(cudaMemcpy(d_W_latent, W_latent, M * K * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dW, dW_host, M * K * sizeof(float), cudaMemcpyHostToDevice));
+
+    /* Kernel 1: dX = dY @ W_ternary (transposed ternary matmul) */
+    {
+        dim3 block(TWO3_BLOCK_X, TWO3_BLOCK_Y);
+        dim3 grid((K + block.x - 1) / block.x,
+                  (S + block.y - 1) / block.y);
+        two3_backward_dx_kernel<<<grid, block>>>(
+            W->packed, d_dY, d_dX, S, M, K);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    /* Kernel 2: dW = dY^T @ X with STE (float outer product) */
+    {
+        dim3 block(TWO3_BLOCK_X, TWO3_BLOCK_Y);
+        dim3 grid((K + block.x - 1) / block.x,
+                  (M + block.y - 1) / block.y);
+        two3_backward_dw_kernel<<<grid, block>>>(
+            d_dY, d_X, d_W_latent, d_dW,
+            S, M, K, ste_clip);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    /* Copy results back — ACCUMULATE into host buffers */
+    float *dX_tmp = (float*)malloc(K * sizeof(float));
+    CUDA_CHECK(cudaMemcpy(dX_tmp, d_dX, K * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < K; i++) dX_host[i] += dX_tmp[i];
+    free(dX_tmp);
+
+    CUDA_CHECK(cudaMemcpy(dW_host, d_dW, M * K * sizeof(float), cudaMemcpyDeviceToHost));
+
+    /* Free device buffers */
+    cudaFree(d_dY); cudaFree(d_X); cudaFree(d_dX);
+    cudaFree(d_W_latent); cudaFree(d_dW);
 }
 
 /* ---- Reference matmul (CPU, float, for verification) ---- */

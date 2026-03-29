@@ -115,6 +115,21 @@ void two3_dequantize_output(const Two3Output* Y,
 /* Free device memory for output. */
 void two3_free_output(Two3Output* y);
 
+/* ----- Backward pass ----- */
+
+/* Backward through ternary projection on GPU.
+ * Computes dX (transposed ternary matmul) and dW (STE outer product).
+ * dX and dW are ACCUMULATED (caller must zero if needed). */
+void two3_backward(
+    const Two3Weights* W,     /* packed ternary (device) */
+    const float* dY_host,     /* [1, M] */
+    const float* X_host,      /* [1, K] */
+    const float* W_latent,    /* [M, K] host */
+    float* dX_host,           /* [K] accumulate */
+    float* dW_host,           /* [M, K] accumulate */
+    int M, int K,
+    float ste_clip);
+
 /* ----- Utilities ----- */
 
 /* Reference float matmul on CPU for verification.

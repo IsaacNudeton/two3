@@ -514,6 +514,21 @@ static void ternary_project_backward_cpu(
     }
 }
 
+/* GPU-accelerated ternary backward — uses two3_backward from two3.cu.
+ * Needs the packed Two3Weights for the transposed ternary matmul. */
+static void ternary_project_backward_gpu(
+    const Two3Weights *W_packed,   /* packed ternary weights (on device) */
+    const float *dY,               /* [rows] gradient from above */
+    const float *X,                /* [cols] saved input */
+    const float *W_latent,         /* [rows × cols] latent float weights */
+    float *dX,                     /* [cols] gradient to pass back (ACCUMULATE) */
+    float *dW_latent,              /* [rows × cols] gradient for latent (ACCUMULATE) */
+    int rows, int cols
+) {
+    two3_backward(W_packed, dY, X, W_latent, dX, dW_latent,
+                  rows, cols, STE_CLIP);
+}
+
 /* Backward through gain normalization (CPU version of kernel_gain_backward) */
 static void gain_backward_cpu(
     float *dx,          /* [dim] gradient w.r.t. input (OUTPUT) */
@@ -1147,7 +1162,8 @@ static TrainResult trainable_forward_backward(
 
                 /* d_h_expert from down projection backward */
                 float *d_h_expert = (float*)calloc(INTER, sizeof(float));
-                ternary_project_backward_cpu(
+                ternary_project_backward_gpu(
+                    &ly->moe.experts[eid].down,
                     d_expert_out, h_expert,
                     tw->expert_down[eid],
                     d_h_expert, dW_down[eid],
@@ -1176,9 +1192,11 @@ static TrainResult trainable_forward_backward(
 
                 /* Backward through gate and up projections (STE) */
                 float *normed = sv->pre_ffn_normed + t * D;
-                ternary_project_backward_cpu(d_gate, normed,
+                ternary_project_backward_gpu(
+                    &ly->moe.experts[eid].gate, d_gate, normed,
                     tw->expert_gate[eid], d_normed_ffn, dW_gate[eid], INTER, D);
-                ternary_project_backward_cpu(d_up, normed,
+                ternary_project_backward_gpu(
+                    &ly->moe.experts[eid].up, d_up, normed,
                     tw->expert_up[eid], d_normed_ffn, dW_up[eid], INTER, D);
 
                 /* Router gradient: dL/dw_k = dL/d_moe_out · expert_k_output
@@ -1230,7 +1248,7 @@ static TrainResult trainable_forward_backward(
 
             /* Step 5 backward: O projection (STE) */
             float *d_attn_out = (float*)calloc(D, sizeof(float));
-            ternary_project_backward_cpu(d_o_proj, sv->attn_out + t * D,
+            ternary_project_backward_gpu(&ly->W_o, d_o_proj, sv->attn_out + t * D,
                 tw->W_o, d_attn_out, dW_o, D, D);
 
             /* Step 4 backward: causal attention */
@@ -1246,7 +1264,7 @@ static TrainResult trainable_forward_backward(
              * Simplified: pass dq/dk through as-is. */
             float *d_normed_attn = (float*)calloc(D, sizeof(float));
 
-            ternary_project_backward_cpu(dq, sv->pre_attn_normed + t * D,
+            ternary_project_backward_gpu(&ly->W_q, dq, sv->pre_attn_normed + t * D,
                 tw->W_q, d_normed_attn, dW_q, D, D);
 
             /* K and V backward: accumulate from dk_store/dv_store at position t */
@@ -1255,9 +1273,9 @@ static TrainResult trainable_forward_backward(
             memcpy(dk_t, dk_store + t * KV, KV * sizeof(float));
             memcpy(dv_t, dv_store + t * KV, KV * sizeof(float));
 
-            ternary_project_backward_cpu(dk_t, sv->pre_attn_normed + t * D,
+            ternary_project_backward_gpu(&ly->W_k, dk_t, sv->pre_attn_normed + t * D,
                 tw->W_k, d_normed_attn, dW_k, KV, D);
-            ternary_project_backward_cpu(dv_t, sv->pre_attn_normed + t * D,
+            ternary_project_backward_gpu(&ly->W_v, dv_t, sv->pre_attn_normed + t * D,
                 tw->W_v, d_normed_attn, dW_v, KV, D);
 
             /* Step 1 backward: gain norm (attention) */
