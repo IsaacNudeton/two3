@@ -33,6 +33,7 @@
 typedef struct {
     /* Model */
     int use_medium;        /* use small config for testing */
+    int use_large;         /* use large config (dim=256, 8 layers) */
     int seq_len;          /* bytes per sequence */
 
     /* Training */
@@ -50,6 +51,7 @@ typedef struct {
 static TrainConfig default_config(void) {
     TrainConfig c;
     c.use_medium = 0;
+    c.use_large = 0;
     c.seq_len = 128;
     c.lr = 3e-3f;
     c.epochs = 1;
@@ -68,7 +70,20 @@ static ModelConfig model_config_medium(void) {
     c.n_kv_heads = 2;
     c.head_dim = 32;
     c.intermediate = 256;
-    c.n_layers = 2;       /* 2 layers — 4+ layers explode in backward (needs layer-wise grad scaling) */
+    c.n_layers = 4;       /* 4 layers — layer-wise gradient clipping prevents explosion */
+    c.max_seq = 512;
+    c.rope_theta = 1000000.0f;
+    return c;
+}
+
+static ModelConfig model_config_large(void) {
+    ModelConfig c;
+    c.dim = 256;
+    c.n_heads = 8;
+    c.n_kv_heads = 4;
+    c.head_dim = 32;
+    c.intermediate = 512;
+    c.n_layers = 8;
     c.max_seq = 512;
     c.rope_theta = 1000000.0f;
     return c;
@@ -78,6 +93,8 @@ static void parse_args(TrainConfig *cfg, int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--medium") == 0) {
             cfg->use_medium = 1;
+        } else if (strcmp(argv[i], "--large") == 0) {
+            cfg->use_large = 1;
         } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
             cfg->lr = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
@@ -156,7 +173,8 @@ int main(int argc, char **argv) {
     if (cfg.data_path[0] == 0) {
         printf("Usage: train_driver.exe <data.txt|data_dir/> [options]\n");
         printf("Options:\n");
-        printf("  --medium           Use medium model (dim=256, 4 layers) (dim=128, 2 layers)\n");
+        printf("  --medium           Use medium model (dim=128, 4 layers)\n");
+        printf("  --large            Use large model (dim=256, 8 layers)\n");
         printf("  --lr <float>      Learning rate (default: 3e-3)\n");
         printf("  --epochs <int>    Number of epochs (default: 1)\n");
         printf("  --seq-len <int>   Sequence length in bytes (default: 128)\n");
@@ -184,7 +202,9 @@ int main(int argc, char **argv) {
     }
 
     /* Init model */
-    ModelConfig mcfg = cfg.use_medium ? model_config_medium() : model_config_default();
+    ModelConfig mcfg = cfg.use_large ? model_config_large()
+                     : cfg.use_medium ? model_config_medium()
+                     : model_config_default();
     if (mcfg.max_seq < cfg.seq_len) mcfg.max_seq = cfg.seq_len;
 
     printf("  Model: dim=%d, layers=%d, heads=%d, kv=%d, inter=%d\n",

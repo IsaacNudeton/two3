@@ -28,6 +28,7 @@
 #define TRAIN_H
 
 #include "model.h"
+#include "two3_tiled.h"
 #include <math.h>
 #include <string.h>
 
@@ -220,6 +221,9 @@ typedef struct {
     AdamState *adam_gain_C_ffn;   /* [n_layers] */
     AdamState adam_gain_C_final;
 
+    /* Pre-allocated GPU backward context (eliminates per-call malloc) */
+    Two3BackwardCtx backward_ctx;
+
     /* Training hyperparams */
     float lr;
     float beta1, beta2, eps;
@@ -340,6 +344,16 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     adam_init(&tm->adam_gain_C_final, D);
     tm->grad_gain_C_final = (float*)calloc(D, sizeof(float));
 
+    /* Pre-allocate GPU backward buffers.
+     * max_M = max(D, KV, INTER), max_K = max(D, INTER).
+     * Covers all projection dimensions: D×D, KV×D, INTER×D, D×INTER. */
+    {
+        int max_M = D > INTER ? D : INTER;
+        if (KV > max_M) max_M = KV;
+        int max_K = D > INTER ? D : INTER;
+        tm->backward_ctx = two3_backward_ctx_init(max_M, max_K);
+    }
+
     /* Quantize latent weights to ternary for the model
      * (defined below, declared here via forward declaration) */
     /* trainable_requantize(tm) called after full init — see below */
@@ -355,67 +369,25 @@ static void trainable_requantize(TrainableModel *tm) {
     /* Re-quantize embedding (it stays float, just sync) */
     memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
 
+    /* Fused GPU requantize: latent → ternary → packed in one pass.
+     * No malloc/free per matrix. No printf spam. No host round-trip.
+     * Uses backward_ctx device buffers as scratch. */
     for (int l = 0; l < tm->cfg.n_layers; l++) {
         TrainableLayerWeights *tw = &tm->layer_weights[l];
         ModelLayer *ly = &tm->model.layers[l];
 
-        /* Build ternary-valued float array from latent, then pack */
-        float *tq;
+        requantize_gpu(&tm->backward_ctx, tw->W_q, &ly->W_q, D, D, STE_THRESHOLD);
+        requantize_gpu(&tm->backward_ctx, tw->W_k, &ly->W_k, KV, D, STE_THRESHOLD);
+        requantize_gpu(&tm->backward_ctx, tw->W_v, &ly->W_v, KV, D, STE_THRESHOLD);
+        requantize_gpu(&tm->backward_ctx, tw->W_o, &ly->W_o, D, D, STE_THRESHOLD);
 
-        /* W_q: quantize latent → ternary float → pack */
-        tq = (float*)malloc(D * D * sizeof(float));
-        for (int i = 0; i < D * D; i++)
-            tq[i] = ternary_quantize(tw->W_q[i]);
-        two3_free_weights(&ly->W_q);
-        ly->W_q = two3_pack_weights(tq, D, D);
-        free(tq);
-
-        /* W_k */
-        tq = (float*)malloc(KV * D * sizeof(float));
-        for (int i = 0; i < KV * D; i++)
-            tq[i] = ternary_quantize(tw->W_k[i]);
-        two3_free_weights(&ly->W_k);
-        ly->W_k = two3_pack_weights(tq, KV, D);
-        free(tq);
-
-        /* W_v */
-        tq = (float*)malloc(KV * D * sizeof(float));
-        for (int i = 0; i < KV * D; i++)
-            tq[i] = ternary_quantize(tw->W_v[i]);
-        two3_free_weights(&ly->W_v);
-        ly->W_v = two3_pack_weights(tq, KV, D);
-        free(tq);
-
-        /* W_o */
-        tq = (float*)malloc(D * D * sizeof(float));
-        for (int i = 0; i < D * D; i++)
-            tq[i] = ternary_quantize(tw->W_o[i]);
-        two3_free_weights(&ly->W_o);
-        ly->W_o = two3_pack_weights(tq, D, D);
-        free(tq);
-
-        /* MoE experts */
         for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            tq = (float*)malloc(INTER * D * sizeof(float));
-            for (int i = 0; i < INTER * D; i++)
-                tq[i] = ternary_quantize(tw->expert_gate[e][i]);
-            two3_free_weights(&ly->moe.experts[e].gate);
-            ly->moe.experts[e].gate = two3_pack_weights(tq, INTER, D);
-            free(tq);
-
-            tq = (float*)malloc(INTER * D * sizeof(float));
-            for (int i = 0; i < INTER * D; i++)
-                tq[i] = ternary_quantize(tw->expert_up[e][i]);
-            two3_free_weights(&ly->moe.experts[e].up);
-            ly->moe.experts[e].up = two3_pack_weights(tq, INTER, D);
-            free(tq);
-
-            tq = (float*)malloc(D * INTER * sizeof(float));
-            for (int i = 0; i < D * INTER; i++)
-                tq[i] = ternary_quantize(tw->expert_down[e][i]);
-            two3_free_weights(&ly->moe.experts[e].down);
-            ly->moe.experts[e].down = two3_pack_weights(tq, D, INTER);
-            free(tq);
+            requantize_gpu(&tm->backward_ctx, tw->expert_gate[e],
+                          &ly->moe.experts[e].gate, INTER, D, STE_THRESHOLD);
+            requantize_gpu(&tm->backward_ctx, tw->expert_up[e],
+                          &ly->moe.experts[e].up, INTER, D, STE_THRESHOLD);
+            requantize_gpu(&tm->backward_ctx, tw->expert_down[e],
+                          &ly->moe.experts[e].down, D, INTER, STE_THRESHOLD);
         }
     }
 }
@@ -459,6 +431,8 @@ static void trainable_model_free(TrainableModel *tm) {
 
     adam_free(&tm->adam_gain_C_final);
     free(tm->grad_gain_C_final);
+
+    two3_backward_ctx_free(&tm->backward_ctx);
 
     model_free(&tm->model);
 }
@@ -514,9 +488,10 @@ static void ternary_project_backward_cpu(
     }
 }
 
-/* GPU-accelerated ternary backward — uses two3_backward from two3.cu.
+/* GPU-accelerated ternary backward — uses pre-allocated context.
  * Needs the packed Two3Weights for the transposed ternary matmul. */
 static void ternary_project_backward_gpu(
+    Two3BackwardCtx *ctx,          /* pre-allocated device buffers */
     const Two3Weights *W_packed,   /* packed ternary weights (on device) */
     const float *dY,               /* [rows] gradient from above */
     const float *X,                /* [cols] saved input */
@@ -525,8 +500,8 @@ static void ternary_project_backward_gpu(
     float *dW_latent,              /* [rows × cols] gradient for latent (ACCUMULATE) */
     int rows, int cols
 ) {
-    two3_backward(W_packed, dY, X, W_latent, dX, dW_latent,
-                  rows, cols, STE_CLIP);
+    two3_backward_fast(ctx, W_packed, dY, X, W_latent, dX, dW_latent,
+                       rows, cols, STE_CLIP);
 }
 
 /* Backward through gain normalization (CPU version of kernel_gain_backward) */
@@ -856,6 +831,9 @@ static TrainResult trainable_forward_backward(
      * FORWARD PASS — save everything for backprop
      * ═══════════════════════════════════════════════════════ */
 
+    static int _timing_done = 0;
+    clock_t _t_fwd_start = clock();
+
     /* Per-position hidden states: [seq_len × dim] */
     /* We need to save hidden states BEFORE and AFTER each sublayer */
     float *hidden = (float*)calloc(seq_len * D, sizeof(float));
@@ -887,6 +865,11 @@ static TrainResult trainable_forward_backward(
     } LayerSaved;
 
     LayerSaved *saved = (LayerSaved*)calloc(L, sizeof(LayerSaved));
+
+    /* Residual scaling for deep models: scale each residual add by 1/sqrt(2*L).
+     * Prevents hidden state magnitude from growing with depth.
+     * For 2 layers: scale = 0.5.  For 4 layers: scale = 0.354. */
+    float res_scale = 1.0f / sqrtf(2.0f * (float)L);
 
     for (int l = 0; l < L; l++) {
         ModelLayer *ly = &tm->model.layers[l];
@@ -942,9 +925,9 @@ static TrainResult trainable_forward_backward(
                     sv->o_proj[t * D + i] *= s;
             }
 
-            /* 6. Residual add */
+            /* 6. Residual add (scaled for deep models) */
             for (int i = 0; i < D; i++)
-                h[i] += sv->o_proj[t * D + i];
+                h[i] += res_scale * sv->o_proj[t * D + i];
         }
 
         /* Save hidden before FFN block */
@@ -1021,9 +1004,9 @@ static TrainResult trainable_forward_backward(
                 free(expert_out);
             }
 
-            /* 10. Residual add (no extra scaling — fixed in task #7) */
+            /* 10. Residual add (scaled for deep models) */
             for (int i = 0; i < D; i++)
-                h[i] += sv->moe_out[t * D + i];
+                h[i] += res_scale * sv->moe_out[t * D + i];
         }
     }
 
@@ -1070,6 +1053,8 @@ static TrainResult trainable_forward_backward(
 
     result.loss = total_loss / (float)T;
 
+    clock_t _t_fwd_end = clock();
+
     /* ═══════════════════════════════════════════════════════
      * BACKWARD PASS — accumulates into persistent grad buffers
      * (caller must zero first via trainable_zero_grads)
@@ -1109,6 +1094,13 @@ static TrainResult trainable_forward_backward(
         LayerSaved *sv = &saved[l];
         TrainableLayerWeights *tw = &tm->layer_weights[l];
 
+        /* Layer-wise gradient clipping: prevent gradient explosion in deep models.
+         * Clip d_hidden norm per-position before it enters this layer's backward.
+         * Without this, 4+ layers reach 10^23 gradient magnitude. */
+        for (int t = 0; t < seq_len; t++) {
+            clip_grad_norm(d_hidden + t * D, D, GRAD_CLIP_NORM);
+        }
+
         /* Use persistent gradient buffers (zeroed by trainable_zero_grads) */
         float *dW_q = tw->grad_Wq;
         float *dW_k = tw->grad_Wk;
@@ -1126,9 +1118,11 @@ static TrainResult trainable_forward_backward(
         for (int t = seq_len - 1; t >= 0; t--) {
             /* d_hidden already has gradient from above (or from next layer) */
 
-            /* Step 10 backward: residual add. d_moe_out = d_hidden, d_hidden unchanged */
+            /* Step 10 backward: residual add with res_scale.
+             * Forward: h += res_scale * moe_out → d_moe_out = res_scale * d_hidden */
             float *d_moe_out = (float*)malloc(D * sizeof(float));
-            memcpy(d_moe_out, d_hidden + t * D, D * sizeof(float));
+            for (int i = 0; i < D; i++)
+                d_moe_out[i] = res_scale * d_hidden[t * D + i];
 
             /* Step 9 backward: MoE expert forward */
             float *d_normed_ffn = (float*)calloc(D, sizeof(float));
@@ -1163,6 +1157,7 @@ static TrainResult trainable_forward_backward(
                 /* d_h_expert from down projection backward */
                 float *d_h_expert = (float*)calloc(INTER, sizeof(float));
                 ternary_project_backward_gpu(
+                    &tm->backward_ctx,
                     &ly->moe.experts[eid].down,
                     d_expert_out, h_expert,
                     tw->expert_down[eid],
@@ -1193,9 +1188,11 @@ static TrainResult trainable_forward_backward(
                 /* Backward through gate and up projections (STE) */
                 float *normed = sv->pre_ffn_normed + t * D;
                 ternary_project_backward_gpu(
+                    &tm->backward_ctx,
                     &ly->moe.experts[eid].gate, d_gate, normed,
                     tw->expert_gate[eid], d_normed_ffn, dW_gate[eid], INTER, D);
                 ternary_project_backward_gpu(
+                    &tm->backward_ctx,
                     &ly->moe.experts[eid].up, d_up, normed,
                     tw->expert_up[eid], d_normed_ffn, dW_up[eid], INTER, D);
 
@@ -1231,51 +1228,48 @@ static TrainResult trainable_forward_backward(
         }
 
         /* ── Backward through attention block (reverse of steps 1-6) ── */
+        /* Three-phase approach: O backward → GPU attention backward → Q/K/V backward */
 
-        /* We need dk_store and dv_store accumulated across positions */
+        /* Phase 1: compute d_attn_out for ALL positions via O projection backward.
+         * Forward: h += res_scale * (1/sqrt(D)) * W_o @ attn_out
+         * Backward: d_o_proj = res_scale * (1/sqrt(D)) * d_hidden */
+        float *d_attn_out_all = (float*)calloc(seq_len * D, sizeof(float));
+        for (int t = 0; t < seq_len; t++) {
+            float *d_o_proj = (float*)malloc(D * sizeof(float));
+            float s = res_scale / sqrtf((float)D);
+            for (int i = 0; i < D; i++)
+                d_o_proj[i] = s * d_hidden[t * D + i];
+            ternary_project_backward_gpu(&tm->backward_ctx,
+                &ly->W_o, d_o_proj, sv->attn_out + t * D,
+                tw->W_o, d_attn_out_all + t * D, dW_o, D, D);
+            free(d_o_proj);
+        }
+
+        /* Phase 2: batched causal attention backward on GPU — all positions at once */
+        float *dq_all  = (float*)calloc(seq_len * D, sizeof(float));
         float *dk_store = (float*)calloc(seq_len * KV, sizeof(float));
         float *dv_store = (float*)calloc(seq_len * KV, sizeof(float));
 
+        two3_attention_backward(
+            sv->q_all, sv->k_store, sv->v_store, d_attn_out_all,
+            dq_all, dk_store, dv_store,
+            seq_len, NH, NKV, HD);
+
+        free(d_attn_out_all);
+
+        /* Phase 3: Q/K/V projection backward + gain backward per position */
         for (int t = seq_len - 1; t >= 0; t--) {
-            /* Step 7 backward: residual. d_o_proj = d_hidden */
-            float *d_o_proj = (float*)malloc(D * sizeof(float));
-            memcpy(d_o_proj, d_hidden + t * D, D * sizeof(float));
-
-            /* Step 6 backward: scaling on o_proj */
-            float s = 1.0f / sqrtf((float)D);
-            for (int i = 0; i < D; i++)
-                d_o_proj[i] *= s;
-
-            /* Step 5 backward: O projection (STE) */
-            float *d_attn_out = (float*)calloc(D, sizeof(float));
-            ternary_project_backward_gpu(&ly->W_o, d_o_proj, sv->attn_out + t * D,
-                tw->W_o, d_attn_out, dW_o, D, D);
-
-            /* Step 4 backward: causal attention */
-            float *dq = (float*)calloc(D, sizeof(float));
-            causal_attention_backward_cpu(
-                d_attn_out, sv->q_all + t * D,
-                sv->k_store, sv->v_store,
-                dq, dk_store, dv_store,
-                t, NH, NKV, HD);
-
-            /* Steps 2-3 backward: Q, K, V projections (STE)
-             * Note: RoPE backward is identity for magnitude (rotations preserve norm).
-             * Simplified: pass dq/dk through as-is. */
             float *d_normed_attn = (float*)calloc(D, sizeof(float));
 
-            ternary_project_backward_gpu(&ly->W_q, dq, sv->pre_attn_normed + t * D,
+            ternary_project_backward_gpu(&tm->backward_ctx,
+                &ly->W_q, dq_all + t * D, sv->pre_attn_normed + t * D,
                 tw->W_q, d_normed_attn, dW_q, D, D);
 
-            /* K and V backward: accumulate from dk_store/dv_store at position t */
-            float *dk_t = (float*)malloc(KV * sizeof(float));
-            float *dv_t = (float*)malloc(KV * sizeof(float));
-            memcpy(dk_t, dk_store + t * KV, KV * sizeof(float));
-            memcpy(dv_t, dv_store + t * KV, KV * sizeof(float));
-
-            ternary_project_backward_gpu(&ly->W_k, dk_t, sv->pre_attn_normed + t * D,
+            ternary_project_backward_gpu(&tm->backward_ctx,
+                &ly->W_k, dk_store + t * KV, sv->pre_attn_normed + t * D,
                 tw->W_k, d_normed_attn, dW_k, KV, D);
-            ternary_project_backward_gpu(&ly->W_v, dv_t, sv->pre_attn_normed + t * D,
+            ternary_project_backward_gpu(&tm->backward_ctx,
+                &ly->W_v, dv_store + t * KV, sv->pre_attn_normed + t * D,
                 tw->W_v, d_normed_attn, dW_v, KV, D);
 
             /* Step 1 backward: gain norm (attention) */
@@ -1288,12 +1282,10 @@ static TrainResult trainable_forward_backward(
             for (int i = 0; i < D; i++)
                 d_hidden[t * D + i] += d_h_pre_attn[i];
 
-            free(d_o_proj); free(d_attn_out); free(dq);
-            free(dk_t); free(dv_t);
             free(d_normed_attn); free(d_h_pre_attn);
         }
 
-        free(dk_store); free(dv_store);
+        free(dq_all); free(dk_store); free(dv_store);
 
         /* Track max gradient for monitoring */
         for (int i = 0; i < D * D; i++) {
@@ -1333,6 +1325,16 @@ static TrainResult trainable_forward_backward(
     free(hidden); free(d_hidden);
     free(final_normed); free(R_final_saved);
     free(all_logits); free(d_logits_all);
+
+    if (!_timing_done) {
+        clock_t _t_end = clock();
+        double fwd_ms = (double)(_t_fwd_end - _t_fwd_start) * 1000.0 / CLOCKS_PER_SEC;
+        double bwd_ms = (double)(_t_end - _t_fwd_end) * 1000.0 / CLOCKS_PER_SEC;
+        double total_ms = fwd_ms + bwd_ms;
+        printf("  [PROFILE] forward=%.0fms  backward=%.0fms  total=%.0fms  (fwd %.0f%% / bwd %.0f%%)\n",
+               fwd_ms, bwd_ms, total_ms, 100.0*fwd_ms/total_ms, 100.0*bwd_ms/total_ms);
+        _timing_done = 1;
+    }
 
     return result;
 }

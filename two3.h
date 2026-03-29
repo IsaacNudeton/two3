@@ -117,9 +117,56 @@ void two3_free_output(Two3Output* y);
 
 /* ----- Backward pass ----- */
 
-/* Backward through ternary projection on GPU.
- * Computes dX (transposed ternary matmul) and dW (STE outer product).
- * dX and dW are ACCUMULATED (caller must zero if needed). */
+/* Pre-allocated device buffers for backward pass.
+ * Init once, reuse across all backward calls per training step.
+ * Eliminates cudaMalloc/cudaFree overhead (~5x alloc + 5x memcpy per call). */
+typedef struct {
+    float *d_dY;        /* [max_M] device */
+    float *d_X;         /* [max_K] device */
+    float *d_dX;        /* [max_K] device */
+    float *d_W_latent;  /* [max_M * max_K] device */
+    float *d_dW;        /* [max_M * max_K] device */
+    float *h_dX_tmp;    /* [max_K] host scratch for accumulate readback */
+    int    max_M;
+    int    max_K;
+} Two3BackwardCtx;
+
+/* Allocate backward context sized for max(M) and max(K) across all layers.
+ * Call once at training init. */
+Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K);
+
+/* Free backward context. */
+void two3_backward_ctx_free(Two3BackwardCtx* ctx);
+
+/* Backward with pre-allocated context (fast path — no per-call malloc). */
+void two3_backward_fast(
+    Two3BackwardCtx* ctx,
+    const Two3Weights* W,     /* packed ternary (device) */
+    const float* dY_host,     /* [1, M] */
+    const float* X_host,      /* [1, K] */
+    const float* W_latent,    /* [M, K] host */
+    float* dX_host,           /* [K] accumulate */
+    float* dW_host,           /* [M, K] accumulate */
+    int M, int K,
+    float ste_clip);
+
+/* ----- Attention backward on GPU ----- */
+
+/* Batched causal attention backward — processes ALL positions at once.
+ * Replaces per-position causal_attention_backward_cpu loop.
+ * All arrays are host memory. Copies to/from GPU internally.
+ * dK and dV are ACCUMULATED. dQ is OUTPUT (zeroed internally). */
+void two3_attention_backward(
+    const float* Q_host,     /* [seq_len, n_heads * head_dim] */
+    const float* K_host,     /* [seq_len, n_kv_heads * head_dim] */
+    const float* V_host,     /* [seq_len, n_kv_heads * head_dim] */
+    const float* d_out_host, /* [seq_len, n_heads * head_dim] */
+    float* dQ_host,          /* [seq_len, n_heads * head_dim] OUTPUT */
+    float* dK_host,          /* [seq_len, n_kv_heads * head_dim] ACCUMULATE */
+    float* dV_host,          /* [seq_len, n_kv_heads * head_dim] ACCUMULATE */
+    int seq_len, int n_heads, int n_kv_heads, int head_dim);
+
+/* Original backward (allocates per call — kept for tests/compat). */
 void two3_backward(
     const Two3Weights* W,     /* packed ternary (device) */
     const float* dY_host,     /* [1, M] */

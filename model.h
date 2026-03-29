@@ -459,6 +459,9 @@ static void model_forward_sequence_cpu(
     float *o_proj  = (float*)malloc(D * sizeof(float));
     float *moe_out = (float*)malloc(D * sizeof(float));
 
+    /* Residual scaling for deep models: 1/sqrt(2*L) per residual add */
+    float res_scale = 1.0f / sqrtf(2.0f * (float)m->cfg.n_layers);
+
     for (int l = 0; l < m->cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];
 
@@ -498,9 +501,9 @@ static void model_forward_sequence_cpu(
                 for (int i = 0; i < D; i++) o_proj[i] *= s;
             }
 
-            /* 7. Residual add */
+            /* 7. Residual add (scaled for deep models) */
             for (int i = 0; i < D; i++)
-                h[i] += o_proj[i];
+                h[i] += res_scale * o_proj[i];
 
             /* ── FFN block ── */
 
@@ -512,11 +515,9 @@ static void model_forward_sequence_cpu(
             moe_route(&ly->moe.router, normed, &sel);
             moe_forward_real(&ly->moe, normed, moe_out, &sel);
 
-            /* 10. Residual add (no extra scaling — internal 1/sqrt(dim)
-             * before squared ReLU is sufficient. External scaling here
-             * would compound to 1/dim, killing FFN gradients.) */
+            /* 10. Residual add (scaled for deep models) */
             for (int i = 0; i < D; i++)
-                h[i] += moe_out[i];
+                h[i] += res_scale * moe_out[i];
         }
 
         free(k_store);
