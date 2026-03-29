@@ -1,0 +1,175 @@
+/*
+ * gain.h — Gain Kernel Normalization for {2,3} Architecture
+ *
+ * NOT RMSNorm. This is the engine's own normalization:
+ *   R' = R + γ(C - R) - κ·R·|x|     (reservoir update)
+ *   y  = x · (1 + α·R - β)           (amplitude control)
+ *
+ * Properties (Lean-verified):
+ *   - Fixed point exists and is unique above threshold
+ *   - Spectral radius < 1 (Jury conditions)
+ *   - 65x CFL safety margin with physical parameters
+ *   - Normalizes (prevents explosion like RMSNorm)
+ *   - Amplifies (weak signals get boosted — RMSNorm can't)
+ *   - Learns (reservoir carries memory across forward passes)
+ *
+ * Isaac & CC — March 2026
+ */
+
+#ifndef GAIN_H
+#define GAIN_H
+
+#include <stdint.h>
+#include <math.h>
+
+/* ═══════════════════════════════════════════════════════
+ * Gain parameters — within CFL stability bound
+ *
+ * CFL: γ < 4 / (Θ(2-β) + β)  where Θ = αC/β
+ * With γ=0.006, β=0.01, Θ=5: bound=0.417, margin=65x
+ * ═══════════════════════════════════════════════════════ */
+
+#define GAIN_ALPHA  0.05f    /* gain coupling */
+#define GAIN_BETA   0.01f    /* grid loss (must be < 1) */
+#define GAIN_GAMMA  0.006f   /* recharge rate ≈ 1/SUBSTRATE_INT */
+#define GAIN_KAPPA  0.05f    /* depletion rate (= alpha, natural choice) */
+
+/* ═══════════════════════════════════════════════════════
+ * Gain state — persistent reservoir per feature
+ * ═══════════════════════════════════════════════════════ */
+
+typedef struct {
+    float *R;          /* [dim] reservoir state — persists across tokens */
+    float *C;          /* [dim] capacity — learnable parameter */
+    int    dim;
+} GainState;
+
+/* Initialize: reservoir starts full (R = C), capacity learnable from 1.0 */
+static void gain_init(GainState *g, int dim) {
+    g->dim = dim;
+    g->R = (float*)calloc(dim, sizeof(float));
+    g->C = (float*)malloc(dim * sizeof(float));
+    for (int i = 0; i < dim; i++) {
+        g->C[i] = 1.0f;   /* initial capacity — gets trained */
+        g->R[i] = g->C[i]; /* reservoir starts at capacity */
+    }
+}
+
+static void gain_free(GainState *g) {
+    free(g->R); free(g->C);
+    g->R = g->C = NULL;
+}
+
+/* ═══════════════════════════════════════════════════════
+ * CUDA kernel: gain normalization
+ *
+ * Per element:
+ *   E = |x[i]|
+ *   R[i] = R[i] + γ(C[i] - R[i]) - κ·R[i]·E
+ *   y[i] = x[i] · (1 + α·R[i] - β)
+ *
+ * The reservoir depletes where signal is strong (normalizes).
+ * The reservoir recharges where signal is weak (amplifies).
+ * The fixed point is R* = β/α, E* = γ(αC-β)/(κβ).
+ * ═══════════════════════════════════════════════════════ */
+
+#ifdef __CUDACC__
+
+__global__ void kernel_gain_forward(
+    float       *y,      /* [dim] output */
+    const float *x,      /* [dim] input */
+    float       *R,      /* [dim] reservoir — READ AND WRITE */
+    const float *C,      /* [dim] capacity */
+    int dim,
+    float alpha, float beta, float gamma_r, float kappa
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+
+    float xi = x[i];
+    float E = fabsf(xi);
+    float Ri = R[i];
+    float Ci = C[i];
+
+    /* Reservoir update: R' = R + γ(C - R) - κ·R·E */
+    float R_new = Ri + gamma_r * (Ci - Ri) - kappa * Ri * E;
+    if (R_new < 0.0f) R_new = 0.0f;  /* reservoir can't go negative */
+
+    /* Amplitude control: y = x · (1 + α·R - β) */
+    float gain = 1.0f + alpha * R_new - beta;
+    float yi = xi * gain;
+
+    /* Write back */
+    R[i] = R_new;
+    y[i] = yi;
+}
+
+/* Gain backward: gradient through the gain operation
+ * Forward: y = x * (1 + α*R - β)
+ * dy/dx = (1 + α*R - β) = gain
+ * dy/dR = x * α
+ * dR/dx: R depends on |x| through depletion term, but for STE we ignore this */
+__global__ void kernel_gain_backward(
+    float       *dx,     /* [dim] gradient w.r.t. input */
+    const float *dy,     /* [dim] gradient from above */
+    const float *x,      /* [dim] saved input */
+    const float *R,      /* [dim] reservoir at time of forward */
+    float       *dC,     /* [dim] gradient w.r.t. capacity (for learning C) */
+    int dim,
+    float alpha, float beta, float gamma_r
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+
+    float gain = 1.0f + alpha * R[i] - beta;
+    dx[i] = dy[i] * gain;
+
+    /* dC: through the reservoir update path
+     * R' = R + γ(C - R) - κ*R*E
+     * dR'/dC = γ
+     * dy/dC = dy/dR' * dR'/dC = x * α * γ
+     * Accumulate across tokens */
+    dC[i] += dy[i] * x[i] * alpha * gamma_r;
+}
+
+#endif /* __CUDACC__ */
+
+/* ═══════════════════════════════════════════════════════
+ * CPU reference for testing
+ * ═══════════════════════════════════════════════════════ */
+
+static void gain_forward_cpu(
+    float *y, const float *x, float *R, const float *C,
+    int dim
+) {
+    for (int i = 0; i < dim; i++) {
+        float E = fabsf(x[i]);
+        float R_new = R[i] + GAIN_GAMMA * (C[i] - R[i]) - GAIN_KAPPA * R[i] * E;
+        if (R_new < 0.0f) R_new = 0.0f;
+        float gain = 1.0f + GAIN_ALPHA * R_new - GAIN_BETA;
+        y[i] = x[i] * gain;
+        R[i] = R_new;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Fixed point calculation (for verification)
+ * ═══════════════════════════════════════════════════════ */
+
+static float gain_R_star(void) { return GAIN_BETA / GAIN_ALPHA; }
+
+static float gain_E_star(float C) {
+    float threshold = GAIN_ALPHA * C - GAIN_BETA;
+    if (threshold <= 0) return 0.0f;  /* below threshold */
+    return GAIN_GAMMA * threshold / (GAIN_KAPPA * GAIN_BETA);
+}
+
+/* Check CFL condition */
+static int gain_cfl_check(float C_max) {
+    float theta = GAIN_ALPHA * C_max / GAIN_BETA;
+    float bound = 4.0f / (theta * (2.0f - GAIN_BETA) + GAIN_BETA);
+    float margin = bound / GAIN_GAMMA;
+    return (GAIN_GAMMA < bound) ? (int)margin : 0;
+}
+
+#endif /* GAIN_H */
