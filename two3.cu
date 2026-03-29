@@ -599,8 +599,12 @@ void two3_backward(
  * Pre-allocated backward context — eliminates per-call malloc
  * ================================================================ */
 
-Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K) {
+Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K,
+                                        int max_seq, int D, int KV, int n_heads) {
     Two3BackwardCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    /* Ternary projection buffers */
     ctx.max_M = max_M;
     ctx.max_K = max_K;
     CUDA_CHECK(cudaMalloc(&ctx.d_dY, max_M * sizeof(float)));
@@ -609,6 +613,32 @@ Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K) {
     CUDA_CHECK(cudaMalloc(&ctx.d_W_latent, (size_t)max_M * max_K * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx.d_dW, (size_t)max_M * max_K * sizeof(float)));
     ctx.h_dX_tmp = (float*)malloc(max_K * sizeof(float));
+
+    /* Attention backward buffers */
+    if (max_seq > 0 && D > 0) {
+        /* Safety: scratch = n_heads * max_seq^2. Warn if > 256MB. */
+        size_t scratch_bytes = (size_t)n_heads * max_seq * max_seq * sizeof(float);
+        if (scratch_bytes > 256 * 1024 * 1024) {
+            fprintf(stderr, "[two3] WARNING: attention scratch = %zuMB "
+                    "(n_heads=%d, max_seq=%d). Consider reducing max_seq.\n",
+                    scratch_bytes / (1024*1024), n_heads, max_seq);
+        }
+        ctx.attn_max_seq = max_seq;
+        ctx.attn_D = D;
+        ctx.attn_KV = KV;
+        ctx.attn_n_heads = n_heads;
+        CUDA_CHECK(cudaMalloc(&ctx.d_attn_Q,       (size_t)max_seq * D  * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx.d_attn_K,       (size_t)max_seq * KV * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx.d_attn_V,       (size_t)max_seq * KV * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx.d_attn_dout,    (size_t)max_seq * D  * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx.d_attn_dQ,      (size_t)max_seq * D  * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx.d_attn_dK,      (size_t)max_seq * KV * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx.d_attn_dV,      (size_t)max_seq * KV * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx.d_attn_scratch,  (size_t)n_heads * max_seq * max_seq * sizeof(float)));
+        ctx.h_attn_dK_tmp = (float*)malloc(max_seq * KV * sizeof(float));
+        ctx.h_attn_dV_tmp = (float*)malloc(max_seq * KV * sizeof(float));
+    }
+
     return ctx;
 }
 
@@ -619,6 +649,17 @@ void two3_backward_ctx_free(Two3BackwardCtx* ctx) {
     if (ctx->d_W_latent) cudaFree(ctx->d_W_latent);
     if (ctx->d_dW)      cudaFree(ctx->d_dW);
     if (ctx->h_dX_tmp)  free(ctx->h_dX_tmp);
+    /* Attention buffers */
+    if (ctx->d_attn_Q)       cudaFree(ctx->d_attn_Q);
+    if (ctx->d_attn_K)       cudaFree(ctx->d_attn_K);
+    if (ctx->d_attn_V)       cudaFree(ctx->d_attn_V);
+    if (ctx->d_attn_dout)    cudaFree(ctx->d_attn_dout);
+    if (ctx->d_attn_dQ)      cudaFree(ctx->d_attn_dQ);
+    if (ctx->d_attn_dK)      cudaFree(ctx->d_attn_dK);
+    if (ctx->d_attn_dV)      cudaFree(ctx->d_attn_dV);
+    if (ctx->d_attn_scratch) cudaFree(ctx->d_attn_scratch);
+    if (ctx->h_attn_dK_tmp)  free(ctx->h_attn_dK_tmp);
+    if (ctx->h_attn_dV_tmp)  free(ctx->h_attn_dV_tmp);
     memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -642,12 +683,12 @@ void two3_backward_fast(
     CUDA_CHECK(cudaMemcpy(ctx->d_W_latent, W_latent, M * K * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx->d_dW, dW_host, M * K * sizeof(float), cudaMemcpyHostToDevice));
 
-    /* Kernel 1: dX = dY @ W_ternary (transposed ternary matmul) */
+    /* Kernel 1: dX = dY @ W_ternary (tiled transposed ternary matmul) */
     {
-        dim3 block(TWO3_BLOCK_X, TWO3_BLOCK_Y);
-        dim3 grid((K + block.x - 1) / block.x,
-                  (S + block.y - 1) / block.y);
-        two3_backward_dx_kernel<<<grid, block>>>(
+        dim3 block(TILE_M, TILE_N);
+        dim3 grid((K + TILE_M - 1) / TILE_M,
+                  (S + TILE_N - 1) / TILE_N);
+        two3_backward_dx_tiled<<<grid, block>>>(
             W->packed, ctx->d_dY, ctx->d_dX, S, M, K);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -676,6 +717,50 @@ void two3_backward_fast(
  * Batched causal attention backward on GPU
  * ================================================================ */
 
+void two3_attention_backward_fast(
+    Two3BackwardCtx* ctx,
+    const float* Q_host, const float* K_host, const float* V_host,
+    const float* d_out_host,
+    float* dQ_host, float* dK_host, float* dV_host,
+    int seq_len, int n_heads, int n_kv_heads, int head_dim
+) {
+    int D  = n_heads * head_dim;
+    int KV = n_kv_heads * head_dim;
+
+    /* Copy inputs to pre-allocated device buffers */
+    CUDA_CHECK(cudaMemcpy(ctx->d_attn_Q,    Q_host,     seq_len * D  * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_attn_K,    K_host,     seq_len * KV * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_attn_V,    V_host,     seq_len * KV * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_attn_dout, d_out_host, seq_len * D  * sizeof(float), cudaMemcpyHostToDevice));
+
+    /* Zero output buffers */
+    CUDA_CHECK(cudaMemset(ctx->d_attn_dQ, 0, seq_len * D  * sizeof(float)));
+    CUDA_CHECK(cudaMemset(ctx->d_attn_dK, 0, seq_len * KV * sizeof(float)));
+    CUDA_CHECK(cudaMemset(ctx->d_attn_dV, 0, seq_len * KV * sizeof(float)));
+
+    /* Launch kernel */
+    int block_size = 128;
+    dim3 grid(n_heads, (seq_len + block_size - 1) / block_size);
+    attention_backward_kernel<<<grid, block_size>>>(
+        ctx->d_attn_Q, ctx->d_attn_K, ctx->d_attn_V, ctx->d_attn_dout,
+        ctx->d_attn_dQ, ctx->d_attn_dK, ctx->d_attn_dV, ctx->d_attn_scratch,
+        seq_len, n_heads, n_kv_heads, head_dim);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    /* Copy dQ back (output, not accumulated) */
+    CUDA_CHECK(cudaMemcpy(dQ_host, ctx->d_attn_dQ, seq_len * D * sizeof(float), cudaMemcpyDeviceToHost));
+
+    /* Copy dK, dV back and ACCUMULATE into host buffers */
+    CUDA_CHECK(cudaMemcpy(ctx->h_attn_dK_tmp, ctx->d_attn_dK, seq_len * KV * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ctx->h_attn_dV_tmp, ctx->d_attn_dV, seq_len * KV * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < seq_len * KV; i++) {
+        dK_host[i] += ctx->h_attn_dK_tmp[i];
+        dV_host[i] += ctx->h_attn_dV_tmp[i];
+    }
+}
+
+/* Original attention backward (allocates per call — kept for compat). */
 void two3_attention_backward(
     const float* Q_host,     /* [seq_len, D] where D = n_heads * head_dim */
     const float* K_host,     /* [seq_len, KV] where KV = n_kv_heads * head_dim */

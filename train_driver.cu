@@ -205,7 +205,9 @@ int main(int argc, char **argv) {
     ModelConfig mcfg = cfg.use_large ? model_config_large()
                      : cfg.use_medium ? model_config_medium()
                      : model_config_default();
-    if (mcfg.max_seq < cfg.seq_len) mcfg.max_seq = cfg.seq_len;
+    /* Clamp max_seq to training seq_len — no need to allocate scratch for
+     * sequences longer than we'll actually train on. */
+    mcfg.max_seq = cfg.seq_len;
 
     printf("  Model: dim=%d, layers=%d, heads=%d, kv=%d, inter=%d\n",
            mcfg.dim, mcfg.n_layers, mcfg.n_heads, mcfg.n_kv_heads, mcfg.intermediate);

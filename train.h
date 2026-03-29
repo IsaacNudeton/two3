@@ -351,7 +351,8 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         int max_M = D > INTER ? D : INTER;
         if (KV > max_M) max_M = KV;
         int max_K = D > INTER ? D : INTER;
-        tm->backward_ctx = two3_backward_ctx_init(max_M, max_K);
+        tm->backward_ctx = two3_backward_ctx_init(max_M, max_K,
+            cfg.max_seq, D, KV, cfg.n_heads);
     }
 
     /* Quantize latent weights to ternary for the model
@@ -1250,7 +1251,8 @@ static TrainResult trainable_forward_backward(
         float *dk_store = (float*)calloc(seq_len * KV, sizeof(float));
         float *dv_store = (float*)calloc(seq_len * KV, sizeof(float));
 
-        two3_attention_backward(
+        two3_attention_backward_fast(
+            &tm->backward_ctx,
             sv->q_all, sv->k_store, sv->v_store, d_attn_out_all,
             dq_all, dk_store, dv_store,
             seq_len, NH, NKV, HD);

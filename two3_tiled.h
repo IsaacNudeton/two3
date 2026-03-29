@@ -159,8 +159,109 @@ static __global__ void two3_matmul_tiled(
     }
 }
 
-/* NOTE: Tiled backward dX kernel deferred to task #23.
- * Needs proper weight tiling into shared memory (not half-done). */
+/*
+ * Tiled backward dX kernel.
+ *
+ * dX[s][k] = sum_m dY[s][m] * sign(W[m][k])
+ *
+ * Transposed ternary matmul: iterate over M dimension.
+ * Tiles BOTH dY and W into shared memory.
+ *
+ * Tile dimensions (reuse forward tile sizes where possible):
+ *   Block: TILE_M × TILE_N = 16 × 16 threads
+ *   Thread (tx, ty) → output element dX[s, k]
+ *     tx = k within tile, ty = s within tile
+ *   Tile over M in chunks of TILE_M_BW = 64
+ *
+ * Shared memory per tile:
+ *   dY:  TILE_N × TILE_M_BW × sizeof(float) = 16 × 64 × 4 = 4096 bytes
+ *   W:   TILE_M_BW × (TILE_M/4) × sizeof(uint8_t) = 64 × 4 = 256 bytes
+ *   Total: 4352 bytes — well within 48KB
+ *
+ * Global memory reads per output element:
+ *   Before: M reads of dY + M reads of W (all from global)
+ *   After:  M/TILE_M_BW tiles, shared within block
+ */
+#define TILE_M_BW 64  /* M-dimension tile for backward */
+
+static __global__ void two3_backward_dx_tiled(
+    const uint8_t* __restrict__ W,    /* [M, K/4] packed ternary */
+    const float*   __restrict__ dY,   /* [S, M]   gradient */
+    float*         __restrict__ dX,   /* [S, K]   output gradient (accumulate) */
+    int S, int M, int K)
+{
+    int tx = threadIdx.x;  /* k within tile (0..TILE_M-1, reused as K tile) */
+    int ty = threadIdx.y;  /* s within tile (0..TILE_N-1) */
+
+    int k = blockIdx.x * TILE_M + tx;
+    int s = blockIdx.y * TILE_N + ty;
+
+    int K4 = K / 4;
+    int j_shift = (k < K) ? (k % 4) * 2 : 0;
+
+    float acc = 0.0f;
+
+    /* Iterate over M in tiles */
+    for (int m_base = 0; m_base < M; m_base += TILE_M_BW) {
+        /* Shared memory for this tile */
+        __shared__ float   sdY[TILE_N][TILE_M_BW];   /* [16][64] = 4KB */
+        __shared__ uint8_t sW[TILE_M_BW][4];          /* [64][4]  = 256B — 4 packed bytes per M row */
+
+        /* ── Cooperative load: dY tile [TILE_N × TILE_M_BW] ── */
+        /* Total: 16 × 64 = 1024 floats. Threads: 256. Each loads 4. */
+        {
+            int tid = ty * TILE_M + tx;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int idx = tid * 4 + i;
+                int ln = idx / TILE_M_BW;   /* which s row */
+                int lm = idx % TILE_M_BW;   /* which m col */
+                int gs = blockIdx.y * TILE_N + ln;
+                int gm = m_base + lm;
+                sdY[ln][lm] = (gs < S && gm < M) ? dY[gs * M + gm] : 0.0f;
+            }
+        }
+
+        /* ── Cooperative load: W tile [TILE_M_BW × 4 packed bytes] ── */
+        /* For this block's k range (blockIdx.x * TILE_M .. +15),
+         * the packed byte columns needed are pk0..pk0+3 (since 16/4=4).
+         * Total: 64 × 4 = 256 bytes. Threads: 256. Each loads 1. */
+        {
+            int tid = ty * TILE_M + tx;
+            int pk_base = (blockIdx.x * TILE_M) / 4;
+
+            if (tid < TILE_M_BW * 4) {
+                int lm  = tid / 4;
+                int lpk = tid % 4;
+                int gm  = m_base + lm;
+                int gpk = pk_base + lpk;
+                sW[lm][lpk] = (gm < M && gpk < K4) ? W[gm * K4 + gpk] : 0;
+            }
+        }
+
+        __syncthreads();
+
+        /* ── Accumulate from this tile ── */
+        if (k < K && s < S) {
+            int lpk = (k / 4) - (blockIdx.x * TILE_M) / 4;  /* local packed byte index (0..3) */
+            int end_m = TILE_M_BW;
+            if (m_base + end_m > M) end_m = M - m_base;
+
+            for (int lm = 0; lm < end_m; lm++) {
+                uint8_t packed = sW[lm][lpk];
+                uint8_t bits = (packed >> j_shift) & 0x3;
+                int sign = (int)(bits & 1) - (int)(bits >> 1);
+                acc += (float)sign * sdY[ty][lm];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (k < K && s < S) {
+        dX[s * K + k] += acc;
+    }
+}
 
 /*
  * Fused requantize kernel.

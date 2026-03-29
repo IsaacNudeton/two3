@@ -119,8 +119,9 @@ void two3_free_output(Two3Output* y);
 
 /* Pre-allocated device buffers for backward pass.
  * Init once, reuse across all backward calls per training step.
- * Eliminates cudaMalloc/cudaFree overhead (~5x alloc + 5x memcpy per call). */
+ * Eliminates cudaMalloc/cudaFree overhead. */
 typedef struct {
+    /* Ternary projection backward buffers */
     float *d_dY;        /* [max_M] device */
     float *d_X;         /* [max_K] device */
     float *d_dX;        /* [max_K] device */
@@ -129,11 +130,29 @@ typedef struct {
     float *h_dX_tmp;    /* [max_K] host scratch for accumulate readback */
     int    max_M;
     int    max_K;
+
+    /* Attention backward buffers (sized at init for max_seq × D/KV) */
+    float *d_attn_Q;       /* [max_seq * D] device */
+    float *d_attn_K;       /* [max_seq * KV] device */
+    float *d_attn_V;       /* [max_seq * KV] device */
+    float *d_attn_dout;    /* [max_seq * D] device */
+    float *d_attn_dQ;      /* [max_seq * D] device */
+    float *d_attn_dK;      /* [max_seq * KV] device */
+    float *d_attn_dV;      /* [max_seq * KV] device */
+    float *d_attn_scratch; /* [n_heads * max_seq * max_seq] device */
+    float *h_attn_dK_tmp;  /* [max_seq * KV] host scratch */
+    float *h_attn_dV_tmp;  /* [max_seq * KV] host scratch */
+    int    attn_max_seq;
+    int    attn_D;
+    int    attn_KV;
+    int    attn_n_heads;
 } Two3BackwardCtx;
 
 /* Allocate backward context sized for max(M) and max(K) across all layers.
+ * Also allocates attention backward buffers if max_seq > 0.
  * Call once at training init. */
-Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K);
+Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K,
+                                        int max_seq, int D, int KV, int n_heads);
 
 /* Free backward context. */
 void two3_backward_ctx_free(Two3BackwardCtx* ctx);
@@ -152,10 +171,19 @@ void two3_backward_fast(
 
 /* ----- Attention backward on GPU ----- */
 
-/* Batched causal attention backward — processes ALL positions at once.
- * Replaces per-position causal_attention_backward_cpu loop.
- * All arrays are host memory. Copies to/from GPU internally.
- * dK and dV are ACCUMULATED. dQ is OUTPUT (zeroed internally). */
+/* Batched causal attention backward with pre-allocated buffers (fast path). */
+void two3_attention_backward_fast(
+    Two3BackwardCtx* ctx,
+    const float* Q_host,     /* [seq_len, n_heads * head_dim] */
+    const float* K_host,     /* [seq_len, n_kv_heads * head_dim] */
+    const float* V_host,     /* [seq_len, n_kv_heads * head_dim] */
+    const float* d_out_host, /* [seq_len, n_heads * head_dim] */
+    float* dQ_host,          /* [seq_len, n_heads * head_dim] OUTPUT */
+    float* dK_host,          /* [seq_len, n_kv_heads * head_dim] ACCUMULATE */
+    float* dV_host,          /* [seq_len, n_kv_heads * head_dim] ACCUMULATE */
+    int seq_len, int n_heads, int n_kv_heads, int head_dim);
+
+/* Original attention backward (allocates per call — kept for compat). */
 void two3_attention_backward(
     const float* Q_host,     /* [seq_len, n_heads * head_dim] */
     const float* K_host,     /* [seq_len, n_kv_heads * head_dim] */
