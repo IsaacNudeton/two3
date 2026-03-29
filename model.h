@@ -1,7 +1,7 @@
 /*
  * model.h — Complete {2,3} Model
  *
- * Layer 2: wraps all components into a full model.
+ * Layer 2: wraps all components into a full model with REAL attention.
  *
  * Architecture:
  *   byte_in (0-255) → embedding (256 × dim, float) → gain_norm
@@ -11,6 +11,9 @@
  * No tokenizer. No BPE. No vocabulary beyond 256 bytes.
  * Sequences are longer but ternary matmul at 408 GOPS handles it.
  * Embedding table is 512KB, not 64MB.
+ *
+ * THIS VERSION: real causal attention, real ternary projections,
+ * full-sequence forward pass. No stubs. No simulations.
  *
  * Isaac & CC — March 2026
  */
@@ -23,6 +26,9 @@
 #include "rope.h"
 #include "activation.h"
 #include "moe.h"
+
+#include <string.h>
+#include <float.h>
 
 /* ═══════════════════════════════════════════════════════
  * Model config
@@ -79,9 +85,8 @@ typedef struct {
 typedef struct {
     ModelConfig  cfg;
 
-    /* Byte embedding: 256 × dim, float16 stored as float */
+    /* Byte embedding: 256 × dim, float */
     float       *embed;         /* [256 × dim] on host */
-    float       *d_embed;       /* [256 × dim] on GPU */
 
     /* Layers */
     ModelLayer  *layers;        /* [n_layers] */
@@ -97,42 +102,11 @@ typedef struct {
 } Model;
 
 /* ═══════════════════════════════════════════════════════
- * Embedding lookup — just index into the table
+ * Embedding — just index into the table
  * ═══════════════════════════════════════════════════════ */
 
-#ifdef __CUDACC__
-
-__global__ void kernel_byte_embed(
-    float *out,             /* [dim] */
-    const float *embed,     /* [256 × dim] */
-    int byte_val, int dim
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < dim) out[i] = embed[byte_val * dim + i];
-}
-
-/* Output logits: dot product of hidden with each embedding row */
-__global__ void kernel_byte_logits(
-    float *logits,          /* [256] */
-    const float *hidden,    /* [dim] */
-    const float *embed,     /* [256 × dim] */
-    int dim
-) {
-    int byte_val = threadIdx.x;  /* one thread per byte value */
-    if (byte_val >= 256) return;
-
-    float sum = 0;
-    for (int d = 0; d < dim; d++)
-        sum += hidden[d] * embed[byte_val * dim + d];
-    logits[byte_val] = sum;
-}
-
-#endif /* __CUDACC__ */
-
-/* CPU reference */
 static void byte_embed_cpu(float *out, const float *embed, int byte_val, int dim) {
-    for (int i = 0; i < dim; i++)
-        out[i] = embed[byte_val * dim + i];
+    memcpy(out, embed + byte_val * dim, dim * sizeof(float));
 }
 
 static void byte_logits_cpu(float *logits, const float *hidden, const float *embed, int dim) {
@@ -144,16 +118,37 @@ static void byte_logits_cpu(float *logits, const float *hidden, const float *emb
     }
 }
 
+#ifdef __CUDACC__
+
+__global__ void kernel_byte_embed(
+    float *out, const float *embed, int byte_val, int dim
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) out[i] = embed[byte_val * dim + i];
+}
+
+__global__ void kernel_byte_logits(
+    float *logits, const float *hidden, const float *embed, int dim
+) {
+    int byte_val = threadIdx.x;
+    if (byte_val >= 256) return;
+    float sum = 0;
+    for (int d = 0; d < dim; d++)
+        sum += hidden[d] * embed[byte_val * dim + d];
+    logits[byte_val] = sum;
+}
+
+#endif /* __CUDACC__ */
+
 /* Softmax + sample */
 static int byte_sample(float *logits, float temperature) {
-    /* Divide by temperature */
     for (int i = 0; i < 256; i++)
         logits[i] /= temperature;
 
-    /* Softmax */
     float max_l = logits[0];
     for (int i = 1; i < 256; i++)
         if (logits[i] > max_l) max_l = logits[i];
+
     float sum = 0;
     for (int i = 0; i < 256; i++) {
         logits[i] = expf(logits[i] - max_l);
@@ -162,7 +157,6 @@ static int byte_sample(float *logits, float temperature) {
     for (int i = 0; i < 256; i++)
         logits[i] /= sum;
 
-    /* Sample from distribution */
     float r = (float)rand() / (float)RAND_MAX;
     float cumsum = 0;
     for (int i = 0; i < 256; i++) {
@@ -173,7 +167,154 @@ static int byte_sample(float *logits, float temperature) {
 }
 
 /* ═══════════════════════════════════════════════════════
- * Model init — random ternary weights
+ * Ternary projection helper — CPU path through GPU kernel
+ *
+ * Takes float input, quantizes to int8, runs ternary matmul
+ * on GPU, dequantizes back to float. This is the REAL path.
+ * ═══════════════════════════════════════════════════════ */
+
+static void ternary_project_cpu(
+    const Two3Weights *W,
+    const float *input,     /* [dim_in] */
+    float *output,          /* [dim_out] (= W->rows) */
+    int dim_in
+) {
+    Two3Activations X = two3_quantize_acts(input, 1, dim_in);
+    Two3Output Y = two3_forward(W, &X);
+    two3_dequantize_output(&Y, W, &X, output);
+    two3_free_output(&Y);
+    two3_free_acts(&X);
+}
+
+/* ═══════════════════════════════════════════════════════
+ * MoE expert forward — REAL ternary gate/up/down
+ *
+ * gate = ternary_matmul(x, expert.gate) → squared_relu
+ * up   = ternary_matmul(x, expert.up)
+ * h    = gate * up
+ * out  = ternary_matmul(h, expert.down)
+ * ═══════════════════════════════════════════════════════ */
+
+static void moe_expert_forward_real(
+    const MoEExpert *expert,
+    const float *x,          /* [dim] */
+    float *output,           /* [dim] */
+    int dim, int intermediate
+) {
+    float *gate = (float*)malloc(intermediate * sizeof(float));
+    float *up   = (float*)malloc(intermediate * sizeof(float));
+
+    /* Gate and Up projections (ternary) */
+    ternary_project_cpu(&expert->gate, x, gate, dim);
+    ternary_project_cpu(&expert->up, x, up, dim);
+
+    /* Squared ReLU on gate */
+    squared_relu_cpu(gate, gate, intermediate);
+
+    /* Element-wise: gate * up */
+    for (int i = 0; i < intermediate; i++)
+        gate[i] *= up[i];
+
+    /* Down projection (ternary) */
+    ternary_project_cpu(&expert->down, gate, output, intermediate);
+
+    free(gate);
+    free(up);
+}
+
+/* MoE forward with real expert computation */
+static void moe_forward_real(
+    const MoELayer *moe,
+    const float *x,          /* [dim] */
+    float *output,           /* [dim] */
+    const MoESelection *sel
+) {
+    int D = moe->dim;
+    memset(output, 0, D * sizeof(float));
+
+    float *expert_out = (float*)malloc(D * sizeof(float));
+
+    for (int k = 0; k < MOE_TOP_K; k++) {
+        int eid = sel->expert_ids[k];
+        float w = sel->expert_weights[k];
+
+        moe_expert_forward_real(&moe->experts[eid], x, expert_out,
+                                 D, moe->intermediate);
+
+        for (int i = 0; i < D; i++)
+            output[i] += w * expert_out[i];
+    }
+
+    free(expert_out);
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Causal attention — the real thing
+ *
+ * For position `pos`, attending to positions 0..pos:
+ *   scores[t] = Q[pos] · K[t] / sqrt(head_dim)  for t = 0..pos
+ *   weights = softmax(scores[0..pos])
+ *   out[h] = sum_t weights[t] * V[t][kv_h]
+ *
+ * GQA: multiple query heads share the same KV head.
+ * heads_per_kv = n_heads / n_kv_heads
+ * ═══════════════════════════════════════════════════════ */
+
+static void causal_attention_cpu(
+    const float *q,          /* [n_heads * head_dim] for current position */
+    const float *k_store,    /* [pos+1, n_kv_heads * head_dim] all K so far */
+    const float *v_store,    /* [pos+1, n_kv_heads * head_dim] all V so far */
+    float *out,              /* [dim] = [n_heads * head_dim] output */
+    int pos,                 /* current position (0-indexed) */
+    int n_heads, int n_kv_heads, int head_dim
+) {
+    int kv_dim = n_kv_heads * head_dim;
+    int heads_per_kv = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int seq_len = pos + 1;  /* attend to positions 0..pos inclusive */
+
+    float *scores = (float*)malloc(seq_len * sizeof(float));
+
+    for (int h = 0; h < n_heads; h++) {
+        int kv_h = h / heads_per_kv;
+
+        /* Compute attention scores: Q[h] · K[t][kv_h] for t = 0..pos */
+        for (int t = 0; t < seq_len; t++) {
+            float dot = 0;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[h * head_dim + d] * k_store[t * kv_dim + kv_h * head_dim + d];
+            scores[t] = dot * scale;
+        }
+        /* Causal mask: all positions 0..pos are visible. No masking needed
+         * because we only compute scores for t <= pos. */
+
+        /* Softmax over scores[0..pos] */
+        float max_s = scores[0];
+        for (int t = 1; t < seq_len; t++)
+            if (scores[t] > max_s) max_s = scores[t];
+
+        float sum_exp = 0;
+        for (int t = 0; t < seq_len; t++) {
+            scores[t] = expf(scores[t] - max_s);
+            sum_exp += scores[t];
+        }
+        for (int t = 0; t < seq_len; t++)
+            scores[t] /= sum_exp;
+
+        /* Weighted sum of V: out[h] = sum_t scores[t] * V[t][kv_h] */
+        for (int d = 0; d < head_dim; d++) {
+            float val = 0;
+            for (int t = 0; t < seq_len; t++)
+                val += scores[t] * v_store[t * kv_dim + kv_h * head_dim + d];
+            out[h * head_dim + d] = val;
+        }
+    }
+
+    free(scores);
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Random ternary weight generation (for init)
  * ═══════════════════════════════════════════════════════ */
 
 static float* make_random_ternary(int rows, int cols) {
@@ -186,6 +327,10 @@ static float* make_random_ternary(int rows, int cols) {
     }
     return w;
 }
+
+/* ═══════════════════════════════════════════════════════
+ * Model init — random ternary weights, including MoE experts
+ * ═══════════════════════════════════════════════════════ */
 
 static void model_init(Model *m, ModelConfig cfg) {
     m->cfg = cfg;
@@ -207,7 +352,7 @@ static void model_init(Model *m, ModelConfig cfg) {
     for (int l = 0; l < cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];
 
-        /* Attention weights */
+        /* Attention weights — ternary */
         float *wq = make_random_ternary(D, D);
         ly->W_q = two3_pack_weights(wq, D, D); free(wq);
 
@@ -223,12 +368,21 @@ static void model_init(Model *m, ModelConfig cfg) {
         gain_init(&ly->gain_attn, D);
         gain_init(&ly->gain_ffn, D);
 
-        /* MoE */
+        /* MoE — router (float) + expert weights (ternary) */
         moe_router_init(&ly->moe.router, D, MOE_NUM_EXPERTS);
         ly->moe.dim = D;
         ly->moe.intermediate = INTER;
-        /* Expert weights would go here — skipped for now,
-         * MoE forward uses simulated output in CPU reference */
+
+        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            float *wg = make_random_ternary(INTER, D);
+            ly->moe.experts[e].gate = two3_pack_weights(wg, INTER, D); free(wg);
+
+            float *wu = make_random_ternary(INTER, D);
+            ly->moe.experts[e].up = two3_pack_weights(wu, INTER, D); free(wu);
+
+            float *wd = make_random_ternary(D, INTER);
+            ly->moe.experts[e].down = two3_pack_weights(wd, D, INTER); free(wd);
+        }
     }
 
     /* Final gain norm */
@@ -247,80 +401,205 @@ static void model_free(Model *m) {
         gain_free(&ly->gain_attn);
         gain_free(&ly->gain_ffn);
         moe_router_free(&ly->moe.router);
+        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            two3_free_weights(&ly->moe.experts[e].gate);
+            two3_free_weights(&ly->moe.experts[e].up);
+            two3_free_weights(&ly->moe.experts[e].down);
+        }
     }
     free(m->layers);
     gain_free(&m->gain_final);
 }
 
 /* ═══════════════════════════════════════════════════════
- * Model forward — one byte in, 256 logits out
+ * Full-sequence forward pass
  *
- * byte_in → embed → [gain → attn → residual → gain → moe → residual] × N
- *         → final_gain → logits (dot with embed, weight-tied)
+ * bytes_in[0..seq_len-1] → all_logits[0..seq_len-1][256]
+ *
+ * This is the TRAINING path. Every position computed.
+ * Causal attention: position t attends to 0..t.
+ *
+ * For each layer, we store K and V for all positions
+ * so attention can look backwards.
  * ═══════════════════════════════════════════════════════ */
 
-static void model_forward_cpu(
+static void model_forward_sequence_cpu(
     Model *m,
-    int byte_in,        /* input byte (0-255) */
-    int pos,            /* position in sequence */
-    float *hidden,      /* [dim] work buffer — also output */
-    float *logits       /* [256] output logits */
+    const uint8_t *bytes_in,   /* [seq_len] input bytes */
+    int seq_len,
+    float *all_logits          /* [seq_len × 256] output logits */
 ) {
     int D = m->cfg.dim;
-    float scale = 1.0f / sqrtf((float)D);
+    int KV = m->cfg.n_kv_heads * m->cfg.head_dim;
+    int HD = m->cfg.head_dim;
+    int NH = m->cfg.n_heads;
+    int NKV = m->cfg.n_kv_heads;
 
-    /* Embed */
-    byte_embed_cpu(hidden, m->embed, byte_in, D);
+    /* Hidden states for all positions: [seq_len × dim] */
+    float *hidden = (float*)calloc(seq_len * D, sizeof(float));
 
-    /* N layers */
-    float *normed = (float*)malloc(D * sizeof(float));
+    /* Embed all bytes */
+    for (int t = 0; t < seq_len; t++)
+        byte_embed_cpu(hidden + t * D, m->embed, bytes_in[t], D);
+
+    /* Work buffers */
+    float *normed  = (float*)malloc(D * sizeof(float));
+    float *q_buf   = (float*)malloc(D * sizeof(float));    /* [n_heads * head_dim] */
+    float *k_buf   = (float*)malloc(KV * sizeof(float));   /* [n_kv_heads * head_dim] */
+    float *v_buf   = (float*)malloc(KV * sizeof(float));
+    float *attn_out = (float*)malloc(D * sizeof(float));
+    float *o_proj  = (float*)malloc(D * sizeof(float));
+    float *moe_out = (float*)malloc(D * sizeof(float));
 
     for (int l = 0; l < m->cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];
 
-        /* Gain norm → attention (simulated: just gain + residual) */
-        gain_forward_cpu(normed, hidden, ly->gain_attn.R, ly->gain_attn.C, D);
+        /* Per-layer KV store: all positions for causal attention */
+        float *k_store = (float*)calloc(seq_len * KV, sizeof(float));
+        float *v_store = (float*)calloc(seq_len * KV, sizeof(float));
 
-        /* Ternary Q projection on GPU, dequant */
-        Two3Activations X = two3_quantize_acts(normed, 1, D);
-        Two3Output Y = two3_forward(&ly->W_q, &X);
-        float *q = (float*)malloc(D * sizeof(float));
-        two3_dequantize_output(&Y, &ly->W_q, &X, q);
-        two3_free_output(&Y);
-        two3_free_acts(&X);
+        /* ── Pass 1: compute and store Q, K, V for all positions ── */
+        /* Then do attention per position (causal: t attends to 0..t) */
 
-        /* Scale + squared ReLU */
-        for (int i = 0; i < D; i++) q[i] *= scale;
-        squared_relu_cpu(q, q, D);
+        for (int t = 0; t < seq_len; t++) {
+            float *h = hidden + t * D;
 
-        /* Residual */
-        for (int i = 0; i < D; i++) hidden[i] += q[i];
-        free(q);
+            /* 1. Gain normalization */
+            gain_forward_cpu(normed, h, ly->gain_attn.R, ly->gain_attn.C, D);
 
-        /* Gain norm → MoE FFN (simulated) */
-        gain_forward_cpu(normed, hidden, ly->gain_ffn.R, ly->gain_ffn.C, D);
+            /* 2. Q, K, V ternary projections — REAL, through GPU kernel */
+            ternary_project_cpu(&ly->W_q, normed, q_buf, D);
+            ternary_project_cpu(&ly->W_k, normed, k_buf, D);
+            ternary_project_cpu(&ly->W_v, normed, v_buf, D);
 
-        MoESelection sel;
-        moe_route(&ly->moe.router, normed, &sel);
+            /* 3. RoPE on Q and K */
+            rope_apply_cpu(q_buf, k_buf, &m->rope, t, NH, NKV);
 
-        float *moe_out = (float*)calloc(D, sizeof(float));
-        moe_forward_cpu_ref(&ly->moe, normed, moe_out, &sel);
+            /* 4. Store K and V for this position */
+            memcpy(k_store + t * KV, k_buf, KV * sizeof(float));
+            memcpy(v_store + t * KV, v_buf, KV * sizeof(float));
 
-        for (int i = 0; i < D; i++) moe_out[i] *= scale;
-        squared_relu_cpu(moe_out, moe_out, D);
+            /* 5. Causal attention: Q[t] attends to K[0..t], V[0..t] */
+            causal_attention_cpu(q_buf, k_store, v_store, attn_out,
+                                 t, NH, NKV, HD);
 
-        /* Residual */
-        for (int i = 0; i < D; i++) hidden[i] += moe_out[i];
-        free(moe_out);
+            /* 6. Output projection — ternary */
+            ternary_project_cpu(&ly->W_o, attn_out, o_proj, D);
+
+            /* 7. Residual add (dequant already happened in ternary_project) */
+            for (int i = 0; i < D; i++)
+                h[i] += o_proj[i];
+
+            /* ── FFN block ── */
+
+            /* 8. Gain normalization */
+            gain_forward_cpu(normed, h, ly->gain_ffn.R, ly->gain_ffn.C, D);
+
+            /* 9. MoE: route + real expert forward */
+            MoESelection sel;
+            moe_route(&ly->moe.router, normed, &sel);
+            moe_forward_real(&ly->moe, normed, moe_out, &sel);
+
+            /* 10. Residual add */
+            for (int i = 0; i < D; i++)
+                h[i] += moe_out[i];
+        }
+
+        free(k_store);
+        free(v_store);
     }
 
-    /* Final gain norm */
-    gain_forward_cpu(normed, hidden, m->gain_final.R, m->gain_final.C, D);
+    /* Final gain norm + logits for each position */
+    for (int t = 0; t < seq_len; t++) {
+        gain_forward_cpu(normed, hidden + t * D,
+                         m->gain_final.R, m->gain_final.C, D);
+        byte_logits_cpu(all_logits + t * 256, normed, m->embed, D);
+    }
 
-    /* Logits: dot product with embedding (weight-tied) */
-    byte_logits_cpu(logits, normed, m->embed, D);
-
+    free(hidden);
     free(normed);
+    free(q_buf);
+    free(k_buf);
+    free(v_buf);
+    free(attn_out);
+    free(o_proj);
+    free(moe_out);
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Single-byte forward — inference/generation path
+ *
+ * Uses stored KV from previous positions. Caller manages
+ * the KV store across calls.
+ *
+ * This wraps model_forward_sequence_cpu for single-byte use:
+ * inefficient (recomputes all previous positions) but correct.
+ * KV cache optimization is Layer 2.5.
+ * ═══════════════════════════════════════════════════════ */
+
+typedef struct {
+    uint8_t *bytes;     /* accumulated byte sequence */
+    int      len;       /* current length */
+    int      capacity;  /* allocated capacity */
+} GenerationContext;
+
+static void gen_ctx_init(GenerationContext *ctx, int max_seq) {
+    ctx->bytes = (uint8_t*)malloc(max_seq);
+    ctx->len = 0;
+    ctx->capacity = max_seq;
+}
+
+static void gen_ctx_free(GenerationContext *ctx) {
+    free(ctx->bytes);
+    ctx->bytes = NULL;
+}
+
+static void gen_ctx_append(GenerationContext *ctx, uint8_t byte) {
+    if (ctx->len < ctx->capacity)
+        ctx->bytes[ctx->len++] = byte;
+}
+
+/* Generate: feed accumulated context, get logits for last position.
+ * NOTE: This recomputes everything from scratch each call.
+ * Proper KV cache comes at Layer 2.5. For now, correctness > speed. */
+static void model_generate_cpu(
+    Model *m,
+    GenerationContext *ctx,
+    float *logits       /* [256] output logits for next byte */
+) {
+    float *all_logits = (float*)malloc(ctx->len * 256 * sizeof(float));
+    model_forward_sequence_cpu(m, ctx->bytes, ctx->len, all_logits);
+
+    /* Copy logits for the last position */
+    memcpy(logits, all_logits + (ctx->len - 1) * 256, 256 * sizeof(float));
+    free(all_logits);
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Legacy single-byte interface (for backward compat)
+ *
+ * WARNING: Without attention context, this produces
+ * position-independent output. Use model_generate_cpu
+ * or model_forward_sequence_cpu for real inference/training.
+ * ═══════════════════════════════════════════════════════ */
+
+static void model_forward_cpu(
+    Model *m,
+    int byte_in,
+    int pos,
+    float *hidden,      /* [dim] — unused in new path, kept for compat */
+    float *logits       /* [256] output logits */
+) {
+    /* Route through sequence forward with length=1.
+     * This means no attention context from previous bytes.
+     * For real generation, use GenerationContext. */
+    uint8_t b = (uint8_t)byte_in;
+    float all_logits[256];
+    model_forward_sequence_cpu(m, &b, 1, all_logits);
+    memcpy(logits, all_logits, 256 * sizeof(float));
+
+    /* Also write hidden for backward compat (grab from embed) */
+    byte_embed_cpu(hidden, m->embed, byte_in, m->cfg.dim);
 }
 
 #endif /* MODEL_H */
