@@ -1090,6 +1090,24 @@ static TrainResult trainable_forward_backward(
                 hidden[t * D + i] += res_scale * sv->moe_out[t * D + i];
 
         T_ACC(_ms_moe_fwd);
+
+        /* Diagnostic: check for activation explosion per layer */
+        {
+            float max_h = 0, min_R = 1e30f, max_R = 0;
+            int nan_cnt = 0;
+            for (int i = 0; i < seq_len * D; i++) {
+                if (hidden[i] != hidden[i]) nan_cnt++;
+                if (fabsf(hidden[i]) > max_h) max_h = fabsf(hidden[i]);
+            }
+            for (int i = 0; i < D; i++) {
+                if (ly->gain_attn.R[i] < min_R) min_R = ly->gain_attn.R[i];
+                if (ly->gain_attn.R[i] > max_R) max_R = ly->gain_attn.R[i];
+            }
+            if (nan_cnt > 0 || max_h > 1e4f) {
+                printf("  !! LAYER %d: max_h=%.1f  NaN=%d  R=[%.4f,%.4f]\n",
+                       l, max_h, nan_cnt, min_R, max_R);
+            }
+        }
     }
 
     /* Final gain norm + logits */

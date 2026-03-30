@@ -33,6 +33,7 @@
 #define GAIN_BETA   0.01f    /* grid loss (must be < 1) */
 #define GAIN_GAMMA  0.006f   /* recharge rate ≈ 1/SUBSTRATE_INT */
 #define GAIN_KAPPA  0.05f    /* depletion rate (= alpha, natural choice) */
+#define GAIN_R_MIN  0.01f   /* reservoir floor — prevents gain collapse (Thm 68a floor repulsion) */
 
 /* ═══════════════════════════════════════════════════════
  * Gain state — persistent reservoir per feature
@@ -93,7 +94,7 @@ __global__ void kernel_gain_forward(
 
     /* Reservoir update: R' = R + γ(C - R) - κ·R·E */
     float R_new = Ri + gamma_r * (Ci - Ri) - kappa * Ri * E;
-    if (R_new < 0.0f) R_new = 0.0f;  /* reservoir can't go negative */
+    if (R_new < GAIN_R_MIN) R_new = GAIN_R_MIN;  /* reservoir floor */
 
     /* Amplitude control: y = x · (1 + α·R - β) */
     float gain = 1.0f + alpha * R_new - beta;
@@ -145,7 +146,7 @@ static void gain_forward_cpu(
     for (int i = 0; i < dim; i++) {
         float E = fabsf(x[i]);
         float R_new = R[i] + GAIN_GAMMA * (C[i] - R[i]) - GAIN_KAPPA * R[i] * E;
-        if (R_new < 0.0f) R_new = 0.0f;
+        if (R_new < GAIN_R_MIN) R_new = GAIN_R_MIN;
         float gain = 1.0f + GAIN_ALPHA * R_new - GAIN_BETA;
         y[i] = x[i] * gain;
         R[i] = R_new;
