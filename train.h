@@ -1023,15 +1023,29 @@ static TrainResult trainable_forward_backward(
                         ternary_project_multi_cpu(W_gu, out_gu, gather_in, 2, cnt, D);
                     }
 
-                    /* Scale, squared ReLU, element-wise multiply (CPU, cheap) */
+                    /* Scale */
                     float scale = 1.0f / sqrtf((float)D);
                     for (int i = 0; i < cnt * INTER; i++) {
                         gate_batch[i] *= scale;
                         up_batch[i] *= scale;
                     }
+
+                    /* Save pre-activation gate + up BEFORE squared ReLU.
+                     * Backward needs original x for dx = (x>0) ? dy*2x : 0. */
+                    if (k_sel == 0) {
+                        for (int i = 0; i < cnt; i++) {
+                            int t = EP(e, i);
+                            memcpy(sv->expert_gate_pre + t * INTER,
+                                   gate_batch + i * INTER, INTER * sizeof(float));
+                            memcpy(sv->expert_up_out + t * INTER,
+                                   up_batch + i * INTER, INTER * sizeof(float));
+                        }
+                    }
+
+                    /* Squared ReLU in-place, then multiply */
                     for (int i = 0; i < cnt * INTER; i++) {
                         float g = gate_batch[i];
-                        gate_batch[i] = (g > 0.0f) ? g * g : 0.0f;  /* squared ReLU */
+                        gate_batch[i] = (g > 0.0f) ? g * g : 0.0f;
                     }
                     for (int i = 0; i < cnt * INTER; i++)
                         h_expert[i] = gate_batch[i] * up_batch[i];
@@ -1040,22 +1054,16 @@ static TrainResult trainable_forward_backward(
                     ternary_project_batch_cpu(&ly->moe.experts[e].down,
                                              h_expert, down_batch, cnt, INTER);
 
-                    /* Scatter: write results back to position order */
+                    /* Scatter outputs + save expert1_out for backward */
                     for (int i = 0; i < cnt; i++) {
                         int t = EP(e, i);
                         float w = sv->moe_sel[t].expert_weights[k_sel];
                         for (int d = 0; d < D; d++)
                             sv->moe_out[t * D + d] += w * down_batch[i * D + d];
 
-                        /* Save intermediates for top-1 expert (needed for backward) */
-                        if (k_sel == 0) {
-                            memcpy(sv->expert_gate_pre + t * INTER,
-                                   gate_batch + i * INTER, INTER * sizeof(float));
-                            memcpy(sv->expert_up_out + t * INTER,
-                                   up_batch + i * INTER, INTER * sizeof(float));
+                        if (k_sel == 0)
                             memcpy(sv->expert1_out + t * D,
                                    down_batch + i * D, D * sizeof(float));
-                        }
                     }
                 }
             }
