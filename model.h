@@ -189,6 +189,30 @@ static void ternary_project_batch_cpu(
     two3_free_acts(&X);
 }
 
+/* Multi-projection: quantize input ONCE, project against N weight matrices.
+ * FBC principle: keep data compressed, only inflate at point of use.
+ * Eliminates N-1 redundant quantize+memcpy when projecting same input
+ * through multiple weights (Q/K/V share pre_attn_normed). */
+static void ternary_project_multi_cpu(
+    const Two3Weights **W_list,  /* [N] weight matrices */
+    float **output_list,         /* [N] output arrays, each [S, W_list[i]->rows] */
+    const float *input,          /* [S, dim_in] shared input */
+    int N, int S, int dim_in
+) {
+    /* Quantize input ONCE */
+    Two3Activations X = two3_quantize_acts(input, S, dim_in);
+
+    /* Project against each weight matrix — activations stay on device */
+    for (int i = 0; i < N; i++) {
+        Two3Output Y = two3_forward(W_list[i], &X);
+        two3_dequantize_output(&Y, W_list[i], &X, output_list[i]);
+        two3_free_output(&Y);
+    }
+
+    /* Free quantized activations once */
+    two3_free_acts(&X);
+}
+
 /* Single-vector convenience wrapper */
 static void ternary_project_cpu(
     const Two3Weights *W,
@@ -217,9 +241,12 @@ static void moe_expert_forward_real(
     float *gate = (float*)malloc(intermediate * sizeof(float));
     float *up   = (float*)malloc(intermediate * sizeof(float));
 
-    /* Gate and Up projections (ternary) */
-    ternary_project_cpu(&expert->gate, x, gate, dim);
-    ternary_project_cpu(&expert->up, x, up, dim);
+    /* Gate + Up share input — quantize once, project 2x */
+    {
+        const Two3Weights *W_gu[2] = { &expert->gate, &expert->up };
+        float *out_gu[2] = { gate, up };
+        ternary_project_multi_cpu(W_gu, out_gu, x, 2, 1, dim);
+    }
 
     /* Scale BEFORE squared ReLU — critical: squaring amplifies magnitude.
      * Same pattern as Layer 1 integration test. */
@@ -485,10 +512,13 @@ static void model_forward_sequence_cpu(
             gain_forward_cpu(normed_all + t * D, hidden + t * D,
                              ly->gain_attn.R, ly->gain_attn.C, D);
 
-        /* Phase 2: batch Q/K/V projections — 3 GPU calls instead of 3×seq_len */
-        ternary_project_batch_cpu(&ly->W_q, normed_all, q_all, seq_len, D);
-        ternary_project_batch_cpu(&ly->W_k, normed_all, k_all, seq_len, D);
-        ternary_project_batch_cpu(&ly->W_v, normed_all, v_all, seq_len, D);
+        /* Phase 2: multi-projection Q/K/V — quantize once, project 3x.
+         * 1 quantize + 3 GPU matmuls instead of 3 quantize + 3 matmuls. */
+        {
+            const Two3Weights *W_qkv[3] = { &ly->W_q, &ly->W_k, &ly->W_v };
+            float *out_qkv[3] = { q_all, k_all, v_all };
+            ternary_project_multi_cpu(W_qkv, out_qkv, normed_all, 3, seq_len, D);
+        }
 
         /* Phase 3: RoPE all positions (CPU, cheap) */
         for (int t = 0; t < seq_len; t++)

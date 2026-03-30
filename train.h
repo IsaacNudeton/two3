@@ -917,10 +917,12 @@ static TrainResult trainable_forward_backward(
             gain_forward_cpu(sv->pre_attn_normed + t * D, hidden + t * D,
                              ly->gain_attn.R, ly->gain_attn.C, D);
 
-        /* Phase 2: batch Q/K/V — 3 GPU calls instead of 3×seq_len */
-        ternary_project_batch_cpu(&ly->W_q, sv->pre_attn_normed, sv->q_all, seq_len, D);
-        ternary_project_batch_cpu(&ly->W_k, sv->pre_attn_normed, sv->k_store, seq_len, D);
-        ternary_project_batch_cpu(&ly->W_v, sv->pre_attn_normed, sv->v_store, seq_len, D);
+        /* Phase 2: multi-projection Q/K/V — quantize once, project 3x */
+        {
+            const Two3Weights *W_qkv[3] = { &ly->W_q, &ly->W_k, &ly->W_v };
+            float *out_qkv[3] = { sv->q_all, sv->k_store, sv->v_store };
+            ternary_project_multi_cpu(W_qkv, out_qkv, sv->pre_attn_normed, 3, seq_len, D);
+        }
 
         /* Phase 3: RoPE all positions (CPU, cheap) */
         for (int t = 0; t < seq_len; t++)
@@ -972,8 +974,12 @@ static TrainResult trainable_forward_backward(
                 int eid = sv->moe_sel[t].expert_ids[0];
                 float w0 = sv->moe_sel[t].expert_weights[0];
 
-                ternary_project_cpu(&ly->moe.experts[eid].gate, normed, gate, D);
-                ternary_project_cpu(&ly->moe.experts[eid].up, normed, up, D);
+                /* Gate + Up share input — quantize once, project 2x */
+                {
+                    const Two3Weights *W_gu[2] = { &ly->moe.experts[eid].gate, &ly->moe.experts[eid].up };
+                    float *out_gu[2] = { gate, up };
+                    ternary_project_multi_cpu(W_gu, out_gu, normed, 2, 1, D);
+                }
 
                 float scale = 1.0f / sqrtf((float)D);
                 for (int i = 0; i < INTER; i++) {
