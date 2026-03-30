@@ -1192,119 +1192,145 @@ static TrainResult trainable_forward_backward(
             dW_down[e] = tw->grad_down[e];
         }
 
-        /* ── Backward through FFN block (reverse of forward steps 7-10) ── */
+        /* ── Backward through FFN block (expert-grouped) ── */
         T_START();
+        {
+            float scale = 1.0f / sqrtf((float)D);
 
-        for (int t = seq_len - 1; t >= 0; t--) {
-            /* d_hidden already has gradient from above (or from next layer) */
+            /* Step 10 backward: d_moe_out_all = res_scale * d_hidden */
+            float *d_moe_out_all = (float*)malloc(seq_len * D * sizeof(float));
+            for (int i = 0; i < seq_len * D; i++)
+                d_moe_out_all[i] = res_scale * d_hidden[i];
 
-            /* Step 10 backward: residual add with res_scale.
-             * Forward: h += res_scale * moe_out → d_moe_out = res_scale * d_hidden */
-            float *d_moe_out = (float*)malloc(D * sizeof(float));
-            for (int i = 0; i < D; i++)
-                d_moe_out[i] = res_scale * d_hidden[t * D + i];
+            /* d_normed_ffn_all accumulates gradients from expert backward + router */
+            float *d_normed_ffn_all = (float*)calloc(seq_len * D, sizeof(float));
 
-            /* Step 9 backward: MoE expert forward */
-            float *d_normed_ffn = (float*)calloc(D, sizeof(float));
-            {
+            /* Group positions by top-1 expert for backward */
+            int *expert_pos_flat = (int*)malloc(MOE_NUM_EXPERTS * seq_len * sizeof(int));
+            #define EPB(e, i) expert_pos_flat[(e) * seq_len + (i)]
+            int expert_cnt[MOE_NUM_EXPERTS];
+            memset(expert_cnt, 0, sizeof(expert_cnt));
+
+            for (int t = 0; t < seq_len; t++) {
                 int eid = sv->moe_sel[t].expert_ids[0];
-                float w0 = sv->moe_sel[t].expert_weights[0];
+                EPB(eid, expert_cnt[eid]++) = t;
+            }
 
-                /* d_moe_out → d_expert_out (through weighting) */
-                float *d_expert_out = (float*)malloc(D * sizeof(float));
-                for (int i = 0; i < D; i++)
-                    d_expert_out[i] = d_moe_out[i] * w0;
+            /* Scratch buffers for batched backward */
+            float *g_d_expert_out = (float*)malloc(seq_len * D * sizeof(float));
+            float *g_h_expert     = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *g_d_h_expert   = (float*)calloc(seq_len * INTER, sizeof(float));
+            float *g_d_gate       = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *g_d_up         = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *g_normed_in    = (float*)malloc(seq_len * D * sizeof(float));
+            float *g_d_normed_out = (float*)calloc(seq_len * D, sizeof(float));
 
-                /* Backward through down projection */
-                float *gate = sv->expert_gate_pre + t * INTER;
-                float *up   = sv->expert_up_out + t * INTER;
-                float scale = 1.0f / sqrtf((float)D);
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                int cnt = expert_cnt[e];
+                if (cnt == 0) continue;
 
-                /* Recompute h_expert = squared_relu(gate*scale) * (up*scale) */
-                float *gate_scaled = (float*)malloc(INTER * sizeof(float));
-                float *up_scaled = (float*)malloc(INTER * sizeof(float));
-                float *gate_activated = (float*)malloc(INTER * sizeof(float));
-                float *h_expert = (float*)malloc(INTER * sizeof(float));
+                /* Gather: d_expert_out = d_moe_out * w0, recompute h_expert, gather normed input */
+                for (int i = 0; i < cnt; i++) {
+                    int t = EPB(e, i);
+                    float w0 = sv->moe_sel[t].expert_weights[0];
+                    for (int d = 0; d < D; d++)
+                        g_d_expert_out[i * D + d] = d_moe_out_all[t * D + d] * w0;
 
-                for (int i = 0; i < INTER; i++) {
-                    gate_scaled[i] = gate[i] * scale;
-                    up_scaled[i] = up[i] * scale;
-                }
-                squared_relu_cpu(gate_activated, gate_scaled, INTER);
-                for (int i = 0; i < INTER; i++)
-                    h_expert[i] = gate_activated[i] * up_scaled[i];
+                    /* Recompute h_expert from saved gate_pre and up_out */
+                    float *gate = sv->expert_gate_pre + t * INTER;
+                    float *up   = sv->expert_up_out + t * INTER;
+                    for (int j = 0; j < INTER; j++) {
+                        float gs = gate[j] * scale;
+                        float us = up[j] * scale;
+                        float ga = (gs > 0.0f) ? gs * gs : 0.0f;
+                        g_h_expert[i * INTER + j] = ga * us;
+                    }
 
-                /* d_h_expert from down projection backward */
-                float *d_h_expert = (float*)calloc(INTER, sizeof(float));
-                ternary_project_backward_gpu(
-                    &tm->backward_ctx,
-                    &ly->moe.experts[eid].down,
-                    d_expert_out, h_expert,
-                    tw->expert_down[eid],
-                    d_h_expert, dW_down[eid],
-                    D, INTER);
-
-                /* d_gate_activated = d_h_expert * up_scaled
-                 * d_up_scaled = d_h_expert * gate_activated */
-                float *d_gate_act = (float*)malloc(INTER * sizeof(float));
-                float *d_up_scaled = (float*)malloc(INTER * sizeof(float));
-                for (int i = 0; i < INTER; i++) {
-                    d_gate_act[i] = d_h_expert[i] * up_scaled[i];
-                    d_up_scaled[i] = d_h_expert[i] * gate_activated[i];
+                    memcpy(g_normed_in + i * D, sv->pre_ffn_normed + t * D,
+                           D * sizeof(float));
                 }
 
-                /* Backward through squared ReLU */
-                float *d_gate_scaled = (float*)malloc(INTER * sizeof(float));
-                squared_relu_backward_cpu(d_gate_scaled, d_gate_act, gate_scaled, INTER);
+                /* Batch down backward: [cnt, D] → [cnt, INTER] */
+                memset(g_d_h_expert, 0, cnt * INTER * sizeof(float));
+                ternary_project_backward_gpu_batch(&tm->backward_ctx,
+                    &ly->moe.experts[e].down,
+                    g_d_expert_out, g_h_expert,
+                    tw->expert_down[e],
+                    g_d_h_expert, dW_down[e],
+                    cnt, D, INTER);
 
-                /* Backward through scaling: d_gate = d_gate_scaled * scale */
-                float *d_gate = (float*)malloc(INTER * sizeof(float));
-                float *d_up = (float*)malloc(INTER * sizeof(float));
-                for (int i = 0; i < INTER; i++) {
-                    d_gate[i] = d_gate_scaled[i] * scale;
-                    d_up[i] = d_up_scaled[i] * scale;
+                /* CPU: d_gate and d_up from d_h_expert (per element) */
+                for (int i = 0; i < cnt; i++) {
+                    int t = EPB(e, i);
+                    float *gate = sv->expert_gate_pre + t * INTER;
+                    float *up   = sv->expert_up_out + t * INTER;
+                    for (int j = 0; j < INTER; j++) {
+                        float gs = gate[j] * scale;
+                        float us = up[j] * scale;
+                        float ga = (gs > 0.0f) ? gs * gs : 0.0f;
+                        float dh = g_d_h_expert[i * INTER + j];
+                        /* d_gate_act = dh * up_scaled, d_up_scaled = dh * gate_activated */
+                        float d_gate_act = dh * us;
+                        float d_up_scaled = dh * ga;
+                        /* squared_relu backward: d_gate_scaled = (gs > 0) ? d_gate_act * 2*gs : 0 */
+                        float d_gate_scaled = (gs > 0.0f) ? d_gate_act * 2.0f * gs : 0.0f;
+                        /* backward through scaling */
+                        g_d_gate[i * INTER + j] = d_gate_scaled * scale;
+                        g_d_up[i * INTER + j] = d_up_scaled * scale;
+                    }
                 }
 
-                /* Backward through gate and up projections (STE) */
-                float *normed = sv->pre_ffn_normed + t * D;
-                ternary_project_backward_gpu(
-                    &tm->backward_ctx,
-                    &ly->moe.experts[eid].gate, d_gate, normed,
-                    tw->expert_gate[eid], d_normed_ffn, dW_gate[eid], INTER, D);
-                ternary_project_backward_gpu(
-                    &tm->backward_ctx,
-                    &ly->moe.experts[eid].up, d_up, normed,
-                    tw->expert_up[eid], d_normed_ffn, dW_up[eid], INTER, D);
+                /* Batch gate backward: [cnt, INTER] dY, [cnt, D] X → accumulate dW_gate, d_normed */
+                memset(g_d_normed_out, 0, cnt * D * sizeof(float));
+                ternary_project_backward_gpu_batch(&tm->backward_ctx,
+                    &ly->moe.experts[e].gate,
+                    g_d_gate, g_normed_in,
+                    tw->expert_gate[e],
+                    g_d_normed_out, dW_gate[e],
+                    cnt, INTER, D);
 
-                /* Router gradient: dL/dw_k = dL/d_moe_out · expert_k_output
-                 * For top-1: use saved expert1_out (the raw, unweighted output).
-                 * For top-2: we don't save it, so we skip (accepted approximation). */
+                /* Batch up backward: same pattern, accumulate into same d_normed */
+                ternary_project_backward_gpu_batch(&tm->backward_ctx,
+                    &ly->moe.experts[e].up,
+                    g_d_up, g_normed_in,
+                    tw->expert_up[e],
+                    g_d_normed_out, dW_up[e],
+                    cnt, INTER, D);
+
+                /* Scatter d_normed back to position order */
+                for (int i = 0; i < cnt; i++) {
+                    int t = EPB(e, i);
+                    for (int d = 0; d < D; d++)
+                        d_normed_ffn_all[t * D + d] += g_d_normed_out[i * D + d];
+                }
+            }
+
+            /* Router backward (CPU, per position — cheap) */
+            for (int t = 0; t < seq_len; t++) {
                 float d_expert_w[MOE_TOP_K] = {0};
                 for (int i = 0; i < D; i++)
-                    d_expert_w[0] += d_moe_out[i] * sv->expert1_out[t * D + i];
+                    d_expert_w[0] += d_moe_out_all[t * D + i] * sv->expert1_out[t * D + i];
                 moe_router_backward_cpu(d_expert_w, &sv->moe_sel[t],
-                    normed, &ly->moe.router, d_normed_ffn, tm->grad_router[l]);
-
-                free(d_expert_out);
-                free(gate_scaled); free(up_scaled);
-                free(gate_activated); free(h_expert);
-                free(d_h_expert); free(d_gate_act); free(d_up_scaled);
-                free(d_gate_scaled); free(d_gate); free(d_up);
+                    sv->pre_ffn_normed + t * D, &ly->moe.router,
+                    d_normed_ffn_all + t * D, tm->grad_router[l]);
             }
-            free(d_moe_out);
 
-            /* Step 8 backward: gain norm (FFN) */
-            float *d_h_pre_ffn = (float*)calloc(D, sizeof(float));
-            gain_backward_cpu(d_h_pre_ffn, d_normed_ffn,
-                              sv->hidden_pre_ffn + t * D,
-                              sv->R_ffn_saved, tm->grad_gain_C_ffn[l], D);
+            /* Gain backward per position */
+            for (int t = 0; t < seq_len; t++) {
+                float *d_h_pre_ffn = (float*)calloc(D, sizeof(float));
+                gain_backward_cpu(d_h_pre_ffn, d_normed_ffn_all + t * D,
+                                  sv->hidden_pre_ffn + t * D,
+                                  sv->R_ffn_saved, tm->grad_gain_C_ffn[l], D);
+                for (int i = 0; i < D; i++)
+                    d_hidden[t * D + i] += d_h_pre_ffn[i];
+                free(d_h_pre_ffn);
+            }
 
-            /* Add FFN backward gradient to d_hidden (residual path) */
-            for (int i = 0; i < D; i++)
-                d_hidden[t * D + i] += d_h_pre_ffn[i];
-
-            free(d_normed_ffn);
-            free(d_h_pre_ffn);
+            free(d_moe_out_all); free(d_normed_ffn_all);
+            free(expert_pos_flat);
+            #undef EPB
+            free(g_d_expert_out); free(g_h_expert); free(g_d_h_expert);
+            free(g_d_gate); free(g_d_up); free(g_normed_in); free(g_d_normed_out);
         }
 
         T_ACC(_ms_bwd_moe);
