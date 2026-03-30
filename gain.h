@@ -33,7 +33,8 @@
 #define GAIN_BETA   0.01f    /* grid loss (must be < 1) */
 #define GAIN_GAMMA  0.006f   /* recharge rate ≈ 1/SUBSTRATE_INT */
 #define GAIN_KAPPA  0.05f    /* depletion rate (= alpha, natural choice) */
-#define GAIN_R_MIN  0.01f   /* reservoir floor — prevents gain collapse (Thm 68a floor repulsion) */
+#define GAIN_R_MIN  0.01f   /* reservoir floor — prevents gain collapse */
+#define GAIN_C_MIN  0.1f    /* capacity floor — must be > R_MIN for replenishment headroom */
 
 /* ═══════════════════════════════════════════════════════
  * Gain state — persistent reservoir per feature
