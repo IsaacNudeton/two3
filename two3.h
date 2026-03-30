@@ -157,16 +157,17 @@ Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K,
 /* Free backward context. */
 void two3_backward_ctx_free(Two3BackwardCtx* ctx);
 
-/* Backward with pre-allocated context (fast path — no per-call malloc). */
+/* Backward with pre-allocated context (fast path — no per-call malloc).
+ * S = number of tokens (1 for single-vector, seq_len for batched). */
 void two3_backward_fast(
     Two3BackwardCtx* ctx,
     const Two3Weights* W,     /* packed ternary (device) */
-    const float* dY_host,     /* [1, M] */
-    const float* X_host,      /* [1, K] */
+    const float* dY_host,     /* [S, M] */
+    const float* X_host,      /* [S, K] */
     const float* W_latent,    /* [M, K] host */
-    float* dX_host,           /* [K] accumulate */
+    float* dX_host,           /* [S, K] accumulate */
     float* dW_host,           /* [M, K] accumulate */
-    int M, int K,
+    int S, int M, int K,
     float ste_clip);
 
 /* ----- Attention backward on GPU ----- */

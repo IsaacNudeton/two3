@@ -609,15 +609,16 @@ Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K,
     Two3BackwardCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
 
-    /* Ternary projection buffers */
+    /* Ternary projection buffers — sized for batched S=max_seq */
+    int S_max = max_seq > 0 ? max_seq : 1;
     ctx.max_M = max_M;
     ctx.max_K = max_K;
-    CUDA_CHECK(cudaMalloc(&ctx.d_dY, max_M * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ctx.d_X, max_K * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ctx.d_dX, max_K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_dY, (size_t)S_max * max_M * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_X, (size_t)S_max * max_K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_dX, (size_t)S_max * max_K * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx.d_W_latent, (size_t)max_M * max_K * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx.d_dW, (size_t)max_M * max_K * sizeof(float)));
-    ctx.h_dX_tmp = (float*)malloc(max_K * sizeof(float));
+    ctx.h_dX_tmp = (float*)malloc(S_max * max_K * sizeof(float));
 
     /* Attention backward buffers */
     if (max_seq > 0 && D > 0) {
@@ -676,17 +677,15 @@ void two3_backward_fast(
     const float* W_latent,
     float* dX_host,
     float* dW_host,
-    int M, int K,
+    int S, int M, int K,
     float ste_clip
 ) {
-    int S = 1;
-
     /* Copy inputs to pre-allocated device buffers */
-    CUDA_CHECK(cudaMemcpy(ctx->d_dY, dY_host, S * M * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ctx->d_X, X_host, S * K * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(ctx->d_dX, 0, S * K * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(ctx->d_W_latent, W_latent, M * K * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ctx->d_dW, dW_host, M * K * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_dY, dY_host, (size_t)S * M * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_X, X_host, (size_t)S * K * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(ctx->d_dX, 0, (size_t)S * K * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(ctx->d_W_latent, W_latent, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_dW, dW_host, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
 
     /* Kernel 1: dX = dY @ W_ternary (tiled transposed ternary matmul) */
     {
@@ -712,8 +711,8 @@ void two3_backward_fast(
     CUDA_CHECK(cudaDeviceSynchronize());
 
     /* Copy results back — ACCUMULATE dX into host buffer */
-    CUDA_CHECK(cudaMemcpy(ctx->h_dX_tmp, ctx->d_dX, K * sizeof(float), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < K; i++) dX_host[i] += ctx->h_dX_tmp[i];
+    CUDA_CHECK(cudaMemcpy(ctx->h_dX_tmp, ctx->d_dX, (size_t)S * K * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < S * K; i++) dX_host[i] += ctx->h_dX_tmp[i];
 
     CUDA_CHECK(cudaMemcpy(dW_host, ctx->d_dW, M * K * sizeof(float), cudaMemcpyDeviceToHost));
 }

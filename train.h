@@ -491,18 +491,29 @@ static void ternary_project_backward_cpu(
 
 /* GPU-accelerated ternary backward — uses pre-allocated context.
  * Needs the packed Two3Weights for the transposed ternary matmul. */
+/* Batched GPU backward — S vectors in one call.
+ * dY: [S, rows], X: [S, cols], dX: [S, cols] accumulate, dW: [rows, cols] accumulate */
+static void ternary_project_backward_gpu_batch(
+    Two3BackwardCtx *ctx,
+    const Two3Weights *W_packed,
+    const float *dY, const float *X, const float *W_latent,
+    float *dX, float *dW_latent,
+    int S, int rows, int cols
+) {
+    two3_backward_fast(ctx, W_packed, dY, X, W_latent, dX, dW_latent,
+                       S, rows, cols, STE_CLIP);
+}
+
+/* Single-vector backward (S=1 convenience wrapper) */
 static void ternary_project_backward_gpu(
-    Two3BackwardCtx *ctx,          /* pre-allocated device buffers */
-    const Two3Weights *W_packed,   /* packed ternary weights (on device) */
-    const float *dY,               /* [rows] gradient from above */
-    const float *X,                /* [cols] saved input */
-    const float *W_latent,         /* [rows × cols] latent float weights */
-    float *dX,                     /* [cols] gradient to pass back (ACCUMULATE) */
-    float *dW_latent,              /* [rows × cols] gradient for latent (ACCUMULATE) */
+    Two3BackwardCtx *ctx,
+    const Two3Weights *W_packed,
+    const float *dY, const float *X, const float *W_latent,
+    float *dX, float *dW_latent,
     int rows, int cols
 ) {
     two3_backward_fast(ctx, W_packed, dY, X, W_latent, dX, dW_latent,
-                       rows, cols, STE_CLIP);
+                       1, rows, cols, STE_CLIP);
 }
 
 /* Backward through gain normalization (CPU version of kernel_gain_backward) */
@@ -899,36 +910,37 @@ static TrainResult trainable_forward_backward(
         /* Save reservoir state before this layer's gain */
         memcpy(sv->R_attn_saved, ly->gain_attn.R, D * sizeof(float));
 
-        for (int t = 0; t < seq_len; t++) {
-            float *h = hidden + t * D;
-            float *normed = sv->pre_attn_normed + t * D;
+        /* ── Attention block (batched projections) ── */
 
-            /* 1. Gain norm (attention) */
-            gain_forward_cpu(normed, h, ly->gain_attn.R, ly->gain_attn.C, D);
+        /* Phase 1: gain norm all positions (sequential — R depends on previous) */
+        for (int t = 0; t < seq_len; t++)
+            gain_forward_cpu(sv->pre_attn_normed + t * D, hidden + t * D,
+                             ly->gain_attn.R, ly->gain_attn.C, D);
 
-            /* 2. Q, K, V projections */
-            ternary_project_cpu(&ly->W_q, normed, sv->q_all + t * D, D);
-            ternary_project_cpu(&ly->W_k, normed, sv->k_store + t * KV, D);
-            ternary_project_cpu(&ly->W_v, normed, sv->v_store + t * KV, D);
+        /* Phase 2: batch Q/K/V — 3 GPU calls instead of 3×seq_len */
+        ternary_project_batch_cpu(&ly->W_q, sv->pre_attn_normed, sv->q_all, seq_len, D);
+        ternary_project_batch_cpu(&ly->W_k, sv->pre_attn_normed, sv->k_store, seq_len, D);
+        ternary_project_batch_cpu(&ly->W_v, sv->pre_attn_normed, sv->v_store, seq_len, D);
 
-            /* 3. RoPE */
-            rope_apply_cpu(sv->q_all + t * D, sv->k_store + t * KV, &tm->model.rope, t, NH, NKV);
+        /* Phase 3: RoPE all positions (CPU, cheap) */
+        for (int t = 0; t < seq_len; t++)
+            rope_apply_cpu(sv->q_all + t * D, sv->k_store + t * KV,
+                           &tm->model.rope, t, NH, NKV);
 
-            /* 4. Causal attention */
+        /* Phase 4: causal attention per position (sequential) */
+        for (int t = 0; t < seq_len; t++)
             causal_attention_cpu(sv->q_all + t * D, sv->k_store, sv->v_store,
                                  sv->attn_out + t * D, t, NH, NKV, HD);
 
-            /* 5. O projection + scale */
-            ternary_project_cpu(&ly->W_o, sv->attn_out + t * D, sv->o_proj + t * D, D);
-            {
-                float s = 1.0f / sqrtf((float)D);
-                for (int i = 0; i < D; i++)
-                    sv->o_proj[t * D + i] *= s;
-            }
+        /* Phase 5: batch O projection — 1 GPU call instead of seq_len */
+        ternary_project_batch_cpu(&ly->W_o, sv->attn_out, sv->o_proj, seq_len, D);
 
-            /* 6. Residual add (scaled for deep models) */
-            for (int i = 0; i < D; i++)
-                h[i] += res_scale * sv->o_proj[t * D + i];
+        /* Phase 6: scale + residual add */
+        {
+            float s = res_scale / sqrtf((float)D);
+            for (int t = 0; t < seq_len; t++)
+                for (int i = 0; i < D; i++)
+                    hidden[t * D + i] += s * sv->o_proj[t * D + i];
         }
 
         /* Save hidden before FFN block */
@@ -1228,25 +1240,24 @@ static TrainResult trainable_forward_backward(
             free(d_h_pre_ffn);
         }
 
-        /* ── Backward through attention block (reverse of steps 1-6) ── */
-        /* Three-phase approach: O backward → GPU attention backward → Q/K/V backward */
+        /* ── Backward through attention block (batched projections) ── */
 
-        /* Phase 1: compute d_attn_out for ALL positions via O projection backward.
-         * Forward: h += res_scale * (1/sqrt(D)) * W_o @ attn_out
-         * Backward: d_o_proj = res_scale * (1/sqrt(D)) * d_hidden */
+        /* Phase 1: batch O backward — 1 GPU call instead of seq_len.
+         * Forward: h += res_scale/sqrt(D) * W_o @ attn_out
+         * Backward: d_o_proj_all = scale * d_hidden, then backward through W_o */
+        float *d_o_proj_all = (float*)malloc(seq_len * D * sizeof(float));
         float *d_attn_out_all = (float*)calloc(seq_len * D, sizeof(float));
-        for (int t = 0; t < seq_len; t++) {
-            float *d_o_proj = (float*)malloc(D * sizeof(float));
+        {
             float s = res_scale / sqrtf((float)D);
-            for (int i = 0; i < D; i++)
-                d_o_proj[i] = s * d_hidden[t * D + i];
-            ternary_project_backward_gpu(&tm->backward_ctx,
-                &ly->W_o, d_o_proj, sv->attn_out + t * D,
-                tw->W_o, d_attn_out_all + t * D, dW_o, D, D);
-            free(d_o_proj);
+            for (int i = 0; i < seq_len * D; i++)
+                d_o_proj_all[i] = s * d_hidden[i];
         }
+        ternary_project_backward_gpu_batch(&tm->backward_ctx,
+            &ly->W_o, d_o_proj_all, sv->attn_out,
+            tw->W_o, d_attn_out_all, dW_o, seq_len, D, D);
+        free(d_o_proj_all);
 
-        /* Phase 2: batched causal attention backward on GPU — all positions at once */
+        /* Phase 2: batched causal attention backward on GPU */
         float *dq_all  = (float*)calloc(seq_len * D, sizeof(float));
         float *dk_store = (float*)calloc(seq_len * KV, sizeof(float));
         float *dv_store = (float*)calloc(seq_len * KV, sizeof(float));
@@ -1259,43 +1270,41 @@ static TrainResult trainable_forward_backward(
 
         free(d_attn_out_all);
 
-        /* Phase 2.5: Inverse RoPE on dQ and dK per position.
-         * Attention backward returns gradients in the rotated space.
-         * Must undo rotation before gradients flow into W_q/W_k backward. */
-        for (int t = 0; t < seq_len; t++) {
+        /* Phase 2.5: Inverse RoPE per position */
+        for (int t = 0; t < seq_len; t++)
             rope_unapply_cpu(dq_all + t * D, dk_store + t * KV,
                              &tm->model.rope, t, NH, NKV);
-        }
 
-        /* Phase 3: Q/K/V projection backward + gain backward per position */
-        for (int t = seq_len - 1; t >= 0; t--) {
-            float *d_normed_attn = (float*)calloc(D, sizeof(float));
+        /* Phase 3: batch Q/K/V backward — 3 GPU calls instead of 3×seq_len.
+         * d_normed_attn_all accumulates from Q, K, V backward. */
+        float *d_normed_attn_all = (float*)calloc(seq_len * D, sizeof(float));
 
-            ternary_project_backward_gpu(&tm->backward_ctx,
-                &ly->W_q, dq_all + t * D, sv->pre_attn_normed + t * D,
-                tw->W_q, d_normed_attn, dW_q, D, D);
+        ternary_project_backward_gpu_batch(&tm->backward_ctx,
+            &ly->W_q, dq_all, sv->pre_attn_normed,
+            tw->W_q, d_normed_attn_all, dW_q, seq_len, D, D);
 
-            ternary_project_backward_gpu(&tm->backward_ctx,
-                &ly->W_k, dk_store + t * KV, sv->pre_attn_normed + t * D,
-                tw->W_k, d_normed_attn, dW_k, KV, D);
-            ternary_project_backward_gpu(&tm->backward_ctx,
-                &ly->W_v, dv_store + t * KV, sv->pre_attn_normed + t * D,
-                tw->W_v, d_normed_attn, dW_v, KV, D);
+        ternary_project_backward_gpu_batch(&tm->backward_ctx,
+            &ly->W_k, dk_store, sv->pre_attn_normed,
+            tw->W_k, d_normed_attn_all, dW_k, seq_len, KV, D);
 
-            /* Step 1 backward: gain norm (attention) */
-            float *d_h_pre_attn = (float*)calloc(D, sizeof(float));
-            gain_backward_cpu(d_h_pre_attn, d_normed_attn,
-                              sv->hidden_pre_attn + t * D,
-                              sv->R_attn_saved, tm->grad_gain_C_attn[l], D);
-
-            /* Add attention backward gradient to d_hidden */
-            for (int i = 0; i < D; i++)
-                d_hidden[t * D + i] += d_h_pre_attn[i];
-
-            free(d_normed_attn); free(d_h_pre_attn);
-        }
+        ternary_project_backward_gpu_batch(&tm->backward_ctx,
+            &ly->W_v, dv_store, sv->pre_attn_normed,
+            tw->W_v, d_normed_attn_all, dW_v, seq_len, KV, D);
 
         free(dq_all); free(dk_store); free(dv_store);
+
+        /* Phase 4: gain backward per position (CPU, sequential) */
+        for (int t = 0; t < seq_len; t++) {
+            float *d_h_pre_attn = (float*)calloc(D, sizeof(float));
+            gain_backward_cpu(d_h_pre_attn, d_normed_attn_all + t * D,
+                              sv->hidden_pre_attn + t * D,
+                              sv->R_attn_saved, tm->grad_gain_C_attn[l], D);
+            for (int i = 0; i < D; i++)
+                d_hidden[t * D + i] += d_h_pre_attn[i];
+            free(d_h_pre_attn);
+        }
+
+        free(d_normed_attn_all);
 
         /* Track max gradient for monitoring */
         for (int i = 0; i < D * D; i++) {

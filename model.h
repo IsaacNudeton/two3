@@ -173,17 +173,30 @@ static int byte_sample(float *logits, float temperature) {
  * on GPU, dequantizes back to float. This is the REAL path.
  * ═══════════════════════════════════════════════════════ */
 
-static void ternary_project_cpu(
+/* Batched ternary projection: S vectors in one GPU round-trip.
+ * input:  [S, dim_in] contiguous row-major
+ * output: [S, dim_out] contiguous row-major */
+static void ternary_project_batch_cpu(
     const Two3Weights *W,
-    const float *input,     /* [dim_in] */
-    float *output,          /* [dim_out] (= W->rows) */
-    int dim_in
+    const float *input,     /* [S, dim_in] */
+    float *output,          /* [S, dim_out] */
+    int S, int dim_in
 ) {
-    Two3Activations X = two3_quantize_acts(input, 1, dim_in);
+    Two3Activations X = two3_quantize_acts(input, S, dim_in);
     Two3Output Y = two3_forward(W, &X);
     two3_dequantize_output(&Y, W, &X, output);
     two3_free_output(&Y);
     two3_free_acts(&X);
+}
+
+/* Single-vector convenience wrapper */
+static void ternary_project_cpu(
+    const Two3Weights *W,
+    const float *input,     /* [dim_in] */
+    float *output,          /* [dim_out] */
+    int dim_in
+) {
+    ternary_project_batch_cpu(W, input, output, 1, dim_in);
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -450,99 +463,80 @@ static void model_forward_sequence_cpu(
     for (int t = 0; t < seq_len; t++)
         byte_embed_cpu(hidden + t * D, m->embed, bytes_in[t], D);
 
-    /* Work buffers */
-    float *normed  = (float*)malloc(D * sizeof(float));
-    float *q_buf   = (float*)malloc(D * sizeof(float));    /* [n_heads * head_dim] */
-    float *k_buf   = (float*)malloc(KV * sizeof(float));   /* [n_kv_heads * head_dim] */
-    float *v_buf   = (float*)malloc(KV * sizeof(float));
-    float *attn_out = (float*)malloc(D * sizeof(float));
-    float *o_proj  = (float*)malloc(D * sizeof(float));
-    float *moe_out = (float*)malloc(D * sizeof(float));
+    /* Batched work buffers — [seq_len × dim] contiguous for GPU batch calls */
+    float *normed_all = (float*)malloc(seq_len * D * sizeof(float));
+    float *q_all      = (float*)malloc(seq_len * D * sizeof(float));
+    float *k_all      = (float*)malloc(seq_len * KV * sizeof(float));
+    float *v_all      = (float*)malloc(seq_len * KV * sizeof(float));
+    float *attn_out_all = (float*)malloc(seq_len * D * sizeof(float));
+    float *o_proj_all = (float*)malloc(seq_len * D * sizeof(float));
+    float *moe_out    = (float*)malloc(D * sizeof(float));
+    float *normed_one = (float*)malloc(D * sizeof(float));
 
-    /* Residual scaling for deep models: 1/sqrt(2*L) per residual add */
     float res_scale = 1.0f / sqrtf(2.0f * (float)m->cfg.n_layers);
-
-    /* Pre-allocate KV stores — same size every layer, reuse */
-    float *k_store = (float*)malloc(seq_len * KV * sizeof(float));
-    float *v_store = (float*)malloc(seq_len * KV * sizeof(float));
 
     for (int l = 0; l < m->cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];
 
-        memset(k_store, 0, seq_len * KV * sizeof(float));
-        memset(v_store, 0, seq_len * KV * sizeof(float));
+        /* ── Attention block (batched projections) ── */
 
-        /* ── Pass 1: compute and store Q, K, V for all positions ── */
-        /* Then do attention per position (causal: t attends to 0..t) */
+        /* Phase 1: gain norm all positions (sequential — R depends on previous) */
+        for (int t = 0; t < seq_len; t++)
+            gain_forward_cpu(normed_all + t * D, hidden + t * D,
+                             ly->gain_attn.R, ly->gain_attn.C, D);
 
+        /* Phase 2: batch Q/K/V projections — 3 GPU calls instead of 3×seq_len */
+        ternary_project_batch_cpu(&ly->W_q, normed_all, q_all, seq_len, D);
+        ternary_project_batch_cpu(&ly->W_k, normed_all, k_all, seq_len, D);
+        ternary_project_batch_cpu(&ly->W_v, normed_all, v_all, seq_len, D);
+
+        /* Phase 3: RoPE all positions (CPU, cheap) */
+        for (int t = 0; t < seq_len; t++)
+            rope_apply_cpu(q_all + t * D, k_all + t * KV, &m->rope, t, NH, NKV);
+
+        /* Phase 4: causal attention per position (sequential dependency) */
+        for (int t = 0; t < seq_len; t++)
+            causal_attention_cpu(q_all + t * D, k_all, v_all,
+                                 attn_out_all + t * D, t, NH, NKV, HD);
+
+        /* Phase 5: batch O projection — 1 GPU call instead of seq_len */
+        ternary_project_batch_cpu(&ly->W_o, attn_out_all, o_proj_all, seq_len, D);
+
+        /* Phase 6: scale + residual add (CPU) */
+        {
+            float s = res_scale / sqrtf((float)D);
+            for (int t = 0; t < seq_len; t++)
+                for (int i = 0; i < D; i++)
+                    hidden[t * D + i] += s * o_proj_all[t * D + i];
+        }
+
+        /* ── FFN block (MoE still per-position for now) ── */
+
+        /* Phase 7: gain norm + MoE per position */
         for (int t = 0; t < seq_len; t++) {
             float *h = hidden + t * D;
+            gain_forward_cpu(normed_one, h, ly->gain_ffn.R, ly->gain_ffn.C, D);
 
-            /* 1. Gain normalization */
-            gain_forward_cpu(normed, h, ly->gain_attn.R, ly->gain_attn.C, D);
-
-            /* 2. Q, K, V ternary projections — REAL, through GPU kernel */
-            ternary_project_cpu(&ly->W_q, normed, q_buf, D);
-            ternary_project_cpu(&ly->W_k, normed, k_buf, D);
-            ternary_project_cpu(&ly->W_v, normed, v_buf, D);
-
-            /* 3. RoPE on Q and K */
-            rope_apply_cpu(q_buf, k_buf, &m->rope, t, NH, NKV);
-
-            /* 4. Store K and V for this position */
-            memcpy(k_store + t * KV, k_buf, KV * sizeof(float));
-            memcpy(v_store + t * KV, v_buf, KV * sizeof(float));
-
-            /* 5. Causal attention: Q[t] attends to K[0..t], V[0..t] */
-            causal_attention_cpu(q_buf, k_store, v_store, attn_out,
-                                 t, NH, NKV, HD);
-
-            /* 6. Output projection — ternary + scale */
-            ternary_project_cpu(&ly->W_o, attn_out, o_proj, D);
-            {
-                float s = 1.0f / sqrtf((float)D);
-                for (int i = 0; i < D; i++) o_proj[i] *= s;
-            }
-
-            /* 7. Residual add (scaled for deep models) */
-            for (int i = 0; i < D; i++)
-                h[i] += res_scale * o_proj[i];
-
-            /* ── FFN block ── */
-
-            /* 8. Gain normalization */
-            gain_forward_cpu(normed, h, ly->gain_ffn.R, ly->gain_ffn.C, D);
-
-            /* 9. MoE: route + real expert forward */
             MoESelection sel;
-            moe_route(&ly->moe.router, normed, &sel);
-            moe_forward_real(&ly->moe, normed, moe_out, &sel);
+            moe_route(&ly->moe.router, normed_one, &sel);
+            moe_forward_real(&ly->moe, normed_one, moe_out, &sel);
 
-            /* 10. Residual add (scaled for deep models) */
             for (int i = 0; i < D; i++)
                 h[i] += res_scale * moe_out[i];
         }
-
     }
-
-    free(k_store);
-    free(v_store);
 
     /* Final gain norm + logits for each position */
     for (int t = 0; t < seq_len; t++) {
-        gain_forward_cpu(normed, hidden + t * D,
+        gain_forward_cpu(normed_one, hidden + t * D,
                          m->gain_final.R, m->gain_final.C, D);
-        byte_logits_cpu(all_logits + t * 256, normed, m->embed, D);
+        byte_logits_cpu(all_logits + t * 256, normed_one, m->embed, D);
     }
 
     free(hidden);
-    free(normed);
-    free(q_buf);
-    free(k_buf);
-    free(v_buf);
-    free(attn_out);
-    free(o_proj);
-    free(moe_out);
+    free(normed_all); free(q_all); free(k_all); free(v_all);
+    free(attn_out_all); free(o_proj_all);
+    free(moe_out); free(normed_one);
 }
 
 /* ═══════════════════════════════════════════════════════
