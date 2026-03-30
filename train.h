@@ -106,8 +106,18 @@ static void adam_free(AdamState *s) {
     s->m = s->v = NULL;
 }
 
-/* Gradient norm clipping: scale gradients if L2 norm exceeds max_norm */
+/* Gradient clipping: per-element clamp THEN L2 norm clip.
+ * Per-element clamp prevents one explosive flip from dominating
+ * the L2 norm and starving all other gradients via norm scaling. */
+#define GRAD_ELEM_CLAMP 5.0f
+
 static float clip_grad_norm(float *grads, int size, float max_norm) {
+    /* Per-element clamp first — prevents flip cascade */
+    for (int i = 0; i < size; i++) {
+        if (grads[i] > GRAD_ELEM_CLAMP) grads[i] = GRAD_ELEM_CLAMP;
+        if (grads[i] < -GRAD_ELEM_CLAMP) grads[i] = -GRAD_ELEM_CLAMP;
+    }
+    /* Then L2 norm clip */
     float norm_sq = 0;
     for (int i = 0; i < size; i++)
         norm_sq += grads[i] * grads[i];
