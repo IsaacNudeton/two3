@@ -540,20 +540,84 @@ static void model_forward_sequence_cpu(
                     hidden[t * D + i] += s * o_proj_all[t * D + i];
         }
 
-        /* ── FFN block (MoE still per-position for now) ── */
+        /* ── FFN block (expert-grouped batched projections) ── */
 
-        /* Phase 7: gain norm + MoE per position */
-        for (int t = 0; t < seq_len; t++) {
-            float *h = hidden + t * D;
-            gain_forward_cpu(normed_one, h, ly->gain_ffn.R, ly->gain_ffn.C, D);
+        /* Phase 7: gain norm all positions (sequential) */
+        for (int t = 0; t < seq_len; t++)
+            gain_forward_cpu(normed_all + t * D, hidden + t * D,
+                             ly->gain_ffn.R, ly->gain_ffn.C, D);
 
-            MoESelection sel;
-            moe_route(&ly->moe.router, normed_one, &sel);
-            moe_forward_real(&ly->moe, normed_one, moe_out, &sel);
+        /* Phase 8: route all positions */
+        MoESelection *all_sel = (MoESelection*)malloc(seq_len * sizeof(MoESelection));
+        for (int t = 0; t < seq_len; t++)
+            moe_route(&ly->moe.router, normed_all + t * D, &all_sel[t]);
 
-            for (int i = 0; i < D; i++)
-                h[i] += res_scale * moe_out[i];
+        /* Phase 9: expert-grouped forward */
+        {
+            int *expert_pos_flat = (int*)malloc(MOE_NUM_EXPERTS * seq_len * sizeof(int));
+            #define EP(e, i) expert_pos_flat[(e) * seq_len + (i)]
+            int expert_cnt[MOE_NUM_EXPERTS];
+            float *gather_in  = (float*)malloc(seq_len * D * sizeof(float));
+            int INTER = m->cfg.intermediate;
+            float *gate_b     = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *up_b       = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *h_exp      = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *down_b     = (float*)malloc(seq_len * D * sizeof(float));
+            float *moe_result = (float*)calloc(seq_len * D, sizeof(float));
+
+            for (int k_sel = 0; k_sel < MOE_TOP_K; k_sel++) {
+                memset(expert_cnt, 0, sizeof(expert_cnt));
+                for (int t = 0; t < seq_len; t++) {
+                    int eid = all_sel[t].expert_ids[k_sel];
+                    EP(eid, expert_cnt[eid]++) = t;
+                }
+
+                for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                    int cnt = expert_cnt[e];
+                    if (cnt == 0) continue;
+
+                    for (int i = 0; i < cnt; i++)
+                        memcpy(gather_in + i * D, normed_all + EP(e, i) * D,
+                               D * sizeof(float));
+
+                    const Two3Weights *W_gu[2] = { &ly->moe.experts[e].gate, &ly->moe.experts[e].up };
+                    float *out_gu[2] = { gate_b, up_b };
+                    ternary_project_multi_cpu(W_gu, out_gu, gather_in, 2, cnt, D);
+
+                    float scale = 1.0f / sqrtf((float)D);
+                    for (int i = 0; i < cnt * INTER; i++) {
+                        gate_b[i] *= scale;
+                        up_b[i] *= scale;
+                    }
+                    for (int i = 0; i < cnt * INTER; i++) {
+                        float g = gate_b[i];
+                        gate_b[i] = (g > 0.0f) ? g * g : 0.0f;
+                    }
+                    for (int i = 0; i < cnt * INTER; i++)
+                        h_exp[i] = gate_b[i] * up_b[i];
+
+                    ternary_project_batch_cpu(&ly->moe.experts[e].down,
+                                             h_exp, down_b, cnt, INTER);
+
+                    for (int i = 0; i < cnt; i++) {
+                        int t = EP(e, i);
+                        float w = all_sel[t].expert_weights[k_sel];
+                        for (int d = 0; d < D; d++)
+                            moe_result[t * D + d] += w * down_b[i * D + d];
+                    }
+                }
+            }
+
+            for (int t = 0; t < seq_len; t++)
+                for (int i = 0; i < D; i++)
+                    hidden[t * D + i] += res_scale * moe_result[t * D + i];
+
+            free(expert_pos_flat);
+            #undef EP
+            free(gather_in); free(gate_b); free(up_b);
+            free(h_exp); free(down_b); free(moe_result);
         }
+        free(all_sel);
     }
 
     /* Final gain norm + logits for each position */

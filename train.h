@@ -844,7 +844,13 @@ static TrainResult trainable_forward_backward(
      * ═══════════════════════════════════════════════════════ */
 
     static int _timing_done = 0;
-    clock_t _t_fwd_start = clock();
+    clock_t _t0, _t1;
+    double _ms_gain_attn = 0, _ms_qkv_proj = 0, _ms_rope_attn = 0;
+    double _ms_o_proj = 0, _ms_moe_fwd = 0, _ms_loss = 0;
+    double _ms_bwd_logits = 0, _ms_bwd_moe = 0, _ms_bwd_attn = 0;
+    double _ms_bwd_qkv = 0, _ms_bwd_gain = 0;
+    #define T_START() _t0 = clock()
+    #define T_ACC(var) do { _t1 = clock(); var += (double)(_t1 - _t0) * 1000.0 / CLOCKS_PER_SEC; } while(0)
 
     /* Per-position hidden states: [seq_len × dim] */
     /* We need to save hidden states BEFORE and AFTER each sublayer */
@@ -913,18 +919,25 @@ static TrainResult trainable_forward_backward(
         /* ── Attention block (batched projections) ── */
 
         /* Phase 1: gain norm all positions (sequential — R depends on previous) */
+        T_START();
         for (int t = 0; t < seq_len; t++)
             gain_forward_cpu(sv->pre_attn_normed + t * D, hidden + t * D,
                              ly->gain_attn.R, ly->gain_attn.C, D);
 
+        T_ACC(_ms_gain_attn);
+
         /* Phase 2: multi-projection Q/K/V — quantize once, project 3x */
+        T_START();
         {
             const Two3Weights *W_qkv[3] = { &ly->W_q, &ly->W_k, &ly->W_v };
             float *out_qkv[3] = { sv->q_all, sv->k_store, sv->v_store };
             ternary_project_multi_cpu(W_qkv, out_qkv, sv->pre_attn_normed, 3, seq_len, D);
         }
 
+        T_ACC(_ms_qkv_proj);
+
         /* Phase 3: RoPE all positions (CPU, cheap) */
+        T_START();
         for (int t = 0; t < seq_len; t++)
             rope_apply_cpu(sv->q_all + t * D, sv->k_store + t * KV,
                            &tm->model.rope, t, NH, NKV);
@@ -934,7 +947,10 @@ static TrainResult trainable_forward_backward(
             causal_attention_cpu(sv->q_all + t * D, sv->k_store, sv->v_store,
                                  sv->attn_out + t * D, t, NH, NKV, HD);
 
+        T_ACC(_ms_rope_attn);
+
         /* Phase 5: batch O projection — 1 GPU call instead of seq_len */
+        T_START();
         ternary_project_batch_cpu(&ly->W_o, sv->attn_out, sv->o_proj, seq_len, D);
 
         /* Phase 6: scale + residual add */
@@ -945,91 +961,121 @@ static TrainResult trainable_forward_backward(
                     hidden[t * D + i] += s * sv->o_proj[t * D + i];
         }
 
+        T_ACC(_ms_o_proj);
+
         /* Save hidden before FFN block */
         memcpy(sv->hidden_pre_ffn, hidden, seq_len * D * sizeof(float));
 
         /* Save reservoir state before FFN gain */
+        T_START();
         memcpy(sv->R_ffn_saved, ly->gain_ffn.R, D * sizeof(float));
 
-        for (int t = 0; t < seq_len; t++) {
-            float *h = hidden + t * D;
-            float *normed = sv->pre_ffn_normed + t * D;
+        /* ── MoE block (expert-grouped batched projections) ── */
 
-            /* 7. Gain norm (FFN) */
-            gain_forward_cpu(normed, h, ly->gain_ffn.R, ly->gain_ffn.C, D);
+        /* Step 7: Gain norm all positions (sequential) */
+        for (int t = 0; t < seq_len; t++)
+            gain_forward_cpu(sv->pre_ffn_normed + t * D, hidden + t * D,
+                             ly->gain_ffn.R, ly->gain_ffn.C, D);
 
-            /* 8. MoE routing */
-            moe_route(&ly->moe.router, normed, &sv->moe_sel[t]);
+        /* Step 8: Route all positions */
+        for (int t = 0; t < seq_len; t++)
+            moe_route(&ly->moe.router, sv->pre_ffn_normed + t * D, &sv->moe_sel[t]);
 
-            /* 9. MoE expert forward — save intermediates for top expert only */
-            /* For backprop we need gate_pre (before squared ReLU) and up_out */
-            {
-                float *gate = sv->expert_gate_pre + t * INTER;
-                float *up   = sv->expert_up_out + t * INTER;
-                float *moe_o = sv->moe_out + t * D;
+        /* Step 9: Expert-grouped forward — gather, batch, scatter.
+         * For each expert: gather positions routed to it, batch-project
+         * gate+up+down, scatter outputs back. */
+        memset(sv->moe_out, 0, seq_len * D * sizeof(float));
+        {
+            /* Group positions by expert (top-K routing) */
+            int *expert_pos_flat = (int*)malloc(MOE_NUM_EXPERTS * seq_len * sizeof(int));
+            #define EP(e, i) expert_pos_flat[(e) * seq_len + (i)]
+            int expert_cnt[MOE_NUM_EXPERTS];
 
-                /* We only save for the PRIMARY expert (top-1) for memory.
-                 * Full backprop through both experts is correct but expensive.
-                 * Approximation: gradient flows through top-1 only. */
-                int eid = sv->moe_sel[t].expert_ids[0];
-                float w0 = sv->moe_sel[t].expert_weights[0];
+            /* Scratch buffers for batched projections */
+            float *gather_in  = (float*)malloc(seq_len * D * sizeof(float));
+            float *gate_batch = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *up_batch   = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *h_expert   = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *down_batch = (float*)malloc(seq_len * D * sizeof(float));
 
-                /* Gate + Up share input — quantize once, project 2x */
-                {
-                    const Two3Weights *W_gu[2] = { &ly->moe.experts[eid].gate, &ly->moe.experts[eid].up };
-                    float *out_gu[2] = { gate, up };
-                    ternary_project_multi_cpu(W_gu, out_gu, normed, 2, 1, D);
+            for (int k_sel = 0; k_sel < MOE_TOP_K; k_sel++) {
+                /* Collect which positions route to each expert for this top-K slot */
+                memset(expert_cnt, 0, sizeof(expert_cnt));
+                for (int t = 0; t < seq_len; t++) {
+                    int eid = sv->moe_sel[t].expert_ids[k_sel];
+                    EP(eid, expert_cnt[eid]++) = t;
                 }
 
-                float scale = 1.0f / sqrtf((float)D);
-                for (int i = 0; i < INTER; i++) {
-                    gate[i] *= scale;
-                    up[i] *= scale;
+                /* Process each active expert */
+                for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                    int cnt = expert_cnt[e];
+                    if (cnt == 0) continue;
+
+                    /* Gather: collect input vectors for this expert */
+                    for (int i = 0; i < cnt; i++)
+                        memcpy(gather_in + i * D, sv->pre_ffn_normed + EP(e, i) * D,
+                               D * sizeof(float));
+
+                    /* Batch gate + up — quantize once, project 2x */
+                    {
+                        const Two3Weights *W_gu[2] = { &ly->moe.experts[e].gate, &ly->moe.experts[e].up };
+                        float *out_gu[2] = { gate_batch, up_batch };
+                        ternary_project_multi_cpu(W_gu, out_gu, gather_in, 2, cnt, D);
+                    }
+
+                    /* Scale, squared ReLU, element-wise multiply (CPU, cheap) */
+                    float scale = 1.0f / sqrtf((float)D);
+                    for (int i = 0; i < cnt * INTER; i++) {
+                        gate_batch[i] *= scale;
+                        up_batch[i] *= scale;
+                    }
+                    for (int i = 0; i < cnt * INTER; i++) {
+                        float g = gate_batch[i];
+                        gate_batch[i] = (g > 0.0f) ? g * g : 0.0f;  /* squared ReLU */
+                    }
+                    for (int i = 0; i < cnt * INTER; i++)
+                        h_expert[i] = gate_batch[i] * up_batch[i];
+
+                    /* Batch down projection */
+                    ternary_project_batch_cpu(&ly->moe.experts[e].down,
+                                             h_expert, down_batch, cnt, INTER);
+
+                    /* Scatter: write results back to position order */
+                    for (int i = 0; i < cnt; i++) {
+                        int t = EP(e, i);
+                        float w = sv->moe_sel[t].expert_weights[k_sel];
+                        for (int d = 0; d < D; d++)
+                            sv->moe_out[t * D + d] += w * down_batch[i * D + d];
+
+                        /* Save intermediates for top-1 expert (needed for backward) */
+                        if (k_sel == 0) {
+                            memcpy(sv->expert_gate_pre + t * INTER,
+                                   gate_batch + i * INTER, INTER * sizeof(float));
+                            memcpy(sv->expert_up_out + t * INTER,
+                                   up_batch + i * INTER, INTER * sizeof(float));
+                            memcpy(sv->expert1_out + t * D,
+                                   down_batch + i * D, D * sizeof(float));
+                        }
+                    }
                 }
-
-                /* Save pre-activation gate for backward */
-                float *gate_activated = (float*)malloc(INTER * sizeof(float));
-                squared_relu_cpu(gate_activated, gate, INTER);
-
-                /* gate_activated * up */
-                float *h_expert = (float*)malloc(INTER * sizeof(float));
-                for (int i = 0; i < INTER; i++)
-                    h_expert[i] = gate_activated[i] * up[i];
-
-                /* Down projection */
-                float *expert_out = (float*)malloc(D * sizeof(float));
-                ternary_project_cpu(&ly->moe.experts[eid].down, h_expert, expert_out, INTER);
-
-                /* Save expert 1's raw output for router gradient */
-                memcpy(sv->expert1_out + t * D, expert_out, D * sizeof(float));
-
-                /* Store weighted output */
-                for (int i = 0; i < D; i++)
-                    moe_o[i] = w0 * expert_out[i];
-
-                /* Add second expert contribution (but don't save intermediates) */
-                if (MOE_TOP_K > 1) {
-                    int eid2 = sv->moe_sel[t].expert_ids[1];
-                    float w1 = sv->moe_sel[t].expert_weights[1];
-                    float *e2_out = (float*)malloc(D * sizeof(float));
-                    moe_expert_forward_real(&ly->moe.experts[eid2], normed, e2_out, D, INTER);
-                    for (int i = 0; i < D; i++)
-                        moe_o[i] += w1 * e2_out[i];
-                    free(e2_out);
-                }
-
-                free(gate_activated);
-                free(h_expert);
-                free(expert_out);
             }
 
-            /* 10. Residual add (scaled for deep models) */
-            for (int i = 0; i < D; i++)
-                h[i] += res_scale * sv->moe_out[t * D + i];
+            free(expert_pos_flat);
+            #undef EP
+            free(gather_in); free(gate_batch); free(up_batch);
+            free(h_expert); free(down_batch);
         }
+
+        /* Step 10: Residual add (scaled for deep models) */
+        for (int t = 0; t < seq_len; t++)
+            for (int i = 0; i < D; i++)
+                hidden[t * D + i] += res_scale * sv->moe_out[t * D + i];
+
+        T_ACC(_ms_moe_fwd);
     }
 
     /* Final gain norm + logits */
+    T_START();
     float *final_normed = (float*)calloc(seq_len * D, sizeof(float));
     float *R_final_saved = (float*)malloc(D * sizeof(float));
     memcpy(R_final_saved, tm->model.gain_final.R, D * sizeof(float));
@@ -1072,10 +1118,14 @@ static TrainResult trainable_forward_backward(
 
     result.loss = total_loss / (float)T;
 
-    clock_t _t_fwd_end = clock();
+    /* (timing handled by T_ACC macros) */
 
     /* ═══════════════════════════════════════════════════════
      * BACKWARD PASS — accumulates into persistent grad buffers
+     * ═══════════════════════════════════════════════════════ */
+    T_ACC(_ms_loss);
+
+    /* ═══════════════════════════════════════════════════════
      * (caller must zero first via trainable_zero_grads)
      * ═══════════════════════════════════════════════════════ */
 
@@ -1106,6 +1156,8 @@ static TrainResult trainable_forward_backward(
         free(d_fn);
     }
 
+    T_START();
+
     /* Backward through layers (reverse order).
      * Gradients accumulate into persistent tw->grad_* buffers. */
     for (int l = L - 1; l >= 0; l--) {
@@ -1133,6 +1185,7 @@ static TrainResult trainable_forward_backward(
         }
 
         /* ── Backward through FFN block (reverse of forward steps 7-10) ── */
+        T_START();
 
         for (int t = seq_len - 1; t >= 0; t--) {
             /* d_hidden already has gradient from above (or from next layer) */
@@ -1246,7 +1299,10 @@ static TrainResult trainable_forward_backward(
             free(d_h_pre_ffn);
         }
 
+        T_ACC(_ms_bwd_moe);
+
         /* ── Backward through attention block (batched projections) ── */
+        T_START();
 
         /* Phase 1: batch O backward — 1 GPU call instead of seq_len.
          * Forward: h += res_scale/sqrt(D) * W_o @ attn_out
@@ -1281,8 +1337,11 @@ static TrainResult trainable_forward_backward(
             rope_unapply_cpu(dq_all + t * D, dk_store + t * KV,
                              &tm->model.rope, t, NH, NKV);
 
+        T_ACC(_ms_bwd_attn);
+
         /* Phase 3: batch Q/K/V backward — 3 GPU calls instead of 3×seq_len.
          * d_normed_attn_all accumulates from Q, K, V backward. */
+        T_START();
         float *d_normed_attn_all = (float*)calloc(seq_len * D, sizeof(float));
 
         ternary_project_backward_gpu_batch(&tm->backward_ctx,
@@ -1299,7 +1358,10 @@ static TrainResult trainable_forward_backward(
 
         free(dq_all); free(dk_store); free(dv_store);
 
+        T_ACC(_ms_bwd_qkv);
+
         /* Phase 4: gain backward per position (CPU, sequential) */
+        T_START();
         for (int t = 0; t < seq_len; t++) {
             float *d_h_pre_attn = (float*)calloc(D, sizeof(float));
             gain_backward_cpu(d_h_pre_attn, d_normed_attn_all + t * D,
@@ -1311,6 +1373,7 @@ static TrainResult trainable_forward_backward(
         }
 
         free(d_normed_attn_all);
+        T_ACC(_ms_bwd_gain);
 
         /* Track max gradient for monitoring */
         for (int i = 0; i < D * D; i++) {
@@ -1352,14 +1415,21 @@ static TrainResult trainable_forward_backward(
     free(all_logits); free(d_logits_all);
 
     if (!_timing_done) {
-        clock_t _t_end = clock();
-        double fwd_ms = (double)(_t_fwd_end - _t_fwd_start) * 1000.0 / CLOCKS_PER_SEC;
-        double bwd_ms = (double)(_t_end - _t_fwd_end) * 1000.0 / CLOCKS_PER_SEC;
-        double total_ms = fwd_ms + bwd_ms;
-        printf("  [PROFILE] forward=%.0fms  backward=%.0fms  total=%.0fms  (fwd %.0f%% / bwd %.0f%%)\n",
-               fwd_ms, bwd_ms, total_ms, 100.0*fwd_ms/total_ms, 100.0*bwd_ms/total_ms);
+        double fwd = _ms_gain_attn + _ms_qkv_proj + _ms_rope_attn + _ms_o_proj + _ms_moe_fwd;
+        double bwd = _ms_bwd_logits + _ms_bwd_moe + _ms_bwd_attn + _ms_bwd_qkv + _ms_bwd_gain;
+        double total = fwd + _ms_loss + bwd;
+        printf("\n  [PROFILE] total=%.0fms  fwd=%.0fms (%.0f%%)  bwd=%.0fms (%.0f%%)\n",
+               total, fwd, 100*fwd/total, bwd, 100*bwd/total);
+        printf("    FWD: gain=%.0f  QKV=%.0f  rope+attn=%.0f  O=%.0f  MoE=%.0f\n",
+               _ms_gain_attn, _ms_qkv_proj, _ms_rope_attn, _ms_o_proj, _ms_moe_fwd);
+        printf("    BWD: logits=%.0f  MoE=%.0f  attn=%.0f  QKV=%.0f  gain=%.0f\n",
+               _ms_bwd_logits, _ms_bwd_moe, _ms_bwd_attn, _ms_bwd_qkv, _ms_bwd_gain);
+        printf("    LOSS: %.0f\n\n", _ms_loss);
         _timing_done = 1;
     }
+
+    #undef T_START
+    #undef T_ACC
 
     return result;
 }
