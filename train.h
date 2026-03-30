@@ -804,6 +804,13 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         adam_update(ly->moe.router.W, tm->grad_router[l], &tm->adam_router[l], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(ly->gain_attn.C, tm->grad_gain_C_attn[l], &tm->adam_gain_C_attn[l], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(ly->gain_ffn.C, tm->grad_gain_C_ffn[l], &tm->adam_gain_C_ffn[l], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+
+        /* Clamp C — capacity can't go negative. If C < R_MIN, replenishment
+         * term γ(C-R) becomes a drain, pinning R at floor permanently. */
+        for (int i = 0; i < D; i++) {
+            if (ly->gain_attn.C[i] < GAIN_R_MIN) ly->gain_attn.C[i] = GAIN_R_MIN;
+            if (ly->gain_ffn.C[i] < GAIN_R_MIN) ly->gain_ffn.C[i] = GAIN_R_MIN;
+        }
     }
 
     /* Embedding and final gain */
@@ -811,6 +818,8 @@ static void trainable_optimizer_step(TrainableModel *tm) {
     clip_grad_norm(tm->grad_gain_C_final, D, GRAD_CLIP_NORM);
     adam_update(tm->latent_embed, tm->grad_embed, &tm->adam_embed, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
     adam_update(tm->model.gain_final.C, tm->grad_gain_C_final, &tm->adam_gain_C_final, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+    for (int i = 0; i < D; i++)
+        if (tm->model.gain_final.C[i] < GAIN_R_MIN) tm->model.gain_final.C[i] = GAIN_R_MIN;
 
     /* Sync embedding + requantize */
     memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
