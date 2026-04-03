@@ -23,6 +23,7 @@ if "%1"=="debug" goto debug
 if "%1"=="debug-moon" goto debug_moon
 if "%1"=="gpu-moon" goto gpu_moon
 if "%1"=="gpu-resident" goto gpu_resident
+if "%1"=="gpu-sixq" goto gpu_sixq
 if "%1"=="verify-moon" goto verify_moon
 if "%1"=="hadamard" goto hadamard
 if "%1"=="hadamard-ablation" goto hadamard
@@ -39,6 +40,11 @@ goto end_verify
 echo  Building hadamard_ablation.exe (host reference, no two3.cu)
 nvcc -O2 -o hadamard_ablation.exe hadamard_ablation.cu
 goto end_hadamard
+
+:gpu_sixq
+echo  Building GPU-SIXQ (GPU-resident + weighted loss + sparse optim + layer skip)
+nvcc -O3 -arch=sm_75 -DTWO3_GPU_RESIDENT -DTWO3_SIX_Q -o train_driver.exe train_driver.cu two3.cu
+goto end
 
 :gpu_resident
 echo  Building GPU-RESIDENT (latent on device, bulk H2D, -O3 optimized)

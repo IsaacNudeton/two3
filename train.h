@@ -160,6 +160,8 @@ typedef struct {
     int    size;
 } AdamState;
 
+#include "six_q.h"
+
 static void adam_init(AdamState *s, int size) {
     s->size = size;
     s->m = (float*)calloc(size, sizeof(float));
@@ -449,6 +451,10 @@ typedef struct {
     float **grad_gain_C_attn;
     float **grad_gain_C_ffn;
     float *grad_gain_C_final;
+
+#ifdef TWO3_LAYER_SKIP
+    LayerSkipState layer_skip;
+#endif
 } TrainableModel;
 
 /* ═══════════════════════════════════════════════════════
@@ -652,6 +658,10 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     }
 #endif
 
+#ifdef TWO3_LAYER_SKIP
+    layer_skip_init(&tm->layer_skip, L);
+#endif
+
     printf("[init] trainable_model_init complete\n"); fflush(stdout);
 }
 
@@ -751,6 +761,10 @@ static void trainable_model_free(TrainableModel *tm) {
 
     adam_free(&tm->adam_gain_C_final);
     free(tm->grad_gain_C_final);
+
+#ifdef TWO3_LAYER_SKIP
+    layer_skip_free(&tm->layer_skip);
+#endif
 
 #ifdef TWO3_GPU_RESIDENT
     cudaFree(tm->d_latent_pool);
@@ -1786,11 +1800,18 @@ static TrainResult trainable_forward_backward(
     float total_loss = 0;
     float *d_logits_all = (float*)calloc(seq_len * 256, sizeof(float));
 
+#ifdef TWO3_WEIGHTED_LOSS
+    float *per_pos_loss = (float*)malloc(T * sizeof(float));
+#endif
+
     for (int t = 0; t < T; t++) {
         int target = bytes[t + 1];
         float loss = cross_entropy_loss(
             all_logits + t * 256, target, d_logits_all + t * 256);
         total_loss += loss;
+#ifdef TWO3_WEIGHTED_LOSS
+        per_pos_loss[t] = loss;
+#endif
 
         /* Track accuracy */
         int pred = 0;
@@ -1804,6 +1825,17 @@ static TrainResult trainable_forward_backward(
         if (pred == target) result.correct++;
     }
     /* Last position has no target — zero gradient */
+
+#ifdef TWO3_WEIGHTED_LOSS
+    /* Weight gradients by difficulty: easy tokens → 10%, hard tokens → 100% */
+    {
+        float *loss_weights = (float*)malloc(T * sizeof(float));
+        compute_loss_weights(loss_weights, per_pos_loss, T);
+        apply_loss_weights(d_logits_all, loss_weights, T);
+        free(loss_weights);
+    }
+    free(per_pos_loss);
+#endif
 
     result.loss = total_loss / (float)T;
 
@@ -1847,12 +1879,42 @@ static TrainResult trainable_forward_backward(
 
     T_START();
 
+#ifdef TWO3_LAYER_SKIP
+    /* Update convergence state from gain reservoirs */
+    {
+        GainState *ga = (GainState*)malloc(L * sizeof(GainState));
+        GainState *gf = (GainState*)malloc(L * sizeof(GainState));
+        for (int l = 0; l < L; l++) {
+            ga[l] = tm->model.layers[l].gain_attn;
+            gf[l] = tm->model.layers[l].gain_ffn;
+        }
+        layer_skip_update(&tm->layer_skip, ga, gf, D);
+        free(ga); free(gf);
+    }
+#endif
+
     /* Backward through layers (reverse order).
      * Gradients accumulate into persistent tw->grad_* buffers. */
     for (int l = L - 1; l >= 0; l--) {
         ModelLayer *ly = &tm->model.layers[l];
         LayerSaved *sv = &saved[l];
         TrainableLayerWeights *tw = &tm->layer_weights[l];
+
+#ifdef TWO3_LAYER_SKIP
+        if (layer_skip_should_skip(&tm->layer_skip, l)) {
+            /* Skip weight gradients — gradient flows through residual unchanged.
+             * Still need to free saved activations. */
+            free(sv->pre_attn_normed); free(sv->R_attn_saved);
+            free(sv->q_all); free(sv->k_store); free(sv->v_store);
+            free(sv->attn_out); free(sv->o_proj);
+            free(sv->pre_ffn_normed); free(sv->R_ffn_saved);
+            free(sv->moe_sel); free(sv->expert_gate_pre); free(sv->expert_up_out);
+            free(sv->moe_out); free(sv->expert1_out);
+            free(sv->hidden_pre_attn); free(sv->hidden_pre_ffn);
+            tm->layer_skip.total_skipped++;
+            continue;
+        }
+#endif
 
         /* Layer-wise gradient clipping: prevent gradient explosion in deep models.
          * Clip d_hidden norm per-position before it enters this layer's backward.
