@@ -169,6 +169,7 @@ static void adam_free(AdamState *s) {
 
 typedef struct {
     float *momentum;  /* [rows × cols] */
+    float *scratch;   /* [cols × cols] pre-allocated NS scratch */
     int    rows;      /* M dimension */
     int    cols;      /* K dimension */
 } MuonState;
@@ -177,11 +178,12 @@ static void muon_init(MuonState *s, int rows, int cols) {
     s->rows = rows;
     s->cols = cols;
     s->momentum = (float*)calloc(rows * cols, sizeof(float));
+    s->scratch  = (float*)calloc(cols * cols, sizeof(float));
 }
 
 static void muon_free(MuonState *s) {
-    free(s->momentum);
-    s->momentum = NULL;
+    free(s->momentum); s->momentum = NULL;
+    free(s->scratch);  s->scratch  = NULL;
 }
 
 /* Newton-Schulz iteration: 5 steps to orthogonalize.
@@ -203,6 +205,9 @@ static void newton_schulz_orthogonalize(
 
     float *XtX = scratch;  /* [cols × cols] */
 
+    /* Pre-allocate G_new once outside loop */
+    float *G_new = (float*)malloc(rows * cols * sizeof(float));
+
     /* 5 iterations of polynomial orthogonalization */
     for (int iter = 0; iter < 5; iter++) {
         /* Compute X^T @ X */
@@ -213,7 +218,6 @@ static void newton_schulz_orthogonalize(
                     XtX[i * cols + j] += G[k * cols + i] * G[k * cols + j];
 
         /* Compute X @ XtX and X @ XtX @ XtX inline */
-        float *G_new = (float*)malloc(rows * cols * sizeof(float));
         for (int i = 0; i < rows; i++) {
             for (int j = 0; j < cols; j++) {
                 /* (X @ XtX)[i][j] */
@@ -234,8 +238,8 @@ static void newton_schulz_orthogonalize(
             }
         }
         memcpy(G, G_new, rows * cols * sizeof(float));
-        free(G_new);
     }
+    free(G_new);
 }
 
 /* Muon update step — replaces Adam for ternary weights */
@@ -253,10 +257,8 @@ static void muon_update(
     for (int i = 0; i < size; i++)
         s->momentum[i] = momentum_beta * s->momentum[i] + grads[i];
 
-    /* Newton-Schulz orthogonalization of momentum */
-    float *scratch = (float*)calloc(s->cols * s->cols, sizeof(float));
-    newton_schulz_orthogonalize(s->momentum, s->rows, s->cols, scratch);
-    free(scratch);
+    /* Newton-Schulz orthogonalization of momentum (pre-allocated scratch) */
+    newton_schulz_orthogonalize(s->momentum, s->rows, s->cols, s->scratch);
 
     /* Update with weight decay */
     for (int i = 0; i < size; i++)
@@ -1090,6 +1092,70 @@ static void trainable_optimizer_step(TrainableModel *tm) {
  * Target: next byte prediction (shift by 1)
  * Loss: cross-entropy averaged over sequence
  * ═══════════════════════════════════════════════════════ */
+
+/* ═══════════════════════════════════════════════════════
+ * Plateau diagnostics — call every N steps during training
+ *
+ * Dumps: per-layer reservoir depletion, per-expert routing
+ * fractions, ternary weight entropy (how diverse are the
+ * weights — entropy 0 = all same, log2(3) = uniform ternary).
+ * ═══════════════════════════════════════════════════════ */
+
+static void trainable_dump_diagnostics(TrainableModel *tm, int step) {
+    int L = tm->cfg.n_layers;
+    int D = tm->cfg.dim;
+
+    printf("\n  [diag step=%d]\n", step);
+
+    /* Per-layer reservoir depletion: mean(C - R) for attn and ffn */
+    for (int l = 0; l < L; l++) {
+        ModelLayer *ly = &tm->model.layers[l];
+        float dep_attn = 0.f, dep_ffn = 0.f;
+        float min_R_attn = 1e30f, min_R_ffn = 1e30f;
+        for (int i = 0; i < D; i++) {
+            dep_attn += ly->gain_attn.C[i] - ly->gain_attn.R[i];
+            dep_ffn  += ly->gain_ffn.C[i]  - ly->gain_ffn.R[i];
+            if (ly->gain_attn.R[i] < min_R_attn) min_R_attn = ly->gain_attn.R[i];
+            if (ly->gain_ffn.R[i]  < min_R_ffn)  min_R_ffn  = ly->gain_ffn.R[i];
+        }
+        printf("    L%d reservoir: attn=%.4f (min_R=%.4f)  ffn=%.4f (min_R=%.4f)\n",
+               l, dep_attn / D, min_R_attn, dep_ffn / D, min_R_ffn);
+    }
+
+    /* Per-expert routing fractions from reservoir state */
+    for (int l = 0; l < L; l++) {
+        MoERouter *r = &tm->model.layers[l].moe.router;
+        printf("    L%d experts R: [", l);
+        for (int e = 0; e < r->n_experts; e++)
+            printf("%.3f%s", r->R_expert[e], e < r->n_experts - 1 ? " " : "");
+        printf("]\n");
+    }
+
+    /* Ternary weight entropy per layer (sample W_q):
+     * count {-1, 0, +1} fractions, compute H = -sum(p*log2(p)) */
+    for (int l = 0; l < L; l++) {
+        TrainableLayerWeights *tw = &tm->layer_weights[l];
+        int size = D * D;
+        int cnt[3] = {0, 0, 0};  /* -1, 0, +1 */
+        for (int i = 0; i < size; i++) {
+            float w = tw->W_q[i];
+            if (w > 0.5f) cnt[2]++;
+            else if (w < -0.5f) cnt[0]++;
+            else cnt[1]++;
+        }
+        float H = 0.f;
+        for (int k = 0; k < 3; k++) {
+            float p = (float)cnt[k] / (float)size;
+            if (p > 1e-10f) H -= p * log2f(p);
+        }
+        printf("    L%d W_q entropy: %.4f (max=%.4f)  [-1]=%.1f%% [0]=%.1f%% [+1]=%.1f%%\n",
+               l, H, log2f(3.0f),
+               100.f * cnt[0] / size, 100.f * cnt[1] / size, 100.f * cnt[2] / size);
+    }
+
+    printf("\n");
+    fflush(stdout);
+}
 
 typedef struct {
     float loss;         /* average cross-entropy loss */

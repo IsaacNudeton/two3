@@ -295,11 +295,11 @@ static int argmax256(const float *v) {
     return j;
 }
 
-/* Fresh model_init per forward so GainState matches; full depth vs margin+stable early exit. */
+/* Fresh model_init per forward so GainState matches; full depth vs reservoir depletion early exit. */
 static int test_early_exit_parity(void) {
     printf("--- Test 7: early exit vs full depth (seq_len=1) ---\n");
-    printf("  compiled TWO3_EXIT_MARGIN_MIN=%.4g (if this looks wrong, force rebuild)\n",
-           (double)TWO3_EXIT_MARGIN_MIN);
+    printf("  compiled TWO3_EXIT_DEPLETION_THRESH=%.4g\n",
+           (double)TWO3_EXIT_DEPLETION_THRESH);
     fflush(stdout);
     ModelConfig cfg = test_config();
     cfg.n_layers = 4;

@@ -346,6 +346,33 @@ int main(int argc, char **argv) {
                             flips, fc.total_flips, step_ms);
                     fflush(logf);
                 }
+
+                /* Plateau diagnostics every 10x log_every */
+                if (global_step % (cfg.log_every * 10) == 0)
+                    trainable_dump_diagnostics(&tm, global_step);
+
+                /* Generation sample every 50 steps */
+                if (global_step % 50 == 0) {
+                    printf("  >> gen[%d]: \"", global_step);
+                    uint8_t gen_buf[65];
+                    gen_buf[0] = 'T';  /* seed byte */
+                    for (int g = 0; g < 64; g++) {
+                        float logits_g[256];
+                        model_forward_sequence_cpu(&tm.model, gen_buf, g + 1, logits_g,
+                                                   MODEL_FWD_FLAGS_DEFAULT);
+                        /* Greedy argmax from last position's logits */
+                        float *last_logits = logits_g + g * 256;
+                        int best = 0;
+                        for (int b = 1; b < 256; b++)
+                            if (last_logits[b] > last_logits[best]) best = b;
+                        gen_buf[g + 1] = (uint8_t)best;
+                        /* Print printable or dot */
+                        char c = (best >= 32 && best < 127) ? (char)best : '.';
+                        printf("%c", c);
+                    }
+                    printf("\"\n");
+                    fflush(stdout);
+                }
             }
 
             /* Checkpoint */

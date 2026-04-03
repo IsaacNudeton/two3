@@ -36,11 +36,16 @@
 
 #define BYTE_VOCAB 256  /* raw bytes, not tokens */
 
-/* Inference early exit (model_forward_sequence_cpu): pseudo-logit margin gate.
- * Default 10: random init still hits margin≥4 often (Test 7 L2 huge); 10 makes exit
- * rare until weights are confident — tune per checkpoint with -DTWO3_EXIT_MARGIN_MIN=… */
-#ifndef TWO3_EXIT_MARGIN_MIN
-#define TWO3_EXIT_MARGIN_MIN (10.0f)
+/* Inference early exit (model_forward_sequence_cpu):
+ * Reservoir depletion gate — if mean(C - R) across both gain states
+ * (attn + ffn) is below threshold, the layer's reservoirs barely fired.
+ * Signal is free (already computed in gain_forward), adaptive (tracks
+ * training), and has stability guarantees from Jury conditions.
+ *
+ * Old heuristic (logit margin) removed — it was a bolted-on heuristic
+ * with no connection to the gain kernel dynamics. */
+#ifndef TWO3_EXIT_DEPLETION_THRESH
+#define TWO3_EXIT_DEPLETION_THRESH (0.08f)
 #endif
 
 /* model_forward_sequence_cpu(..., forward_flags) — last parameter */
@@ -548,21 +553,8 @@ static void model_forward_sequence_cpu(
 
     float res_scale = 1.0f / sqrtf(2.0f * (float)m->cfg.n_layers);
 
-    /* Per-layer exit probe: same token t across consecutive layer outputs.
-     * hidden is [seq_len × D], not [n_layers × D]. */
-#if defined(TWO3_EARLY_EXIT) || defined(TWO3_DEBUG_EXIT_METRICS)
-    const int t_exit = (seq_len > 0) ? (seq_len - 1) : 0;
-    float *h_layer_prev = NULL;
-    if (seq_len > 0) {
-        h_layer_prev = (float*)malloc((size_t)D * sizeof(float));
-        memcpy(h_layer_prev, hidden + t_exit * D, (size_t)D * sizeof(float));
-    }
-#endif
 #ifdef TWO3_EARLY_EXIT
     int layers_early_stop = 0;
-#endif
-#if defined(TWO3_EARLY_EXIT) || defined(TWO3_DEBUG_EXIT_METRICS)
-    int prev_probe_pred = -1;
 #endif
 
     for (int l = 0; l < m->cfg.n_layers; l++) {
@@ -683,45 +675,29 @@ static void model_forward_sequence_cpu(
         free(all_sel);
 
         /* ═══════════════════════════════════════════════════════
-         * TWO3_DEBUG_EXIT_METRICS: log cos, pseudo pred, margin, stable_vs_prev.
-         * Pseudo = embed·h (no gain_final) — calibrate vs true logits separately.
-         *
-         * TWO3_EARLY_EXIT: seq_len==1 only; after layer l>=1 exit if pseudo-argmax
-         * matches previous layer AND margin >= TWO3_EXIT_MARGIN_MIN (default 10.0f).
-         * Never break when seq_len>1. Training: do not define TWO3_EARLY_EXIT.
+         * Reservoir depletion early exit.
+         * mean(C - R) across attn + ffn gain states for this layer.
+         * If < threshold, reservoirs barely depleted — layer had little
+         * effect, skip remaining layers. Only for seq_len==1 inference.
          * ═══════════════════════════════════════════════════════ */
 #if defined(TWO3_EARLY_EXIT) || defined(TWO3_DEBUG_EXIT_METRICS)
-        if (h_layer_prev && seq_len > 0) {
-            const float *h = hidden + t_exit * D;
-            float dot = 0.f, na = 0.f, nb = 0.f;
+        {
+            float depletion_sum = 0.f;
             for (int i = 0; i < D; i++) {
-                float a = h_layer_prev[i];
-                float b = h[i];
-                dot += a * b;
-                na += a * a;
-                nb += b * b;
+                depletion_sum += (ly->gain_attn.C[i] - ly->gain_attn.R[i]);
+                depletion_sum += (ly->gain_ffn.C[i] - ly->gain_ffn.R[i]);
             }
-            float cos_sim = dot / (sqrtf(na + 1e-10f) * sqrtf(nb + 1e-10f));
-
-            float probe_logits[256];
-            byte_logits_cpu(probe_logits, h, m->embed, D);
-            int best_byte;
-            float top_l, second_l, margin_l;
-            byte_probe_top2(probe_logits, &best_byte, &top_l, &second_l, &margin_l);
-            int stable = (l > 0 && prev_probe_pred >= 0 && best_byte == prev_probe_pred) ? 1 : 0;
-
+            float mean_depletion = depletion_sum / (2.0f * D);
 #ifdef TWO3_DEBUG_EXIT_METRICS
-            printf("[exit_probe] layer=%d t=%d cos=%.6f pred=%d top=%.4f 2nd=%.4f margin=%.4f stable_vs_prev=%d\n",
-                   l, t_exit, cos_sim, best_byte, top_l, second_l, margin_l, stable);
+            printf("[exit_reservoir] layer=%d mean_depletion=%.6f thresh=%.4f\n",
+                   l, mean_depletion, (double)TWO3_EXIT_DEPLETION_THRESH);
             fflush(stdout);
 #endif
 #ifdef TWO3_EARLY_EXIT
-            if (seq_len == 1 && l >= 1 && stable && margin_l >= TWO3_EXIT_MARGIN_MIN
+            if (seq_len == 1 && l >= 1 && mean_depletion < TWO3_EXIT_DEPLETION_THRESH
                 && !(forward_flags & MODEL_FWD_FORCE_FULL_DEPTH))
                 layers_early_stop = 1;
 #endif
-            prev_probe_pred = best_byte;
-            memcpy(h_layer_prev, h, (size_t)D * sizeof(float));
         }
 #endif
 #ifdef TWO3_EARLY_EXIT
@@ -729,10 +705,6 @@ static void model_forward_sequence_cpu(
             break;
 #endif
     }
-
-#if defined(TWO3_EARLY_EXIT) || defined(TWO3_DEBUG_EXIT_METRICS)
-    free(h_layer_prev);
-#endif
 
     /* Final gain norm + logits for each position */
     for (int t = 0; t < seq_len; t++) {
