@@ -33,8 +33,60 @@
 #include <string.h>
 
 /* ═══════════════════════════════════════════════════════
- * Logit clipping — prevents exp(114K) = inf
+ * Muon optimizer GPU — wrapper for train.h integration
+ *
+ * When TWO3_MUON_GPU is defined, use GPU Newton-Schulz
+ * via cuBLAS. Requires cublas linked and two3_muon_gpu_init
+ * called on backward_ctx.
  * ═══════════════════════════════════════════════════════ */
+
+#ifdef TWO3_MUON_GPU
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+static void check_cuda(cudaError_t err, const char *msg) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error at %s: %s\n", msg, cudaGetErrorString(err));
+        exit(1);
+    }
+}
+
+/* Muon update on GPU for a single weight tensor.
+ * H2D / D2H staging uses d_W_latent and d_dW (safe after backward, before next forward).
+ * Newton-Schulz scratch (d_muon_XXtX, d_muon_XXtXXtX) must not alias params/grads. */
+static void muon_update_gpu_tensor(
+    Two3BackwardCtx *ctx,
+    float *params_host,      /* [rows × cols] host, read/write */
+    const float *grads_host, /* [rows × cols] host, read */
+    float *host_momentum,    /* [rows × cols] host MuonState.momentum */
+    int rows, int cols,
+    float lr, float momentum_beta, float weight_decay
+) {
+    int size = rows * cols;
+    size_t bytes = size * sizeof(float);
+
+    float *d_params = ctx->d_W_latent;
+    float *d_grads = ctx->d_dW;
+
+    check_cuda(cudaMemcpy(ctx->d_muon_momentum, host_momentum, bytes,
+                          cudaMemcpyHostToDevice),
+               "cudaMemcpy momentum H2D");
+    check_cuda(cudaMemcpy(d_params, params_host, bytes, cudaMemcpyHostToDevice),
+               "cudaMemcpy params H2D");
+    check_cuda(cudaMemcpy(d_grads, grads_host, bytes, cudaMemcpyHostToDevice),
+               "cudaMemcpy grads H2D");
+
+    two3_muon_update_gpu(ctx, d_params, d_grads, rows, cols,
+                         lr, momentum_beta, weight_decay);
+
+    check_cuda(cudaMemcpy(params_host, d_params, bytes, cudaMemcpyDeviceToHost),
+               "cudaMemcpy params D2H");
+    check_cuda(cudaMemcpy(host_momentum, ctx->d_muon_momentum, bytes,
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy momentum D2H");
+}
+
+#endif /* TWO3_MUON_GPU */
 
 #define LOGIT_CLIP 30.0f
 
@@ -106,6 +158,111 @@ static void adam_free(AdamState *s) {
     s->m = s->v = NULL;
 }
 
+/* ═══════════════════════════════════════════════════════
+ * Muon optimizer — Newton-Schulz orthogonal projection
+ *
+ * Preserves singular value spectrum of weight matrices.
+ * For ternary weights: coherent flip patterns, not chaos.
+ * Memory: 1 buffer (momentum) vs Adam's 2 (m, v).
+ * Savings: ~2.6 GB for 654M params on 8GB card.
+ * ═══════════════════════════════════════════════════════ */
+
+typedef struct {
+    float *momentum;  /* [rows × cols] */
+    int    rows;      /* M dimension */
+    int    cols;      /* K dimension */
+} MuonState;
+
+static void muon_init(MuonState *s, int rows, int cols) {
+    s->rows = rows;
+    s->cols = cols;
+    s->momentum = (float*)calloc(rows * cols, sizeof(float));
+}
+
+static void muon_free(MuonState *s) {
+    free(s->momentum);
+    s->momentum = NULL;
+}
+
+/* Newton-Schulz iteration: 5 steps to orthogonalize.
+ * Input: G [rows × cols] gradient matrix, modified in-place.
+ * Scratch: [cols × cols] temporary for X^T @ X.
+ * Coefficients from Muon paper: a=3.4445, b=-4.7750, c=2.0315 */
+static void newton_schulz_orthogonalize(
+    float *G, int rows, int cols, float *scratch
+) {
+    const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
+
+    /* Normalize G by Frobenius norm */
+    float norm_sq = 0;
+    for (int i = 0; i < rows * cols; i++)
+        norm_sq += G[i] * G[i];
+    float norm = sqrtf(norm_sq + 1e-30f);
+    for (int i = 0; i < rows * cols; i++)
+        G[i] /= norm;
+
+    float *XtX = scratch;  /* [cols × cols] */
+
+    /* 5 iterations of polynomial orthogonalization */
+    for (int iter = 0; iter < 5; iter++) {
+        /* Compute X^T @ X */
+        memset(XtX, 0, cols * cols * sizeof(float));
+        for (int i = 0; i < cols; i++)
+            for (int j = 0; j < cols; j++)
+                for (int k = 0; k < rows; k++)
+                    XtX[i * cols + j] += G[k * cols + i] * G[k * cols + j];
+
+        /* Compute X @ XtX and X @ XtX @ XtX inline */
+        float *G_new = (float*)malloc(rows * cols * sizeof(float));
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                /* (X @ XtX)[i][j] */
+                float x_xtx = 0;
+                for (int k = 0; k < cols; k++)
+                    x_xtx += G[i * cols + k] * XtX[k * cols + j];
+
+                /* (X @ XtX @ XtX)[i][j] */
+                float x_xtx_xtx = 0;
+                for (int k = 0; k < cols; k++) {
+                    float xtx_xtx_kj = 0;
+                    for (int m = 0; m < cols; m++)
+                        xtx_xtx_kj += XtX[k * cols + m] * XtX[m * cols + j];
+                    x_xtx_xtx += G[i * cols + k] * xtx_xtx_kj;
+                }
+
+                G_new[i * cols + j] = a * G[i * cols + j] + b * x_xtx + c * x_xtx_xtx;
+            }
+        }
+        memcpy(G, G_new, rows * cols * sizeof(float));
+        free(G_new);
+    }
+}
+
+/* Muon update step — replaces Adam for ternary weights */
+static void muon_update(
+    float *params,         /* [rows × cols] latent weights */
+    const float *grads,    /* [rows × cols] gradients */
+    MuonState *s,
+    float lr,
+    float momentum_beta,   /* 0.95 typical */
+    float weight_decay     /* 0.01 typical */
+) {
+    int size = s->rows * s->cols;
+
+    /* Momentum: m = β·m + g */
+    for (int i = 0; i < size; i++)
+        s->momentum[i] = momentum_beta * s->momentum[i] + grads[i];
+
+    /* Newton-Schulz orthogonalization of momentum */
+    float *scratch = (float*)calloc(s->cols * s->cols, sizeof(float));
+    newton_schulz_orthogonalize(s->momentum, s->rows, s->cols, scratch);
+    free(scratch);
+
+    /* Update with weight decay */
+    for (int i = 0; i < size; i++)
+        params[i] -= lr * (s->momentum[i] + weight_decay * params[i]);
+}
+
 /* Gradient clipping: per-element clamp THEN L2 norm clip.
  * Per-element clamp prevents one explosive flip from dominating
  * the L2 norm and starving all other gradients via norm scaling. */
@@ -130,7 +287,12 @@ static float clip_grad_norm(float *grads, int size, float max_norm) {
     return norm;
 }
 
+/* Muon (NS) updates use orthogonalized momentum — same LR as SGD can diverge; clip a bit tighter too. */
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
+#define GRAD_CLIP_NORM 0.5f
+#else
 #define GRAD_CLIP_NORM 1.0f
+#endif
 
 /* Adam update: modifies params in-place */
 static void adam_update(
@@ -190,6 +352,8 @@ static float ste_backward(float grad, float w_latent) {
  *
  * Structure mirrors Model but adds float latent weights
  * and Adam states for every trainable parameter.
+ * Ternary weights (W_q/k/v/o, expert gate/up/down) use Muon.
+ * Float weights (embedding, router, gain C) use Adam.
  * ═══════════════════════════════════════════════════════ */
 
 typedef struct {
@@ -209,11 +373,19 @@ typedef struct {
     float *grad_up[MOE_NUM_EXPERTS];
     float *grad_down[MOE_NUM_EXPERTS];
 
-    /* Adam states for each */
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
+    /* Muon states for ternary weights (momentum only, half memory) */
+    MuonState muon_Wq, muon_Wk, muon_Wv, muon_Wo;
+    MuonState muon_gate[MOE_NUM_EXPERTS];
+    MuonState muon_up[MOE_NUM_EXPERTS];
+    MuonState muon_down[MOE_NUM_EXPERTS];
+#else
+    /* Adam states for ternary weights (default path) */
     AdamState adam_Wq, adam_Wk, adam_Wv, adam_Wo;
     AdamState adam_gate[MOE_NUM_EXPERTS];
     AdamState adam_up[MOE_NUM_EXPERTS];
     AdamState adam_down[MOE_NUM_EXPERTS];
+#endif
 } TrainableLayerWeights;
 
 typedef struct {
@@ -312,10 +484,17 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         INIT_TERNARY_LATENT(tw->W_v, KV * D);
         INIT_TERNARY_LATENT(tw->W_o, D * D);
 
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
+        muon_init(&tw->muon_Wq, D, D);
+        muon_init(&tw->muon_Wk, KV, D);
+        muon_init(&tw->muon_Wv, KV, D);
+        muon_init(&tw->muon_Wo, D, D);
+#else
         adam_init(&tw->adam_Wq, D * D);
         adam_init(&tw->adam_Wk, KV * D);
         adam_init(&tw->adam_Wv, KV * D);
         adam_init(&tw->adam_Wo, D * D);
+#endif
 
         /* Persistent gradient accumulators for batch accumulation */
         tw->grad_Wq = (float*)calloc(D * D, sizeof(float));
@@ -332,9 +511,15 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
             INIT_TERNARY_LATENT(tw->expert_up[e], INTER * D);
             INIT_TERNARY_LATENT(tw->expert_down[e], D * INTER);
 
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
+            muon_init(&tw->muon_gate[e], INTER, D);
+            muon_init(&tw->muon_up[e], INTER, D);
+            muon_init(&tw->muon_down[e], D, INTER);
+#else
             adam_init(&tw->adam_gate[e], INTER * D);
             adam_init(&tw->adam_up[e], INTER * D);
             adam_init(&tw->adam_down[e], D * INTER);
+#endif
 
             tw->grad_gate[e] = (float*)calloc(INTER * D, sizeof(float));
             tw->grad_up[e]   = (float*)calloc(INTER * D, sizeof(float));
@@ -364,6 +549,16 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         tm->backward_ctx = two3_backward_ctx_init(max_M, max_K,
             cfg.max_seq, D, KV, cfg.n_heads);
     }
+
+#ifdef TWO3_MUON_GPU
+    /* Initialize Muon GPU buffers (cuBLAS handle, device buffers) */
+    {
+        int max_M = D > INTER ? D : INTER;
+        if (KV > max_M) max_M = KV;
+        int max_K = D > INTER ? D : INTER;
+        two3_muon_gpu_init(&tm->backward_ctx, max_M, max_K);
+    }
+#endif
 
     /* Quantize latent weights to ternary for the model
      * (defined below, declared here via forward declaration) */
@@ -414,14 +609,24 @@ static void trainable_model_free(TrainableModel *tm) {
         TrainableLayerWeights *tw = &tm->layer_weights[l];
         free(tw->W_q); free(tw->W_k); free(tw->W_v); free(tw->W_o);
         free(tw->grad_Wq); free(tw->grad_Wk); free(tw->grad_Wv); free(tw->grad_Wo);
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
+        muon_free(&tw->muon_Wq); muon_free(&tw->muon_Wk);
+        muon_free(&tw->muon_Wv); muon_free(&tw->muon_Wo);
+#else
         adam_free(&tw->adam_Wq); adam_free(&tw->adam_Wk);
         adam_free(&tw->adam_Wv); adam_free(&tw->adam_Wo);
+#endif
 
         for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
             free(tw->expert_gate[e]); free(tw->expert_up[e]); free(tw->expert_down[e]);
             free(tw->grad_gate[e]); free(tw->grad_up[e]); free(tw->grad_down[e]);
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
+            muon_free(&tw->muon_gate[e]); muon_free(&tw->muon_up[e]);
+            muon_free(&tw->muon_down[e]);
+#else
             adam_free(&tw->adam_gate[e]); adam_free(&tw->adam_up[e]);
             adam_free(&tw->adam_down[e]);
+#endif
         }
 
         adam_free(&tm->adam_router[l]);
@@ -442,6 +647,11 @@ static void trainable_model_free(TrainableModel *tm) {
 
     adam_free(&tm->adam_gain_C_final);
     free(tm->grad_gain_C_final);
+
+#ifdef TWO3_MUON_GPU
+    /* Free Muon GPU buffers before backward_ctx free */
+    two3_muon_gpu_free(&tm->backward_ctx);
+#endif
 
     two3_backward_ctx_free(&tm->backward_ctx);
 
@@ -782,7 +992,59 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         clip_grad_norm(tw->grad_Wv, KV * D, GRAD_CLIP_NORM);
         clip_grad_norm(tw->grad_Wo, D * D, GRAD_CLIP_NORM);
 
-        /* Adam on STE weights */
+        /* ═══════════════════════════════════════════════════════
+         * Optimizer selection:
+         *   TWO3_MUON_GPU     → GPU Newton-Schulz via cuBLAS (fastest)
+         *   TWO3_USE_MUON_TERNARY → CPU Newton-Schulz (slow, debug only)
+         *   default           → SGD (fast, production)
+         * ═══════════════════════════════════════════════════════ */
+
+#ifdef TWO3_MUON_GPU
+        /* GPU Muon — Newton-Schulz on GPU via cuBLAS */
+        muon_update_gpu_tensor(&tm->backward_ctx,
+            tw->W_q, tw->grad_Wq, tw->muon_Wq.momentum, D, D,
+            tm->lr, 0.95f, 0.01f);
+        muon_update_gpu_tensor(&tm->backward_ctx,
+            tw->W_k, tw->grad_Wk, tw->muon_Wk.momentum, KV, D,
+            tm->lr, 0.95f, 0.01f);
+        muon_update_gpu_tensor(&tm->backward_ctx,
+            tw->W_v, tw->grad_Wv, tw->muon_Wv.momentum, KV, D,
+            tm->lr, 0.95f, 0.01f);
+        muon_update_gpu_tensor(&tm->backward_ctx,
+            tw->W_o, tw->grad_Wo, tw->muon_Wo.momentum, D, D,
+            tm->lr, 0.95f, 0.01f);
+
+        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            clip_grad_norm(tw->grad_gate[e], INTER * D, GRAD_CLIP_NORM);
+            clip_grad_norm(tw->grad_up[e], INTER * D, GRAD_CLIP_NORM);
+            clip_grad_norm(tw->grad_down[e], D * INTER, GRAD_CLIP_NORM);
+            muon_update_gpu_tensor(&tm->backward_ctx,
+                tw->expert_gate[e], tw->grad_gate[e], tw->muon_gate[e].momentum,
+                INTER, D, tm->lr, 0.95f, 0.01f);
+            muon_update_gpu_tensor(&tm->backward_ctx,
+                tw->expert_up[e], tw->grad_up[e], tw->muon_up[e].momentum,
+                INTER, D, tm->lr, 0.95f, 0.01f);
+            muon_update_gpu_tensor(&tm->backward_ctx,
+                tw->expert_down[e], tw->grad_down[e], tw->muon_down[e].momentum,
+                D, INTER, tm->lr, 0.95f, 0.01f);
+        }
+#elif defined(TWO3_USE_MUON_TERNARY)
+        /* CPU Muon — Newton-Schulz on CPU (slow, ~100x SGD) */
+        muon_update(tw->W_q, tw->grad_Wq, &tw->muon_Wq, tm->lr, 0.95f, 0.01f);
+        muon_update(tw->W_k, tw->grad_Wk, &tw->muon_Wk, tm->lr, 0.95f, 0.01f);
+        muon_update(tw->W_v, tw->grad_Wv, &tw->muon_Wv, tm->lr, 0.95f, 0.01f);
+        muon_update(tw->W_o, tw->grad_Wo, &tw->muon_Wo, tm->lr, 0.95f, 0.01f);
+
+        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            clip_grad_norm(tw->grad_gate[e], INTER * D, GRAD_CLIP_NORM);
+            clip_grad_norm(tw->grad_up[e], INTER * D, GRAD_CLIP_NORM);
+            clip_grad_norm(tw->grad_down[e], D * INTER, GRAD_CLIP_NORM);
+            muon_update(tw->expert_gate[e], tw->grad_gate[e], &tw->muon_gate[e], tm->lr, 0.95f, 0.01f);
+            muon_update(tw->expert_up[e], tw->grad_up[e], &tw->muon_up[e], tm->lr, 0.95f, 0.01f);
+            muon_update(tw->expert_down[e], tw->grad_down[e], &tw->muon_down[e], tm->lr, 0.95f, 0.01f);
+        }
+#else
+        /* Adam on STE ternary weights (default path) */
         adam_update(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
@@ -796,8 +1058,9 @@ static void trainable_optimizer_step(TrainableModel *tm) {
             adam_update(tw->expert_up[e], tw->grad_up[e], &tw->adam_up[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
             adam_update(tw->expert_down[e], tw->grad_down[e], &tw->adam_down[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         }
+#endif
 
-        /* Router and gain C */
+        /* Router and gain C — Adam (float weights, not ternary) */
         clip_grad_norm(tm->grad_router[l], D * MOE_NUM_EXPERTS, GRAD_CLIP_NORM);
         clip_grad_norm(tm->grad_gain_C_attn[l], D, GRAD_CLIP_NORM);
         clip_grad_norm(tm->grad_gain_C_ffn[l], D, GRAD_CLIP_NORM);
@@ -809,13 +1072,13 @@ static void trainable_optimizer_step(TrainableModel *tm) {
          * collapsing the reservoir. C stays at init value (1.0). */
     }
 
-    /* Embedding and final gain */
+    /* Embedding and final gain — Adam */
     clip_grad_norm(tm->grad_embed, 256 * D, GRAD_CLIP_NORM);
     clip_grad_norm(tm->grad_gain_C_final, D, GRAD_CLIP_NORM);
     adam_update(tm->latent_embed, tm->grad_embed, &tm->adam_embed, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
     /* gain_final.C also frozen — same reasoning as per-layer C. */
 
-    /* Sync embedding + requantize */
+    /* Sync embedding + requantize ternary weights */
     memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
     trainable_requantize(tm);
 }
@@ -851,6 +1114,13 @@ static TrainResult trainable_forward_backward(
     int INTER = tm->cfg.intermediate;
     int L = tm->cfg.n_layers;
     int T = seq_len - 1;  /* number of prediction positions */
+
+    if (seq_len < 2) {
+        fprintf(stderr,
+                "trainable_forward_backward: seq_len must be >= 2 (next-byte target). got %d\n",
+                seq_len);
+        return result;
+    }
 
     /* ═══════════════════════════════════════════════════════
      * FORWARD PASS — save everything for backprop
@@ -902,9 +1172,29 @@ static TrainResult trainable_forward_backward(
      * For 2 layers: scale = 0.5.  For 4 layers: scale = 0.354. */
     float res_scale = 1.0f / sqrtf(2.0f * (float)L);
 
+    /* Same token, consecutive layer outputs — mirrors model_forward_sequence_cpu.
+     * Training never calls that path; log here when TWO3_DEBUG_EXIT_METRICS is set. */
+#ifdef TWO3_DEBUG_EXIT_METRICS
+    const int t_exit = (seq_len > 0) ? (seq_len - 1) : 0;
+    float *h_layer_prev = NULL;
+    int prev_probe_pred = -1;
+    if (seq_len > 0) {
+        h_layer_prev = (float*)malloc((size_t)D * sizeof(float));
+        memcpy(h_layer_prev, hidden + t_exit * D, (size_t)D * sizeof(float));
+    }
+#endif
+
     for (int l = 0; l < L; l++) {
         ModelLayer *ly = &tm->model.layers[l];
         LayerSaved *sv = &saved[l];
+
+#ifdef TWO3_DEBUG_MOE
+        static int debug_layer_hit = 0;
+        if (!debug_layer_hit) {
+            printf("DEBUG_FWD_HIT l=%d seq_len=%d D=%d\n", l, seq_len, D);
+            debug_layer_hit = 1;
+        }
+#endif
 
         sv->pre_attn_normed = (float*)calloc(seq_len * D, sizeof(float));
         sv->R_attn_saved = (float*)malloc(D * sizeof(float));
@@ -1079,6 +1369,20 @@ static TrainResult trainable_forward_backward(
                                    down_batch + i * D, D * sizeof(float));
                     }
                 }
+
+                /* Update reservoirs for load balancing (after expert dispatch, before scatter) */
+                moe_update_reservoir(&ly->moe.router, expert_cnt, seq_len);
+
+#ifdef TWO3_DEBUG_MOE
+                if (l == 0) { /* layer 0 only, cheap */
+                    printf("step=%d layer=%d ", tm->step, l);
+                    printf("counts:");
+                    for (int e = 0; e < MOE_NUM_EXPERTS; e++) printf(" %d", expert_cnt[e]);
+                    printf("  R:");
+                    for (int e = 0; e < MOE_NUM_EXPERTS; e++) printf(" %.3f", ly->moe.router.R_expert[e]);
+                    printf("\n");
+                }
+#endif
             }
 
             free(expert_pos_flat);
@@ -1093,6 +1397,17 @@ static TrainResult trainable_forward_backward(
                 hidden[t * D + i] += res_scale * sv->moe_out[t * D + i];
 
         T_ACC(_ms_moe_fwd);
+
+#ifdef TWO3_DEBUG_GAIN
+        /* Log gain reservoir depletion as difficulty signal */
+        if (l == 0) { /* layer 0 only, cheap */
+            float total_dep = 0.0f;
+            for (int i = 0; i < D; i++)
+                total_dep += ly->gain_ffn.C[i] - ly->gain_ffn.R[i];
+            float mean_dep = total_dep / (float)D;
+            printf("step=%d layer=%d mean_depletion=%.4f\n", tm->step, l, mean_dep);
+        }
+#endif
 
         /* Diagnostic: check for activation explosion per layer */
         {
@@ -1111,7 +1426,37 @@ static TrainResult trainable_forward_backward(
                        l, max_h, nan_cnt, min_R, max_R);
             }
         }
+
+#ifdef TWO3_DEBUG_EXIT_METRICS
+        if (h_layer_prev && seq_len > 0) {
+            const float *h = hidden + t_exit * D;
+            float dot = 0.f, na = 0.f, nb = 0.f;
+            for (int i = 0; i < D; i++) {
+                float a = h_layer_prev[i];
+                float b = h[i];
+                dot += a * b;
+                na += a * a;
+                nb += b * b;
+            }
+            float cos_sim = dot / (sqrtf(na + 1e-10f) * sqrtf(nb + 1e-10f));
+            float probe_logits[256];
+            byte_logits_cpu(probe_logits, h, tm->model.embed, D);
+            int best_byte;
+            float top_l, second_l, margin_l;
+            byte_probe_top2(probe_logits, &best_byte, &top_l, &second_l, &margin_l);
+            int stable = (l > 0 && prev_probe_pred >= 0 && best_byte == prev_probe_pred) ? 1 : 0;
+            printf("[exit_probe] train step=%d layer=%d t=%d cos=%.6f pred=%d top=%.4f 2nd=%.4f margin=%.4f stable_vs_prev=%d\n",
+                   tm->step, l, t_exit, cos_sim, best_byte, top_l, second_l, margin_l, stable);
+            fflush(stdout);
+            prev_probe_pred = best_byte;
+            memcpy(h_layer_prev, h, (size_t)D * sizeof(float));
+        }
+#endif
     }
+
+#ifdef TWO3_DEBUG_EXIT_METRICS
+    free(h_layer_prev);
+#endif
 
     /* Final gain norm + logits */
     T_START();

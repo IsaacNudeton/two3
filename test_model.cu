@@ -71,7 +71,7 @@ static int test_single_byte(void) {
 
     uint8_t input = 72;  /* 'H' */
     float logits[256];
-    model_forward_sequence_cpu(&m, &input, 1, logits);
+    model_forward_sequence_cpu(&m, &input, 1, logits, MODEL_FWD_FLAGS_DEFAULT);
 
     int nan = has_any_nan(logits, 256);
     float max_l = logits[0], min_l = logits[0];
@@ -115,7 +115,7 @@ static int test_causality(void) {
     /* Sequence A: [65, 66, 67] = "ABC" */
     uint8_t seq_a[3] = {65, 66, 67};
     float logits_a[3 * 256];
-    model_forward_sequence_cpu(&m, seq_a, 3, logits_a);
+    model_forward_sequence_cpu(&m, seq_a, 3, logits_a, MODEL_FWD_FLAGS_DEFAULT);
 
     /* Re-init model with same seed for identical weights */
     model_free(&m);
@@ -125,7 +125,7 @@ static int test_causality(void) {
     /* Sequence B: [65, 90, 67] = "AZC" — different byte at position 1 */
     uint8_t seq_b[3] = {65, 90, 67};
     float logits_b[3 * 256];
-    model_forward_sequence_cpu(&m, seq_b, 3, logits_b);
+    model_forward_sequence_cpu(&m, seq_b, 3, logits_b, MODEL_FWD_FLAGS_DEFAULT);
 
     /* Position 0 logits should be IDENTICAL (same byte, no prior context) */
     float dist_pos0 = vec_l2_dist(logits_a, logits_b, 256);
@@ -166,7 +166,7 @@ static int test_position_sensitivity(void) {
     /* Same byte repeated: [88, 88, 88, 88] = "XXXX" */
     uint8_t seq[4] = {88, 88, 88, 88};
     float logits[4 * 256];
-    model_forward_sequence_cpu(&m, seq, 4, logits);
+    model_forward_sequence_cpu(&m, seq, 4, logits, MODEL_FWD_FLAGS_DEFAULT);
 
     /* Compare logits at different positions */
     float d01 = vec_l2_dist(logits + 0*256, logits + 1*256, 256);
@@ -261,7 +261,7 @@ static int test_stability(void) {
         seq[i] = (uint8_t)(rand() % 256);
 
     float *all_logits = (float*)malloc(seq_len * 256 * sizeof(float));
-    model_forward_sequence_cpu(&m, seq, seq_len, all_logits);
+    model_forward_sequence_cpu(&m, seq, seq_len, all_logits, MODEL_FWD_FLAGS_DEFAULT);
 
     /* Check logits at various positions */
     int nan_count = 0;
@@ -286,6 +286,64 @@ static int test_stability(void) {
     model_free(&m);
     return pass;
 }
+
+#ifdef TWO3_EARLY_EXIT
+static int argmax256(const float *v) {
+    int j = 0;
+    for (int i = 1; i < 256; i++)
+        if (v[i] > v[j]) j = i;
+    return j;
+}
+
+/* Fresh model_init per forward so GainState matches; full depth vs margin+stable early exit. */
+static int test_early_exit_parity(void) {
+    printf("--- Test 7: early exit vs full depth (seq_len=1) ---\n");
+    printf("  compiled TWO3_EXIT_MARGIN_MIN=%.4g (if this looks wrong, force rebuild)\n",
+           (double)TWO3_EXIT_MARGIN_MIN);
+    fflush(stdout);
+    ModelConfig cfg = test_config();
+    cfg.n_layers = 4;
+
+    const int trials = 200;
+    int match = 0;
+    float max_l2 = 0.f;
+    int nan_fail = 0;
+
+    for (int t = 0; t < trials; t++) {
+        unsigned seed = 7000u + (unsigned)t * 7919u;
+        srand(seed);
+        uint8_t b = (uint8_t)(rand() % 256);
+
+        Model mf;
+        model_init(&mf, cfg);
+        float lf[256];
+        model_forward_sequence_cpu(&mf, &b, 1, lf, MODEL_FWD_FORCE_FULL_DEPTH);
+        if (has_any_nan(lf, 256)) nan_fail++;
+        model_free(&mf);
+
+        srand(seed);
+        Model me;
+        model_init(&me, cfg);
+        float le[256];
+        model_forward_sequence_cpu(&me, &b, 1, le, MODEL_FWD_FLAGS_DEFAULT);
+        if (has_any_nan(le, 256)) nan_fail++;
+        model_free(&me);
+
+        float d = vec_l2_dist(lf, le, 256);
+        if (d > max_l2) max_l2 = d;
+        if (argmax256(lf) == argmax256(le)) match++;
+    }
+
+    printf("  trials=%d  layers=%d  argmax_match=%d (%.1f%%)\n",
+           trials, cfg.n_layers, match, 100.0f * (float)match / (float)trials);
+    printf("  max L2 between full and early logits: %.6g\n", max_l2);
+    printf("  NaN in any path: %s\n", nan_fail ? "YES" : "no");
+    printf("  (Argmax mismatch is expected sometimes; pass = no NaN.)\n");
+    int pass = (nan_fail == 0);
+    printf("  result: %s\n\n", pass ? "PASS" : "FAIL");
+    return pass;
+}
+#endif
 
 /* ═══════════════════════════════════════════════════════
  * Test 6: Memory footprint estimate
@@ -352,6 +410,9 @@ int main(void) {
     total++; passed += test_position_sensitivity();
     total++; passed += test_generation();
     total++; passed += test_stability();
+#ifdef TWO3_EARLY_EXIT
+    total++; passed += test_early_exit_parity();
+#endif
     total++; passed += test_memory_footprint();
 
     printf("============================================\n");

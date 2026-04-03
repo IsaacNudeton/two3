@@ -364,11 +364,132 @@ static __global__ void kernel_compute_absmean(
  * in two3.h/two3.cu this session. Not duplicated here. */
 
 /*
+ * Compute L1 sum (sum of absolute values) for initial scale.
+ * Each thread processes multiple elements, accumulates locally.
+ */
+static __global__ void kernel_compute_l1_sum(
+    const float* __restrict__ data,  /* [rows, cols] */
+    float* __restrict__ scratch,     /* [1] device: sum */
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < n; i += stride) {
+        local_sum += fabsf(data[i]);
+    }
+
+    /* Block-level reduce */
+    __shared__ float s_sum[256];
+    s_sum[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        atomicAdd(scratch, s_sum[0]);
+    }
+}
+
+/*
+ * Compute active-weight sum and count for scale refinement.
+ * Active = |w| > threshold * scale.
+ * Each thread processes multiple elements, accumulates locally.
+ */
+static __global__ void kernel_compute_active_scale(
+    const float* __restrict__ data,  /* [rows, cols] */
+    float* __restrict__ scratch,     /* [2] device: [0]=sum, [1]=count */
+    int n,
+    float ref_scale,
+    float threshold
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    float local_sum = 0.0f;
+    int local_cnt = 0;
+
+    for (int i = tid; i < n; i += stride) {
+        float abs_w = fabsf(data[i]);
+        if (abs_w > threshold * ref_scale) {
+            local_sum += abs_w;
+            local_cnt++;
+        }
+    }
+
+    /* Block-level reduce */
+    __shared__ float s_sum[256];
+    __shared__ int s_cnt[256];
+    s_sum[threadIdx.x] = local_sum;
+    s_cnt[threadIdx.x] = local_cnt;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + s];
+            s_cnt[threadIdx.x] += s_cnt[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        atomicAdd(scratch, s_sum[0]);
+        atomicAdd(scratch + 1, (float)s_cnt[0]);
+    }
+}
+
+/*
+ * Hadamard transform kernel — applies FWT to each row.
+ * Each thread handles one row. Uses iterative Cooley-Tukey pattern.
+ * Normalized: output scaled by 1/sqrt(cols).
+ */
+static __global__ void kernel_hadamard_rows(
+    float* __restrict__ data,  /* [rows, cols] row-major, transformed in-place */
+    int rows, int cols
+) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+
+    float* row = data + r * cols;
+
+    /* Iterative fast Walsh-Hadamard transform */
+    for (int len = 1; len < cols; len <<= 1) {
+        for (int i = 0; i < cols; i += len << 1) {
+            for (int j = 0; j < len; j++) {
+                float u = row[i + j];
+                float v = row[i + j + len];
+                row[i + j]       = u + v;
+                row[i + j + len] = u - v;
+            }
+        }
+    }
+
+    /* Normalize by 1/sqrt(cols) */
+    float scale = 1.0f / sqrtf((float)cols);
+    for (int i = 0; i < cols; i++)
+        row[i] *= scale;
+}
+
+/*
  * Fused requantize on GPU — no host round-trip, no printf.
  *
  * Uses Two3BackwardCtx.d_W_latent as scratch for latent upload.
  * Writes directly to existing Two3Weights.packed buffer on device.
- * Uses Two3BackwardCtx.d_dY[0] as scratch for absmean reduction.
+ * Uses Two3BackwardCtx.d_dY[0..1] as scratch for scale computation.
+ *
+ * Hadamard pre-quantization: applies fast Walsh-Hadamard transform
+ * to each row before quantization. Reduces quantization error by
+ * spreading outlier energy uniformly across dimensions.
+ *
+ * Lloyd-Max scale refinement: 3-pass iterative refinement where
+ * scale = mean of only active weights (|w| > threshold * scale).
+ * Prevents outliers from stretching the quantization grid.
  *
  * Replaces old trainable_requantize() which called two3_pack_weights()
  * (112 malloc/free + 112 printf per optimizer step).
@@ -386,6 +507,15 @@ static void requantize_gpu(
     /* Upload latent to device (reuse backward ctx buffer) */
     cudaMemcpy(ctx->d_W_latent, latent_host,
                total * sizeof(float), cudaMemcpyHostToDevice);
+
+    /* Hadamard pre-quantization: transform each row on GPU.
+     * Each thread handles one row. */
+    {
+        int hadamard_threads = 256;
+        int hadamard_blocks = (rows + hadamard_threads - 1) / hadamard_threads;
+        kernel_hadamard_rows<<<hadamard_blocks, hadamard_threads>>>(
+            ctx->d_W_latent, rows, cols);
+    }
 
     /* Compute absmean scale — only over values that survive quantization.
      * scale = nonzero_count / total (fraction of active weights).

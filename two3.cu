@@ -385,6 +385,7 @@ Two3Weights two3_pack_weights(const float* w_float, int rows, int cols) {
         }
     }
 
+    /* Copy to device */
     printf("[two3] weights %dx%d → packed %dx%d (%d bytes)\n",
            rows, cols, rows, packed_cols, packed_total);
     printf("[two3] substrate: %.1f%%  entity A(+1): %.1f%%  entity B(-1): %.1f%%\n",
@@ -393,7 +394,6 @@ Two3Weights two3_pack_weights(const float* w_float, int rows, int cols) {
            100.0f * count_minus / total);
     printf("[two3] weight scale (absmean): %.6f\n", result.scale);
 
-    /* Copy to device */
     CUDA_CHECK(cudaMalloc(&result.packed, packed_total));
     CUDA_CHECK(cudaMemcpy(result.packed, packed_host, packed_total,
                            cudaMemcpyHostToDevice));
@@ -877,3 +877,174 @@ void two3_print_stats(const Two3Weights* w) {
 
     free(host_packed);
 }
+
+/* ═══════════════════════════════════════════════════════
+ * Muon optimizer GPU — Newton-Schulz with cuBLAS
+ *
+ * Requires TWO3_MUON_GPU defined and cublas linked.
+ * All matrices are row-major. cuBLAS is column-major, so
+ * we use CUBLAS_OP_T to transpose on the fly.
+ * ═══════════════════════════════════════════════════════ */
+
+#ifdef TWO3_MUON_GPU
+
+#include <cublas_v2.h>
+
+/* XtX[i,j] = sum_k G[k,i]*G[k,j]  (G row-major rows×cols) — same as CPU newton_schulz.
+ * cuBLAS G^T@G with lda=cols fails when rows>cols (requires lda>=rows for OP_T). */
+__global__ void muon_compute_XtX_kernel(const float *__restrict__ G,
+                                        float *__restrict__ XtX,
+                                        int rows, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= cols || j >= cols) return;
+    float s = 0.f;
+    for (int k = 0; k < rows; k++)
+        s += G[k * cols + i] * G[k * cols + j];
+    XtX[i * cols + j] = s;
+}
+
+/* Newton-Schulz: 5 iterations of polynomial orthogonalization.
+ * G: [rows × cols] device memory, modified in-place.
+ * Buffers from ctx: d_muon_XtX [cols×cols], d_muon_XXtX [rows×cols],
+ *                   d_muon_XXtXXtX [rows×cols].
+ *
+ * Polynomial: X ← a·X + b·X@XtX + c·X@XtX@XtX
+ * Coefficients from Muon paper: a=3.4445, b=-4.7750, c=2.0315
+ */
+void two3_newton_schulz_gpu(Two3BackwardCtx* ctx, float *d_G, int rows, int cols) {
+    cublasHandle_t handle = (cublasHandle_t)ctx->cublas_handle;
+    float *d_XtX = ctx->d_muon_XtX;      /* [cols × cols] */
+    float *d_XXtX = ctx->d_muon_XXtX;    /* [rows × cols] */
+    float *d_XXtXXtX = ctx->d_muon_XXtXXtX; /* [rows × cols] */
+
+    const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
+    const float alpha = 1.0f, beta = 0.0f;
+
+    /* Normalize G by Frobenius norm */
+    float norm = 0.0f;
+    cublasSnrm2(handle, rows * cols, d_G, 1, &norm);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    norm = fmaxf(norm, 1e-30f);
+    float inv_norm = 1.0f / norm;
+    cublasSscal(handle, rows * cols, &inv_norm, d_G, 1);
+
+    /* Row-major C[m×n] = A[m×k] @ B[k×n]: cublasSgemm(N,N, n,m,k, α, B,n, A,k, β, C,n). */
+    dim3 xtx_block(16, 16);
+    dim3 xtx_grid((cols + 15) / 16, (cols + 15) / 16);
+
+    for (int iter = 0; iter < 5; iter++) {
+        /* Step 1: XtX ← G^T @ G  [cols × cols], row-major XtX */
+        muon_compute_XtX_kernel<<<xtx_grid, xtx_block>>>(d_G, d_XtX, rows, cols);
+        CUDA_CHECK(cudaGetLastError());
+
+        /* Step 2: XXtX ← G @ XtX  [rows × cols] */
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    cols, rows, cols,
+                    &alpha,
+                    d_XtX, cols,
+                    d_G, cols,
+                    &beta,
+                    d_XXtX, cols);
+
+        /* Step 3: XXtXXtX ← XXtX @ XtX  [rows × cols] */
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    cols, rows, cols,
+                    &alpha,
+                    d_XtX, cols,
+                    d_XXtX, cols,
+                    &beta,
+                    d_XXtXXtX, cols);
+
+        /* Step 4: G ← a·G + b·XXtX + c·XXtXXtX */
+        float b_scalar = b, c_scalar = c;
+        cublasSscal(handle, rows * cols, &a, d_G, 1);
+        cublasSaxpy(handle, rows * cols, &b_scalar, d_XXtX, 1, d_G, 1);
+        cublasSaxpy(handle, rows * cols, &c_scalar, d_XXtXXtX, 1, d_G, 1);
+    }
+}
+
+/* Muon update on GPU:
+ * 1. momentum ← β·momentum + grads
+ * 2. Newton-Schulz orthogonalize momentum
+ * 3. params ← params - lr·(momentum + wd·params)
+ *
+ * All buffers on device. d_G output contains orthogonalized momentum.
+ */
+void two3_muon_update_gpu(Two3BackwardCtx* ctx,
+                          float *d_params, const float *d_grads,
+                          int rows, int cols,
+                          float lr, float momentum_beta, float weight_decay) {
+    cublasHandle_t handle = (cublasHandle_t)ctx->cublas_handle;
+    float *d_mom = ctx->d_muon_momentum;
+    int size = rows * cols;
+
+    /* Step 1: momentum ← β·momentum + grads
+     * mom ← β·mom (scal), then mom ← mom + grads (axpy) */
+    cublasSscal(handle, size, &momentum_beta, d_mom, 1);
+    float alpha = 1.0f;
+    cublasSaxpy(handle, size, &alpha, d_grads, 1, d_mom, 1);
+
+    /* Step 2: Orthogonalize momentum in-place */
+    two3_newton_schulz_gpu(ctx, d_mom, rows, cols);
+
+    /* Step 3: params ← params - lr·(momentum + wd·params)
+     * = params - lr·momentum - lr·wd·params
+     * = (1 - lr·wd)·params - lr·momentum
+     *
+     * Compute scale = 1 - lr·wd, then params ← scale·params - lr·momentum */
+    float scale = 1.0f - lr * weight_decay;
+    float neg_lr = -lr;
+
+    /* params ← scale·params */
+    cublasSscal(handle, size, &scale, d_params, 1);
+    /* params ← params - lr·momentum */
+    cublasSaxpy(handle, size, &neg_lr, d_mom, 1, d_params, 1);
+}
+
+/* Initialize Muon GPU buffers.
+ * Call after two3_backward_ctx_init. */
+void two3_muon_gpu_init(Two3BackwardCtx* ctx, int max_M, int max_K) {
+    /* Create cuBLAS handle */
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    ctx->cublas_handle = (void*)handle;
+    cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
+
+    ctx->muon_max_M = max_M;
+    ctx->muon_max_K = max_K;
+
+    size_t momentum_size = (size_t)max_M * max_K * sizeof(float);
+    size_t XtX_size = (size_t)max_K * max_K * sizeof(float);
+
+    /* Allocate buffers */
+    CUDA_CHECK(cudaMalloc(&ctx->d_muon_momentum, momentum_size));
+    CUDA_CHECK(cudaMalloc(&ctx->d_muon_XtX, XtX_size));
+    CUDA_CHECK(cudaMalloc(&ctx->d_muon_XXtX, momentum_size));
+    CUDA_CHECK(cudaMalloc(&ctx->d_muon_XXtXXtX, momentum_size));
+
+    /* Zero momentum */
+    CUDA_CHECK(cudaMemset(ctx->d_muon_momentum, 0, momentum_size));
+}
+
+/* Free Muon GPU buffers.
+ * Call before two3_backward_ctx_free. */
+void two3_muon_gpu_free(Two3BackwardCtx* ctx) {
+    if (ctx->d_muon_momentum) cudaFree(ctx->d_muon_momentum);
+    if (ctx->d_muon_XtX)      cudaFree(ctx->d_muon_XtX);
+    if (ctx->d_muon_XXtX)     cudaFree(ctx->d_muon_XXtX);
+    if (ctx->d_muon_XXtXXtX)  cudaFree(ctx->d_muon_XXtXXtX);
+
+    if (ctx->cublas_handle) {
+        cublasHandle_t handle = (cublasHandle_t)ctx->cublas_handle;
+        cublasDestroy(handle);
+    }
+
+    ctx->cublas_handle = NULL;
+    ctx->d_muon_momentum = NULL;
+    ctx->d_muon_XtX = NULL;
+    ctx->d_muon_XXtX = NULL;
+    ctx->d_muon_XXtXXtX = NULL;
+}
+
+#endif /* TWO3_MUON_GPU */

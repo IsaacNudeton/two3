@@ -36,6 +36,17 @@
 
 #define BYTE_VOCAB 256  /* raw bytes, not tokens */
 
+/* Inference early exit (model_forward_sequence_cpu): pseudo-logit margin gate.
+ * Default 10: random init still hits margin≥4 often (Test 7 L2 huge); 10 makes exit
+ * rare until weights are confident — tune per checkpoint with -DTWO3_EXIT_MARGIN_MIN=… */
+#ifndef TWO3_EXIT_MARGIN_MIN
+#define TWO3_EXIT_MARGIN_MIN (10.0f)
+#endif
+
+/* model_forward_sequence_cpu(..., forward_flags) — last parameter */
+#define MODEL_FWD_FLAGS_DEFAULT     0
+#define MODEL_FWD_FORCE_FULL_DEPTH  1  /* ignore TWO3_EARLY_EXIT (calibration / parity) */
+
 typedef struct {
     int dim;            /* hidden dimension (1024) */
     int n_heads;        /* query heads (8) */
@@ -118,6 +129,32 @@ static void byte_logits_cpu(float *logits, const float *hidden, const float *emb
     }
 }
 
+/* Argmax, runner-up, margin (top − second) on 256-way logits — for exit-probe diagnostics. */
+static void byte_probe_top2(
+    const float *logits256,
+    int *out_best,
+    float *out_top,
+    float *out_second,
+    float *out_margin
+) {
+    int best = 0;
+    for (int b = 1; b < 256; b++)
+        if (logits256[b] > logits256[best]) best = b;
+    int second = (best == 0) ? 1 : 0;
+    float s = logits256[second];
+    for (int b = 0; b < 256; b++) {
+        if (b == best) continue;
+        if (logits256[b] > s) {
+            s = logits256[b];
+            second = b;
+        }
+    }
+    *out_best = best;
+    *out_top = logits256[best];
+    *out_second = s;
+    *out_margin = logits256[best] - s;
+}
+
 #ifdef __CUDACC__
 
 __global__ void kernel_byte_embed(
@@ -175,7 +212,9 @@ static int byte_sample(float *logits, float temperature) {
 
 /* Batched ternary projection: S vectors in one GPU round-trip.
  * input:  [S, dim_in] contiguous row-major
- * output: [S, dim_out] contiguous row-major */
+ * output: [S, dim_out] contiguous row-major
+ *
+ */
 static void ternary_project_batch_cpu(
     const Two3Weights *W,
     const float *input,     /* [S, dim_in] */
@@ -469,14 +508,21 @@ static void model_free(Model *m) {
  *
  * For each layer, we store K and V for all positions
  * so attention can look backwards.
+ *
+ * forward_flags: MODEL_FWD_FLAGS_DEFAULT, or MODEL_FWD_FORCE_FULL_DEPTH
+ * (disables TWO3_EARLY_EXIT for parity / calibration).
  * ═══════════════════════════════════════════════════════ */
 
 static void model_forward_sequence_cpu(
     Model *m,
     const uint8_t *bytes_in,   /* [seq_len] input bytes */
     int seq_len,
-    float *all_logits          /* [seq_len × 256] output logits */
+    float *all_logits,         /* [seq_len × 256] output logits */
+    int forward_flags          /* MODEL_FWD_* */
 ) {
+#ifndef TWO3_EARLY_EXIT
+    (void)forward_flags;
+#endif
     int D = m->cfg.dim;
     int KV = m->cfg.n_kv_heads * m->cfg.head_dim;
     int HD = m->cfg.head_dim;
@@ -501,6 +547,23 @@ static void model_forward_sequence_cpu(
     float *normed_one = (float*)malloc(D * sizeof(float));
 
     float res_scale = 1.0f / sqrtf(2.0f * (float)m->cfg.n_layers);
+
+    /* Per-layer exit probe: same token t across consecutive layer outputs.
+     * hidden is [seq_len × D], not [n_layers × D]. */
+#if defined(TWO3_EARLY_EXIT) || defined(TWO3_DEBUG_EXIT_METRICS)
+    const int t_exit = (seq_len > 0) ? (seq_len - 1) : 0;
+    float *h_layer_prev = NULL;
+    if (seq_len > 0) {
+        h_layer_prev = (float*)malloc((size_t)D * sizeof(float));
+        memcpy(h_layer_prev, hidden + t_exit * D, (size_t)D * sizeof(float));
+    }
+#endif
+#ifdef TWO3_EARLY_EXIT
+    int layers_early_stop = 0;
+#endif
+#if defined(TWO3_EARLY_EXIT) || defined(TWO3_DEBUG_EXIT_METRICS)
+    int prev_probe_pred = -1;
+#endif
 
     for (int l = 0; l < m->cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];
@@ -618,7 +681,58 @@ static void model_forward_sequence_cpu(
             free(h_exp); free(down_b); free(moe_result);
         }
         free(all_sel);
+
+        /* ═══════════════════════════════════════════════════════
+         * TWO3_DEBUG_EXIT_METRICS: log cos, pseudo pred, margin, stable_vs_prev.
+         * Pseudo = embed·h (no gain_final) — calibrate vs true logits separately.
+         *
+         * TWO3_EARLY_EXIT: seq_len==1 only; after layer l>=1 exit if pseudo-argmax
+         * matches previous layer AND margin >= TWO3_EXIT_MARGIN_MIN (default 10.0f).
+         * Never break when seq_len>1. Training: do not define TWO3_EARLY_EXIT.
+         * ═══════════════════════════════════════════════════════ */
+#if defined(TWO3_EARLY_EXIT) || defined(TWO3_DEBUG_EXIT_METRICS)
+        if (h_layer_prev && seq_len > 0) {
+            const float *h = hidden + t_exit * D;
+            float dot = 0.f, na = 0.f, nb = 0.f;
+            for (int i = 0; i < D; i++) {
+                float a = h_layer_prev[i];
+                float b = h[i];
+                dot += a * b;
+                na += a * a;
+                nb += b * b;
+            }
+            float cos_sim = dot / (sqrtf(na + 1e-10f) * sqrtf(nb + 1e-10f));
+
+            float probe_logits[256];
+            byte_logits_cpu(probe_logits, h, m->embed, D);
+            int best_byte;
+            float top_l, second_l, margin_l;
+            byte_probe_top2(probe_logits, &best_byte, &top_l, &second_l, &margin_l);
+            int stable = (l > 0 && prev_probe_pred >= 0 && best_byte == prev_probe_pred) ? 1 : 0;
+
+#ifdef TWO3_DEBUG_EXIT_METRICS
+            printf("[exit_probe] layer=%d t=%d cos=%.6f pred=%d top=%.4f 2nd=%.4f margin=%.4f stable_vs_prev=%d\n",
+                   l, t_exit, cos_sim, best_byte, top_l, second_l, margin_l, stable);
+            fflush(stdout);
+#endif
+#ifdef TWO3_EARLY_EXIT
+            if (seq_len == 1 && l >= 1 && stable && margin_l >= TWO3_EXIT_MARGIN_MIN
+                && !(forward_flags & MODEL_FWD_FORCE_FULL_DEPTH))
+                layers_early_stop = 1;
+#endif
+            prev_probe_pred = best_byte;
+            memcpy(h_layer_prev, h, (size_t)D * sizeof(float));
+        }
+#endif
+#ifdef TWO3_EARLY_EXIT
+        if (layers_early_stop)
+            break;
+#endif
     }
+
+#if defined(TWO3_EARLY_EXIT) || defined(TWO3_DEBUG_EXIT_METRICS)
+    free(h_layer_prev);
+#endif
 
     /* Final gain norm + logits for each position */
     for (int t = 0; t < seq_len; t++) {
@@ -650,6 +764,182 @@ typedef struct {
     int      capacity;  /* allocated capacity */
 } GenerationContext;
 
+/* ═══════════════════════════════════════════════════════
+ * KV Cache — device-resident, enables O(T·D) generation
+ *
+ * K,V at position t are deterministic and immutable after
+ * computation. Caching them reduces generation from O(T²·D)
+ * to O(T·D). Memory: ~192 MB for 12 layers, 4096 seq, 512 kv_dim.
+ * ═══════════════════════════════════════════════════════ */
+
+typedef struct {
+    float *K;       /* [n_layers × max_seq × kv_dim] device memory */
+    float *V;       /* [n_layers × max_seq × kv_dim] device memory */
+    int    len;     /* current cached length */
+    int    max_seq;
+    int    kv_dim;
+    int    n_layers;
+} KVCache;
+
+static void kv_cache_init(KVCache *kv, int n_layers, int max_seq, int kv_dim) {
+    kv->n_layers = n_layers;
+    kv->max_seq = max_seq;
+    kv->kv_dim = kv_dim;
+    kv->len = 0;
+    size_t total = (size_t)n_layers * max_seq * kv_dim * sizeof(float);
+    cudaMalloc(&kv->K, total);
+    cudaMalloc(&kv->V, total);
+    cudaMemset(kv->K, 0, total);
+    cudaMemset(kv->V, 0, total);
+}
+
+static void kv_cache_free(KVCache *kv) {
+    cudaFree(kv->K);
+    cudaFree(kv->V);
+    kv->K = kv->V = NULL;
+}
+
+static float* kv_K_at(KVCache *kv, int l, int t) {
+    return kv->K + ((size_t)l * kv->max_seq + t) * kv->kv_dim;
+}
+
+static float* kv_V_at(KVCache *kv, int l, int t) {
+    return kv->V + ((size_t)l * kv->max_seq + t) * kv->kv_dim;
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Cached forward — single-step generation with KV cache
+ *
+ * Uses cached K,V from previous positions. O(T·D) per step
+ * instead of O(T²·D). Call kv_cache_init before generation,
+ * kv_cache_free when done.
+ * ═══════════════════════════════════════════════════════ */
+
+static void model_forward_cached(
+    Model *m,
+    KVCache *kv,
+    uint8_t byte_in,
+    float *logits          /* [256] output logits */
+) {
+    int D = m->cfg.dim;
+    int KV = m->cfg.n_kv_heads * m->cfg.head_dim;
+    int HD = m->cfg.head_dim;
+    int NH = m->cfg.n_heads;
+    int NKV = m->cfg.n_kv_heads;
+    int pos = kv->len;
+
+    float *hidden = (float*)malloc(D * sizeof(float));
+    float *normed = (float*)malloc(D * sizeof(float));
+    float *q = (float*)malloc(D * sizeof(float));
+    float *k_new = (float*)malloc(KV * sizeof(float));
+    float *v_new = (float*)malloc(KV * sizeof(float));
+    float *attn_out = (float*)malloc(D * sizeof(float));
+    float *o_proj = (float*)malloc(D * sizeof(float));
+    float *moe_out = (float*)calloc(D, sizeof(float));
+
+    /* Embed single byte */
+    byte_embed_cpu(hidden, m->embed, byte_in, D);
+
+    float res_scale = 1.0f / sqrtf(2.0f * (float)m->cfg.n_layers);
+
+    for (int l = 0; l < m->cfg.n_layers; l++) {
+        ModelLayer *ly = &m->layers[l];
+
+        /* Gain norm */
+        gain_forward_cpu(normed, hidden, ly->gain_attn.R, ly->gain_attn.C, D);
+
+        /* Q/K/V projections — single position */
+        ternary_project_cpu(&ly->W_q, normed, q, D);
+        ternary_project_cpu(&ly->W_k, normed, k_new, D);
+        ternary_project_cpu(&ly->W_v, normed, v_new, D);
+
+        /* Store K,V into cache (device-resident) */
+        cudaMemcpy(kv_K_at(kv, l, pos), k_new, KV * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(kv_V_at(kv, l, pos), v_new, KV * sizeof(float), cudaMemcpyHostToDevice);
+
+        /* RoPE for current position */
+        rope_apply_cpu(q, k_new, &m->rope, pos, NH, NKV);
+
+        /* Attention: Q[pos] against K[0..pos], V[0..pos] from cache */
+        /* Need to copy cached K,V back to host for attention */
+        float *k_cached = (float*)malloc((pos + 1) * KV * sizeof(float));
+        float *v_cached = (float*)malloc((pos + 1) * KV * sizeof(float));
+        for (int t = 0; t <= pos; t++) {
+            cudaMemcpy(k_cached + t * KV, kv_K_at(kv, l, t), KV * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(v_cached + t * KV, kv_V_at(kv, l, t), KV * sizeof(float), cudaMemcpyDeviceToHost);
+        }
+        causal_attention_cpu(q, k_cached, v_cached, attn_out, pos + 1, NH, NKV, HD);
+        free(k_cached);
+        free(v_cached);
+
+        /* O projection */
+        ternary_project_cpu(&ly->W_o, attn_out, o_proj, D);
+
+        /* Residual */
+        float s = res_scale / sqrtf((float)D);
+        for (int i = 0; i < D; i++)
+            hidden[i] += s * o_proj[i];
+
+        /* FFN block (MoE) */
+        gain_forward_cpu(normed, hidden, ly->gain_ffn.R, ly->gain_ffn.C, D);
+        MoESelection sel;
+        moe_route(&ly->moe.router, normed, &sel);
+
+        /* Process top-K experts */
+        float *expert_out = (float*)calloc(D, sizeof(float));
+        for (int k = 0; k < MOE_TOP_K; k++) {
+            int e = sel.expert_ids[k];
+            float *gate_h = (float*)malloc(m->cfg.intermediate * sizeof(float));
+            float *up_h = (float*)malloc(m->cfg.intermediate * sizeof(float));
+            float *h = (float*)malloc(m->cfg.intermediate * sizeof(float));
+
+            ternary_project_cpu(&ly->moe.experts[e].gate, normed, gate_h, D);
+            ternary_project_cpu(&ly->moe.experts[e].up, normed, up_h, D);
+
+            float scale = 1.0f / sqrtf((float)D);
+            for (int i = 0; i < m->cfg.intermediate; i++) {
+                gate_h[i] *= scale;
+                up_h[i] *= scale;
+            }
+
+            /* Squared ReLU */
+            for (int i = 0; i < m->cfg.intermediate; i++) {
+                float g = gate_h[i];
+                gate_h[i] = (g > 0.0f) ? g * g : 0.0f;
+            }
+
+            /* Hadamard product */
+            for (int i = 0; i < m->cfg.intermediate; i++)
+                h[i] = gate_h[i] * up_h[i];
+
+            /* Down projection */
+            float *down_out = (float*)malloc(D * sizeof(float));
+            ternary_project_cpu(&ly->moe.experts[e].down, h, down_out, m->cfg.intermediate);
+
+            /* Weighted combine */
+            float w = sel.expert_weights[k];
+            for (int i = 0; i < D; i++)
+                expert_out[i] += w * down_out[i];
+
+            free(gate_h); free(up_h); free(h); free(down_out);
+        }
+
+        /* Residual add */
+        for (int i = 0; i < D; i++)
+            hidden[i] += res_scale * expert_out[i];
+        free(expert_out);
+    }
+
+    /* Final norm + logits */
+    gain_forward_cpu(normed, hidden, m->gain_final.R, m->gain_final.C, D);
+    byte_logits_cpu(logits, normed, m->embed, D);
+
+    kv->len++;
+
+    free(hidden); free(normed); free(q); free(k_new); free(v_new);
+    free(attn_out); free(o_proj); free(moe_out);
+}
+
 static void gen_ctx_init(GenerationContext *ctx, int max_seq) {
     ctx->bytes = (uint8_t*)malloc(max_seq);
     ctx->len = 0;
@@ -675,7 +965,7 @@ static void model_generate_cpu(
     float *logits       /* [256] output logits for next byte */
 ) {
     float *all_logits = (float*)malloc(ctx->len * 256 * sizeof(float));
-    model_forward_sequence_cpu(m, ctx->bytes, ctx->len, all_logits);
+    model_forward_sequence_cpu(m, ctx->bytes, ctx->len, all_logits, MODEL_FWD_FLAGS_DEFAULT);
 
     /* Copy logits for the last position */
     memcpy(logits, all_logits + (ctx->len - 1) * 256, 256 * sizeof(float));
@@ -702,7 +992,7 @@ static void model_forward_cpu(
      * For real generation, use GenerationContext. */
     uint8_t b = (uint8_t)byte_in;
     float all_logits[256];
-    model_forward_sequence_cpu(m, &b, 1, all_logits);
+    model_forward_sequence_cpu(m, &b, 1, all_logits, MODEL_FWD_FLAGS_DEFAULT);
     memcpy(logits, all_logits, 256 * sizeof(float));
 
     /* Also write hidden for backward compat (grab from embed) */

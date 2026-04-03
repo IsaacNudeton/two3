@@ -23,15 +23,24 @@
 #define MOE_NUM_EXPERTS  8
 #define MOE_TOP_K        2
 
+/* Reservoir routing hyperparameters (CFL-stable) */
+#define MOE_ROUTE_ALPHA  0.1f    /* routing coupling */
+#define MOE_ROUTE_BETA   0.01f   /* routing loss */
+#define MOE_ROUTE_GAMMA  0.05f   /* recharge rate */
+#define MOE_ROUTE_KAPPA  0.1f    /* depletion rate (= α_r) */
+
 /* ═══════════════════════════════════════════════════════
  * Router — float weights, softmax selection
  *
  * router_logits = x @ W_router  (float matmul, tiny: dim × 8)
  * top_k = argmax(softmax(logits), k=2)
+ * Reservoir R_expert provides dynamic load balancing bonus
  * ═══════════════════════════════════════════════════════ */
 
 typedef struct {
     float *W;           /* [dim × n_experts] — float, not ternary */
+    float *R_expert;    /* [n_experts] routing reservoir */
+    float  C_r;         /* routing capacity (uniform) */
     int    dim;
     int    n_experts;
 } MoERouter;
@@ -70,12 +79,14 @@ static void moe_route(
     int D = router->dim;
     int N = router->n_experts;
 
-    /* Compute logits: x @ W_router */
+    /* Compute logits: x @ W_router + reservoir bonus */
     float logits[MOE_NUM_EXPERTS];
     for (int e = 0; e < N; e++) {
         float sum = 0;
         for (int d = 0; d < D; d++)
             sum += x[d] * router->W[d * N + e];
+        /* Reservoir routing bonus */
+        sum += MOE_ROUTE_ALPHA * router->R_expert[e];
         logits[e] = sum;
     }
 
@@ -140,15 +151,43 @@ static void moe_route(
 static void moe_router_init(MoERouter *r, int dim, int n_experts) {
     r->dim = dim;
     r->n_experts = n_experts;
+    r->C_r = 1.0f;
     r->W = (float*)malloc(dim * n_experts * sizeof(float));
-    /* Xavier init */
+    r->R_expert = (float*)malloc(n_experts * sizeof(float));
+    /* Xavier init for router weights */
     float scale = 1.0f / sqrtf((float)dim);
     for (int i = 0; i < dim * n_experts; i++)
         r->W[i] = scale * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+    /* Init reservoirs full */
+    for (int i = 0; i < n_experts; i++)
+        r->R_expert[i] = 1.0f;
 }
 
 static void moe_router_free(MoERouter *r) {
     free(r->W); r->W = NULL;
+    free(r->R_expert); r->R_expert = NULL;
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Reservoir update — call after each batch
+ *
+ * R_e' = R_e + γ(C - R_e) - κ · R_e · f_e
+ * where f_e = fraction of tokens routed to expert e
+ * ═══════════════════════════════════════════════════════ */
+
+static void moe_update_reservoir(
+    MoERouter *router,
+    const int *expert_counts,  /* [n_experts] tokens per expert this batch */
+    int total_tokens
+) {
+    for (int e = 0; e < router->n_experts; e++) {
+        float f_e = (float)expert_counts[e] / (float)total_tokens;
+        float R = router->R_expert[e];
+        float C = router->C_r;
+        float R_new = R + MOE_ROUTE_GAMMA * (C - R) - MOE_ROUTE_KAPPA * R * f_e;
+        if (R_new < 0.01f) R_new = 0.01f;  /* floor */
+        router->R_expert[e] = R_new;
+    }
 }
 
 #ifdef __CUDACC__

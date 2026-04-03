@@ -53,7 +53,11 @@ static TrainConfig default_config(void) {
     c.use_medium = 0;
     c.use_large = 0;
     c.seq_len = 128;
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
+    c.lr = 1e-3f;       /* Muon + Newton–Schulz: more conservative than SGD 3e-3 */
+#else
     c.lr = 3e-3f;
+#endif
     c.epochs = 1;
     c.batch_size = 8;
     c.ckpt_every = 100;
@@ -175,12 +179,21 @@ int main(int argc, char **argv) {
         printf("Options:\n");
         printf("  --medium           Use medium model (dim=128, 4 layers)\n");
         printf("  --large            Use large model (dim=256, 8 layers)\n");
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
+        printf("  --lr <float>      Learning rate (default: 1e-3 for Muon builds)\n");
+#else
         printf("  --lr <float>      Learning rate (default: 3e-3)\n");
+#endif
         printf("  --epochs <int>    Number of epochs (default: 1)\n");
-        printf("  --seq-len <int>   Sequence length in bytes (default: 128)\n");
+        printf("  --seq-len <int>   Sequence length in bytes (default: 128, min 2)\n");
         printf("  --resume <path>   Resume from checkpoint\n");
         printf("  --ckpt-every <N>  Checkpoint every N steps (default: 100)\n");
         printf("  --log-every <N>   Log every N steps (default: 10)\n");
+        return 1;
+    }
+
+    if (cfg.seq_len < 2) {
+        printf("seq_len must be >= 2 (input + next-byte target). Got %d.\n", cfg.seq_len);
         return 1;
     }
 
@@ -214,6 +227,9 @@ int main(int argc, char **argv) {
     printf("  MoE: %d experts, top-%d\n", MOE_NUM_EXPERTS, MOE_TOP_K);
     printf("  Seq len: %d bytes\n", cfg.seq_len);
     printf("  LR: %.4f\n", cfg.lr);
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
+    printf("  (Muon: tighter grad clip in train.h; use --lr 5e-4 or lower if max_h explodes)\n");
+#endif
     printf("  Epochs: %d\n", cfg.epochs);
     printf("  Batch size: %d\n", cfg.batch_size);
     printf("  Chunks per epoch: %d\n", ds.n_chunks);
@@ -254,6 +270,16 @@ int main(int argc, char **argv) {
      * ═══════════════════════════════════════════════════════ */
 
     printf("  Training...\n\n");
+    
+#ifdef TWO3_DEBUG_MOE
+    printf("  [DEBUG] TWO3_DEBUG_MOE is DEFINED\n");
+#else
+    printf("  [DEBUG] TWO3_DEBUG_MOE is NOT defined\n");
+#endif
+#ifdef TWO3_DEBUG_EXIT_METRICS
+    printf("  [DEBUG] TWO3_DEBUG_EXIT_METRICS is DEFINED (per-layer [exit_probe] in train forward)\n");
+#endif
+
     clock_t t_start = clock();
     int global_step = tm.step;
 
@@ -288,6 +314,7 @@ int main(int argc, char **argv) {
             trainable_optimizer_step(&tm);
 
             global_step++;
+            
             TrainResult r;
             r.loss = batch_loss / actual_batch;
             r.correct = batch_correct;
@@ -357,6 +384,13 @@ int main(int argc, char **argv) {
     /* Save final model */
     trainable_save(&tm, "final.t2l4");
     printf("  Saved: final.t2l4\n");
+
+#if defined(TWO3_DEBUG_EXIT_METRICS)
+    printf("\n  (TWO3_DEBUG_EXIT_METRICS: [exit_probe] in train forward; inference uses model.h)\n");
+#endif
+#ifdef TWO3_EARLY_EXIT
+    printf("  (TWO3_EARLY_EXIT: margin+stable early exit in model_forward_sequence_cpu, seq_len==1 only)\n");
+#endif
 
     printf("\n============================================\n");
     printf("  Training complete.\n");

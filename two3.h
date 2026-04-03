@@ -146,6 +146,21 @@ typedef struct {
     int    attn_D;
     int    attn_KV;
     int    attn_n_heads;
+
+    /* ═══════════════════════════════════════════════════════
+     * Muon optimizer GPU buffers (optional, for TWO3_MUON_GPU)
+     * Persistent device buffers for Newton-Schulz orthogonalization.
+     * XtX is K×K, X·(…) buffers are M×K.
+     * ═══════════════════════════════════════════════════════ */
+#ifdef TWO3_MUON_GPU
+    void   *cublas_handle;    /* cublasHandle_t — opaque, void* for header compat */
+    float  *d_muon_momentum;  /* [max_M * max_K] device — momentum buffer */
+    float  *d_muon_XtX;       /* [max_K * max_K] device — X^T @ X result */
+    float  *d_muon_XXtX;      /* [max_M * max_K] device — X @ XtX intermediate */
+    float  *d_muon_XXtXXtX;   /* [max_M * max_K] device — X @ XtX @ XtX result */
+    int    muon_max_M;
+    int    muon_max_K;
+#endif
 } Two3BackwardCtx;
 
 /* Allocate backward context sized for max(M) and max(K) across all layers.
@@ -156,6 +171,38 @@ Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K,
 
 /* Free backward context. */
 void two3_backward_ctx_free(Two3BackwardCtx* ctx);
+
+/* ═══════════════════════════════════════════════════════
+ * Muon optimizer GPU — Newton-Schulz with cuBLAS
+ * Requires TWO3_MUON_GPU defined and cublas linked.
+ * ═══════════════════════════════════════════════════════ */
+#ifdef TWO3_MUON_GPU
+
+/* Initialize Muon GPU buffers within existing backward context.
+ * Call after two3_backward_ctx_init.
+ * max_M/max_K: maximum dimensions across all layers. */
+void two3_muon_gpu_init(Two3BackwardCtx* ctx, int max_M, int max_K);
+
+/* Free Muon GPU buffers.
+ * Call before two3_backward_ctx_free. */
+void two3_muon_gpu_free(Two3BackwardCtx* ctx);
+
+/* Newton-Schulz orthogonalization on GPU using cuBLAS.
+ * G: [rows × cols] device memory, modified in-place.
+ * Uses pre-allocated buffers from ctx (d_muon_XtX, d_muon_XXtX, d_muon_XXtXXtX).
+ * 5 iterations of polynomial: a*X + b*X@XtX + c*X@XtX@XtX */
+void two3_newton_schulz_gpu(Two3BackwardCtx* ctx, float *d_G, int rows, int cols);
+
+/* Muon update on GPU.
+ * params, grads: [rows × cols] device memory.
+ * Uses pre-allocated momentum buffer (d_muon_momentum).
+ * Returns: orthogonalized update in d_G (caller copies back to params). */
+void two3_muon_update_gpu(Two3BackwardCtx* ctx,
+                          float *d_params, const float *d_grads,
+                          int rows, int cols,
+                          float lr, float momentum_beta, float weight_decay);
+
+#endif /* TWO3_MUON_GPU */
 
 /* Backward with pre-allocated context (fast path — no per-call malloc).
  * S = number of tokens (1 for single-vector, seq_len for batched). */
@@ -216,6 +263,34 @@ void two3_ref_matmul(const float* X, const float* W, float* C,
 
 /* Print weight statistics: % substrate, % entity A, % entity B */
 void two3_print_stats(const Two3Weights* w);
+
+/* ═══════════════════════════════════════════════════════
+ * Hadamard Pre-Quantization — reduces quantization error
+ *
+ * Pre-multiplying weights by Hadamard matrix spreads outlier
+ * energy uniformly across dimensions. Reduces MSE by factor
+ * of (1 + κ₄/3)^{-1} where κ₄ is excess kurtosis.
+ * Cost: O(K log K) via fast Walsh-Hadamard transform.
+ * ═══════════════════════════════════════════════════════ */
+
+/* Fast Walsh-Hadamard transform IN PLACE.
+ * x: [n] array, n must be power of 2.
+ * Normalized: output scaled by 1/sqrt(n). */
+static inline void hadamard_transform(float *x, int n) {
+    for (int len = 1; len < n; len <<= 1) {
+        for (int i = 0; i < n; i += len << 1) {
+            for (int j = 0; j < len; j++) {
+                float u = x[i + j];
+                float v = x[i + j + len];
+                x[i + j]       = u + v;
+                x[i + j + len] = u - v;
+            }
+        }
+    }
+    float scale = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++)
+        x[i] *= scale;
+}
 
 #ifdef __cplusplus
 }
