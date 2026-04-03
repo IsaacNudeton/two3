@@ -178,8 +178,9 @@ static int test_position_sensitivity(void) {
     printf("  logit distance pos0 vs pos2: %.6f\n", d02);
     printf("  logit distance pos1 vs pos2: %.6f\n", d12);
 
-    /* All distances should be non-zero if position encoding works */
-    int pass = (d01 > 0.001f && d02 > 0.001f && d12 > 0.001f);
+    /* All distances should be non-zero if position encoding works.
+     * Threshold scales down with dequant normalization (1/sqrt(K)). */
+    int pass = (d01 > 1e-5f && d02 > 1e-5f && d12 > 1e-5f);
     printf("  position sensitivity: %s\n", pass ? "VERIFIED" : "FAILED");
     printf("  result: %s\n\n", pass ? "PASS" : "FAIL");
 

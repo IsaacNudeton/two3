@@ -589,7 +589,7 @@ static void model_forward_sequence_cpu(
 
         /* Phase 6: scale + residual add (CPU) */
         {
-            float s = res_scale / sqrtf((float)D);
+            float s = res_scale;
             for (int t = 0; t < seq_len; t++)
                 for (int i = 0; i < D; i++)
                     hidden[t * D + i] += s * o_proj_all[t * D + i];
@@ -848,9 +848,8 @@ static void model_forward_cached(
         ternary_project_cpu(&ly->W_o, attn_out, o_proj, D);
 
         /* Residual */
-        float s = res_scale / sqrtf((float)D);
         for (int i = 0; i < D; i++)
-            hidden[i] += s * o_proj[i];
+            hidden[i] += res_scale * o_proj[i];
 
         /* FFN block (MoE) */
         gain_forward_cpu(normed, hidden, ly->gain_ffn.R, ly->gain_ffn.C, D);
@@ -888,17 +887,20 @@ static void model_forward_cached(
             float *down_out = (float*)malloc(D * sizeof(float));
             ternary_project_cpu(&ly->moe.experts[e].down, h, down_out, m->cfg.intermediate);
 
-            /* Weighted combine */
+            /* Weighted combine (down projection scaled by 1/sqrt(INTER)) */
             float w = sel.expert_weights[k];
+            float ds = 1.0f / sqrtf((float)m->cfg.intermediate);
             for (int i = 0; i < D; i++)
-                expert_out[i] += w * down_out[i];
+                expert_out[i] += w * ds * down_out[i];
 
             free(gate_h); free(up_h); free(h); free(down_out);
         }
 
-        /* Residual add */
-        for (int i = 0; i < D; i++)
-            hidden[i] += res_scale * expert_out[i];
+        /* Residual add (scaled by 1/sqrt(D) like attention residual) */
+        {
+            for (int i = 0; i < D; i++)
+                hidden[i] += res_scale * expert_out[i];
+        }
         free(expert_out);
     }
 

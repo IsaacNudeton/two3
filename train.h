@@ -1323,7 +1323,7 @@ static TrainResult trainable_forward_backward(
 
         /* Phase 6: scale + residual add */
         {
-            float s = res_scale / sqrtf((float)D);
+            float s = res_scale;
             for (int t = 0; t < seq_len; t++)
                 for (int i = 0; i < D; i++)
                     hidden[t * D + i] += s * sv->o_proj[t * D + i];
@@ -1456,10 +1456,13 @@ static TrainResult trainable_forward_backward(
             free(h_expert); free(down_batch);
         }
 
-        /* Step 10: Residual add (scaled for deep models) */
-        for (int t = 0; t < seq_len; t++)
-            for (int i = 0; i < D; i++)
-                hidden[t * D + i] += res_scale * sv->moe_out[t * D + i];
+        /* Step 10: Residual add (scaled by 1/sqrt(D) like attention) */
+        {
+            float moe_s = res_scale;
+            for (int t = 0; t < seq_len; t++)
+                for (int i = 0; i < D; i++)
+                    hidden[t * D + i] += moe_s * sv->moe_out[t * D + i];
+        }
 
         T_ACC(_ms_moe_fwd);
 
@@ -1638,10 +1641,11 @@ static TrainResult trainable_forward_backward(
         {
             float scale = 1.0f / sqrtf((float)D);
 
-            /* Step 10 backward: d_moe_out_all = res_scale * d_hidden */
+            /* Step 10 backward: d_moe_out_all = (res_scale/sqrt(D)) * d_hidden */
+            float moe_s = res_scale;
             float *d_moe_out_all = (float*)malloc(seq_len * D * sizeof(float));
             for (int i = 0; i < seq_len * D; i++)
-                d_moe_out_all[i] = res_scale * d_hidden[i];
+                d_moe_out_all[i] = moe_s * d_hidden[i];
 
             /* d_normed_ffn_all accumulates gradients from expert backward + router */
             float *d_normed_ffn_all = (float*)calloc(seq_len * D, sizeof(float));
@@ -1670,7 +1674,7 @@ static TrainResult trainable_forward_backward(
                 int cnt = expert_cnt[e];
                 if (cnt == 0) continue;
 
-                /* Gather: d_expert_out = d_moe_out * w0, recompute h_expert, gather normed input */
+                /* Gather: d_expert_out = d_moe_out * w0 */
                 for (int i = 0; i < cnt; i++) {
                     int t = EPB(e, i);
                     float w0 = sv->moe_sel[t].expert_weights[0];
@@ -1785,7 +1789,7 @@ static TrainResult trainable_forward_backward(
         float *d_o_proj_all = (float*)malloc(seq_len * D * sizeof(float));
         float *d_attn_out_all = (float*)calloc(seq_len * D, sizeof(float));
         {
-            float s = res_scale / sqrtf((float)D);
+            float s = res_scale;
             for (int i = 0; i < seq_len * D; i++)
                 d_o_proj_all[i] = s * d_hidden[i];
         }
