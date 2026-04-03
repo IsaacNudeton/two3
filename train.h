@@ -40,9 +40,19 @@
  * called on backward_ctx.
  * ═══════════════════════════════════════════════════════ */
 
-#ifdef TWO3_MUON_GPU
+#if defined(TWO3_MUON_GPU) || defined(TWO3_GPU_RESIDENT)
 #include <cuda_runtime.h>
 #include <stdio.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(1); \
+    } \
+} while(0)
+#endif
 
 static void check_cuda(cudaError_t err, const char *msg) {
     if (err != cudaSuccess) {
@@ -51,6 +61,7 @@ static void check_cuda(cudaError_t err, const char *msg) {
     }
 }
 
+#ifdef TWO3_MUON_GPU
 /* Muon update on GPU for a single weight tensor.
  * H2D / D2H staging uses d_W_latent and d_dW (safe after backward, before next forward).
  * Newton-Schulz scratch (d_muon_XXtX, d_muon_XXtXXtX) must not alias params/grads. */
@@ -86,7 +97,9 @@ static void muon_update_gpu_tensor(
                "cudaMemcpy momentum D2H");
 }
 
-#endif /* TWO3_MUON_GPU */
+#endif /* TWO3_MUON_GPU (muon_update_gpu_tensor) */
+
+#endif /* TWO3_MUON_GPU || TWO3_GPU_RESIDENT */
 
 #define LOGIT_CLIP 30.0f
 
@@ -408,6 +421,20 @@ typedef struct {
     /* Pre-allocated GPU backward context (eliminates per-call malloc) */
     Two3BackwardCtx backward_ctx;
 
+#ifdef TWO3_GPU_RESIDENT
+    /* GPU-resident latent weights — all ternary latents live on device.
+     * Single allocation, layers index into it. Eliminates H2D per requantize. */
+    float *d_latent_pool;         /* [total_ternary_params] device */
+    float **d_latent_layer_ptrs;  /* [n_layers] array of offsets into pool */
+    int   *layer_param_offsets;   /* [n_layers+1] cumulative param counts */
+    int    total_ternary_params;
+    float *d_grad_buf;            /* [max_layer_params] device — per-layer scratch */
+    float *h_norm_scratch;        /* host scratch for norm reduction */
+    float *d_norm_scratch;        /* device scratch for norm reduction */
+    float *h_staging;             /* [max_layer_params] host staging for bulk H2D */
+    int    max_layer_params;
+#endif
+
     /* Training hyperparams */
     float lr;
     float beta1, beta2, eps;
@@ -563,6 +590,60 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     }
 #endif
 
+#ifdef TWO3_GPU_RESIDENT
+    /* GPU-resident latent weights: allocate device pool, upload latents */
+    {
+        /* Count total ternary params per layer and overall */
+        int per_layer = D*D + KV*D + KV*D + D*D  /* Q,K,V,O */
+                      + MOE_NUM_EXPERTS * (INTER*D + INTER*D + D*INTER);  /* experts */
+        tm->total_ternary_params = per_layer * L;
+        size_t pool_bytes = (size_t)tm->total_ternary_params * sizeof(float);
+
+        printf("[gpu-resident] allocating %.1f MB device latent pool\n",
+               pool_bytes / 1e6); fflush(stdout);
+        CUDA_CHECK(cudaMalloc(&tm->d_latent_pool, pool_bytes));
+
+        /* Build layer offset table and upload initial latent weights */
+        tm->layer_param_offsets = (int*)malloc((L + 1) * sizeof(int));
+        tm->d_latent_layer_ptrs = (float**)malloc(L * sizeof(float*));
+        int offset = 0;
+        for (int l = 0; l < L; l++) {
+            tm->layer_param_offsets[l] = offset;
+            tm->d_latent_layer_ptrs[l] = tm->d_latent_pool + offset;
+            TrainableLayerWeights *tw = &tm->layer_weights[l];
+
+            /* Upload each weight tensor into the contiguous pool */
+            float *d = tm->d_latent_pool + offset;
+            cudaMemcpy(d, tw->W_q, D*D*sizeof(float), cudaMemcpyHostToDevice); d += D*D;
+            cudaMemcpy(d, tw->W_k, KV*D*sizeof(float), cudaMemcpyHostToDevice); d += KV*D;
+            cudaMemcpy(d, tw->W_v, KV*D*sizeof(float), cudaMemcpyHostToDevice); d += KV*D;
+            cudaMemcpy(d, tw->W_o, D*D*sizeof(float), cudaMemcpyHostToDevice); d += D*D;
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                cudaMemcpy(d, tw->expert_gate[e], INTER*D*sizeof(float), cudaMemcpyHostToDevice); d += INTER*D;
+                cudaMemcpy(d, tw->expert_up[e], INTER*D*sizeof(float), cudaMemcpyHostToDevice); d += INTER*D;
+                cudaMemcpy(d, tw->expert_down[e], D*INTER*sizeof(float), cudaMemcpyHostToDevice); d += D*INTER;
+            }
+            offset += per_layer;
+        }
+        tm->layer_param_offsets[L] = offset;
+
+        /* Per-layer gradient scratch on device */
+        CUDA_CHECK(cudaMalloc(&tm->d_grad_buf, per_layer * sizeof(float)));
+        CUDA_CHECK(cudaMemset(tm->d_grad_buf, 0, per_layer * sizeof(float)));
+
+        /* Norm reduction scratch */
+        tm->h_norm_scratch = (float*)malloc(1024 * sizeof(float));
+        CUDA_CHECK(cudaMalloc(&tm->d_norm_scratch, 1024 * sizeof(float)));
+
+        /* Host staging buffer for bulk H2D per layer */
+        tm->max_layer_params = per_layer;
+        tm->h_staging = (float*)malloc(per_layer * sizeof(float));
+
+        printf("[gpu-resident] %d params, %d layers, %.1f MB on device\n",
+               tm->total_ternary_params, L, pool_bytes / 1e6); fflush(stdout);
+    }
+#endif
+
     printf("[init] trainable_model_init complete\n"); fflush(stdout);
 }
 
@@ -583,19 +664,33 @@ static void trainable_requantize(TrainableModel *tm) {
         TrainableLayerWeights *tw = &tm->layer_weights[l];
         ModelLayer *ly = &tm->model.layers[l];
 
-        requantize_gpu(&tm->backward_ctx, tw->W_q, &ly->W_q, D, D, STE_THRESHOLD);
-        requantize_gpu(&tm->backward_ctx, tw->W_k, &ly->W_k, KV, D, STE_THRESHOLD);
-        requantize_gpu(&tm->backward_ctx, tw->W_v, &ly->W_v, KV, D, STE_THRESHOLD);
-        requantize_gpu(&tm->backward_ctx, tw->W_o, &ly->W_o, D, D, STE_THRESHOLD);
-
+#ifdef TWO3_GPU_RESIDENT
+        /* GPU-resident: read from device latent pool directly */
+        float *d = tm->d_latent_layer_ptrs[l];
+        requantize_gpu(&tm->backward_ctx, NULL, &ly->W_q, D, D, STE_THRESHOLD, d); d += D*D;
+        requantize_gpu(&tm->backward_ctx, NULL, &ly->W_k, KV, D, STE_THRESHOLD, d); d += KV*D;
+        requantize_gpu(&tm->backward_ctx, NULL, &ly->W_v, KV, D, STE_THRESHOLD, d); d += KV*D;
+        requantize_gpu(&tm->backward_ctx, NULL, &ly->W_o, D, D, STE_THRESHOLD, d); d += D*D;
+        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            requantize_gpu(&tm->backward_ctx, NULL, &ly->moe.experts[e].gate, INTER, D, STE_THRESHOLD, d); d += INTER*D;
+            requantize_gpu(&tm->backward_ctx, NULL, &ly->moe.experts[e].up, INTER, D, STE_THRESHOLD, d); d += INTER*D;
+            requantize_gpu(&tm->backward_ctx, NULL, &ly->moe.experts[e].down, D, INTER, STE_THRESHOLD, d); d += D*INTER;
+        }
+#else
+        /* Legacy: upload from host */
+        requantize_gpu(&tm->backward_ctx, tw->W_q, &ly->W_q, D, D, STE_THRESHOLD, NULL);
+        requantize_gpu(&tm->backward_ctx, tw->W_k, &ly->W_k, KV, D, STE_THRESHOLD, NULL);
+        requantize_gpu(&tm->backward_ctx, tw->W_v, &ly->W_v, KV, D, STE_THRESHOLD, NULL);
+        requantize_gpu(&tm->backward_ctx, tw->W_o, &ly->W_o, D, D, STE_THRESHOLD, NULL);
         for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
             requantize_gpu(&tm->backward_ctx, tw->expert_gate[e],
-                          &ly->moe.experts[e].gate, INTER, D, STE_THRESHOLD);
+                          &ly->moe.experts[e].gate, INTER, D, STE_THRESHOLD, NULL);
             requantize_gpu(&tm->backward_ctx, tw->expert_up[e],
-                          &ly->moe.experts[e].up, INTER, D, STE_THRESHOLD);
+                          &ly->moe.experts[e].up, INTER, D, STE_THRESHOLD, NULL);
             requantize_gpu(&tm->backward_ctx, tw->expert_down[e],
-                          &ly->moe.experts[e].down, D, INTER, STE_THRESHOLD);
+                          &ly->moe.experts[e].down, D, INTER, STE_THRESHOLD, NULL);
         }
+#endif
     }
 }
 
@@ -648,6 +743,16 @@ static void trainable_model_free(TrainableModel *tm) {
 
     adam_free(&tm->adam_gain_C_final);
     free(tm->grad_gain_C_final);
+
+#ifdef TWO3_GPU_RESIDENT
+    cudaFree(tm->d_latent_pool);
+    cudaFree(tm->d_grad_buf);
+    cudaFree(tm->d_norm_scratch);
+    free(tm->h_norm_scratch);
+    free(tm->h_staging);
+    free(tm->d_latent_layer_ptrs);
+    free(tm->layer_param_offsets);
+#endif
 
 #ifdef TWO3_MUON_GPU
     /* Free Muon GPU buffers before backward_ctx free */
@@ -1079,8 +1184,40 @@ static void trainable_optimizer_step(TrainableModel *tm) {
     adam_update(tm->latent_embed, tm->grad_embed, &tm->adam_embed, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
     /* gain_final.C also frozen — same reasoning as per-layer C. */
 
-    /* Sync embedding + requantize ternary weights */
+    /* Sync embedding */
     memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
+
+#ifdef TWO3_GPU_RESIDENT
+    /* GPU-resident requantize: latent already on device from optimizer update below.
+     * After CPU Adam, we H2D the updated latent back, then requantize from device. */
+    {
+        int per_layer = D*D + KV*D + KV*D + D*D
+                      + MOE_NUM_EXPERTS * (INTER*D + INTER*D + D*INTER);
+        size_t layer_bytes = (size_t)per_layer * sizeof(float);
+
+        for (int l = 0; l < L; l++) {
+            TrainableLayerWeights *tw = &tm->layer_weights[l];
+
+            /* Pack into contiguous staging buffer */
+            float *s = tm->h_staging;
+            memcpy(s, tw->W_q, D*D*sizeof(float)); s += D*D;
+            memcpy(s, tw->W_k, KV*D*sizeof(float)); s += KV*D;
+            memcpy(s, tw->W_v, KV*D*sizeof(float)); s += KV*D;
+            memcpy(s, tw->W_o, D*D*sizeof(float)); s += D*D;
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                memcpy(s, tw->expert_gate[e], INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(s, tw->expert_up[e], INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(s, tw->expert_down[e], D*INTER*sizeof(float)); s += D*INTER;
+            }
+
+            /* ONE bulk H2D per layer */
+            cudaMemcpy(tm->d_latent_layer_ptrs[l], tm->h_staging,
+                       tm->max_layer_params * sizeof(float), cudaMemcpyHostToDevice);
+        }
+    }
+#endif
+
+    /* Requantize ternary weights (GPU-resident reads from device pool) */
     trainable_requantize(tm);
 }
 

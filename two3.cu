@@ -1051,3 +1051,84 @@ void two3_muon_gpu_free(Two3BackwardCtx* ctx) {
 }
 
 #endif /* TWO3_MUON_GPU */
+
+/* ═══════════════════════════════════════════════════════
+ * GPU-resident optimizer kernels
+ * Used when latent weights live on device (TWO3_GPU_RESIDENT).
+ * ═══════════════════════════════════════════════════════ */
+
+#ifdef TWO3_GPU_RESIDENT
+
+/* Per-element gradient clamp: |g| <= max_elem */
+__global__ void kernel_grad_clamp(float *grads, int size, float max_elem) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= size) return;
+    float g = grads[i];
+    if (g > max_elem) grads[i] = max_elem;
+    else if (g < -max_elem) grads[i] = -max_elem;
+}
+
+/* L2 norm reduction — each block produces a partial sum */
+__global__ void kernel_l2_norm_partial(const float *data, float *partials, int size) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    sdata[tid] = (i < size) ? data[i] * data[i] : 0.0f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) partials[blockIdx.x] = sdata[0];
+}
+
+/* Scale gradient by factor: g *= scale */
+__global__ void kernel_grad_scale(float *grads, int size, float scale) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= size) return;
+    grads[i] *= scale;
+}
+
+/* GPU grad clip: per-element clamp then L2 norm clip.
+ * Uses d_dY as scratch for partial sums (safe — not needed between bwd and optim). */
+void gpu_clip_grad_norm(float *d_grads, int size, float max_norm, float max_elem,
+                        float *d_scratch, float *h_scratch) {
+    int threads = 256;
+    int blocks = (size + threads - 1) / threads;
+
+    /* Per-element clamp */
+    kernel_grad_clamp<<<blocks, threads>>>(d_grads, size, max_elem);
+
+    /* L2 norm */
+    int norm_blocks = (size + threads - 1) / threads;
+    if (norm_blocks > 1024) norm_blocks = 1024;
+    kernel_l2_norm_partial<<<norm_blocks, threads, threads * sizeof(float)>>>(
+        d_grads, d_scratch, size);
+    cudaMemcpy(h_scratch, d_scratch, norm_blocks * sizeof(float), cudaMemcpyDeviceToHost);
+    float norm_sq = 0.0f;
+    for (int i = 0; i < norm_blocks; i++) norm_sq += h_scratch[i];
+    float norm = sqrtf(norm_sq + 1e-30f);
+
+    if (norm > max_norm) {
+        float scale = max_norm / norm;
+        kernel_grad_scale<<<blocks, threads>>>(d_grads, size, scale);
+    }
+}
+
+/* Adam update on GPU: w -= lr * (m_hat / (sqrt(v_hat) + eps)) */
+__global__ void kernel_adam_update(
+    float *params, float *m, float *v, const float *grads,
+    int size, float lr, float beta1, float beta2, float eps,
+    float bc1, float bc2  /* bias correction: 1/(1-beta^t) */
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= size) return;
+    float g = grads[i];
+    m[i] = beta1 * m[i] + (1.0f - beta1) * g;
+    v[i] = beta2 * v[i] + (1.0f - beta2) * g * g;
+    float m_hat = m[i] * bc1;
+    float v_hat = v[i] * bc2;
+    params[i] -= lr * m_hat / (sqrtf(v_hat) + eps);
+}
+
+#endif /* TWO3_GPU_RESIDENT */

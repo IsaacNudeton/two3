@@ -494,19 +494,32 @@ static __global__ void kernel_hadamard_rows(
  * Replaces old trainable_requantize() which called two3_pack_weights()
  * (112 malloc/free + 112 printf per optimizer step).
  */
+/* requantize_gpu: latent → Hadamard → quantize → pack.
+ * If d_latent_device is non-NULL, uses it directly (GPU-resident path).
+ * Otherwise uploads latent_host via H2D (legacy path). */
 static void requantize_gpu(
     Two3BackwardCtx *ctx,
-    const float *latent_host,    /* [rows, cols] latent float */
+    const float *latent_host,    /* [rows, cols] latent float (NULL if GPU-resident) */
     Two3Weights *w,              /* existing weights — packed buffer reused */
     int rows, int cols,
-    float threshold              /* STE_THRESHOLD */
+    float threshold,             /* STE_THRESHOLD */
+    float *d_latent_device       /* device pointer (NULL = use latent_host via H2D) */
 ) {
     int total = rows * cols;
     int packed_total = rows * (cols / 4);
 
-    /* Upload latent to device (reuse backward ctx buffer) */
-    cudaMemcpy(ctx->d_W_latent, latent_host,
-               total * sizeof(float), cudaMemcpyHostToDevice);
+    float *d_src;
+    if (d_latent_device) {
+        /* GPU-resident: copy from device latent to scratch (Hadamard modifies in-place) */
+        cudaMemcpy(ctx->d_W_latent, d_latent_device, total * sizeof(float),
+                   cudaMemcpyDeviceToDevice);
+        d_src = ctx->d_W_latent;
+    } else {
+        /* Legacy: upload from host */
+        cudaMemcpy(ctx->d_W_latent, latent_host, total * sizeof(float),
+                   cudaMemcpyHostToDevice);
+        d_src = ctx->d_W_latent;
+    }
 
     /* Hadamard pre-quantization: transform each row on GPU.
      * Each thread handles one row. */
