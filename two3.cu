@@ -393,6 +393,7 @@ Two3Weights two3_pack_weights(const float* w_float, int rows, int cols) {
            100.0f * count_plus  / total,
            100.0f * count_minus / total);
     printf("[two3] weight scale (absmean): %.6f\n", result.scale);
+    fflush(stdout);
 
     CUDA_CHECK(cudaMalloc(&result.packed, packed_total));
     CUDA_CHECK(cudaMemcpy(result.packed, packed_host, packed_total,

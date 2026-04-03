@@ -558,13 +558,12 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         int max_M = D > INTER ? D : INTER;
         if (KV > max_M) max_M = KV;
         int max_K = D > INTER ? D : INTER;
+        printf("[init] muon_gpu_init max_M=%d max_K=%d\n", max_M, max_K); fflush(stdout);
         two3_muon_gpu_init(&tm->backward_ctx, max_M, max_K);
     }
 #endif
 
-    /* Quantize latent weights to ternary for the model
-     * (defined below, declared here via forward declaration) */
-    /* trainable_requantize(tm) called after full init — see below */
+    printf("[init] trainable_model_init complete\n"); fflush(stdout);
 }
 
 /* Re-quantize all latent weights → ternary for the model.

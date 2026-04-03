@@ -79,14 +79,17 @@ static void moe_route(
     int D = router->dim;
     int N = router->n_experts;
 
-    /* Compute logits: x @ W_router + reservoir bonus */
+    /* Compute logits: x @ W_router, modulated by reservoir.
+     * Multiplicative gating: logit *= (0.5 + 0.5*R_e).
+     * Depleted expert (R=0) gets logits halved.
+     * Full expert (R=1) keeps full logits.
+     * Same modulation pattern as gain kernel on activations. */
     float logits[MOE_NUM_EXPERTS];
     for (int e = 0; e < N; e++) {
         float sum = 0;
         for (int d = 0; d < D; d++)
             sum += x[d] * router->W[d * N + e];
-        /* Reservoir routing bonus */
-        sum += MOE_ROUTE_ALPHA * router->R_expert[e];
+        sum *= router->R_expert[e];
         logits[e] = sum;
     }
 

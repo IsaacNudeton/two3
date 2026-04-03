@@ -160,6 +160,7 @@ static void flip_counter_free(FlipCounter *fc) {
 /* ═══════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);  /* unbuffered stdout for file redirect */
     printf("============================================\n");
     printf("  {2,3} Training Driver\n");
     printf("  Bytes in. Loss out. No tokenizer.\n");
@@ -251,12 +252,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    printf("[init] calling trainable_requantize...\n"); fflush(stdout);
     trainable_requantize(&tm);
+    printf("[init] requantize done\n"); fflush(stdout);
 
     /* Flip counter on W_q of first layer (representative) */
     int D = mcfg.dim;
+    printf("[init] D=%d, W_q=%p\n", D, (void*)tm.layer_weights[0].W_q); fflush(stdout);
     FlipCounter fc;
     flip_counter_init(&fc, tm.layer_weights[0].W_q, D * D);
+    printf("[init] flip_counter done\n"); fflush(stdout);
 
     /* Open log file */
     FILE *logf = fopen("train_log.txt", "a");
@@ -264,6 +269,7 @@ int main(int argc, char **argv) {
         fprintf(logf, "# step  loss  accuracy  max_grad  flips  total_flips  time_ms\n");
         fflush(logf);
     }
+    printf("[init] log file opened\n"); fflush(stdout);
 
     /* ═══════════════════════════════════════════════════════
      * TRAINING LOOP
@@ -339,6 +345,7 @@ int main(int argc, char **argv) {
                        epoch + 1, cfg.epochs, global_step,
                        r.loss, accuracy, r.max_grad,
                        flips, fc.total_flips, step_ms);
+                fflush(stdout);
 
                 if (logf) {
                     fprintf(logf, "%d  %.6f  %.4f  %.6f  %d  %d  %.1f\n",
@@ -357,7 +364,8 @@ int main(int argc, char **argv) {
                     uint8_t gen_buf[65];
                     gen_buf[0] = 'T';  /* seed byte */
                     for (int g = 0; g < 64; g++) {
-                        float logits_g[256];
+                        /* Allocate full logits array for sequence length g+1 */
+                        float *logits_g = (float*)malloc((g + 1) * 256 * sizeof(float));
                         model_forward_sequence_cpu(&tm.model, gen_buf, g + 1, logits_g,
                                                    MODEL_FWD_FLAGS_DEFAULT);
                         /* Greedy argmax from last position's logits */
@@ -365,8 +373,8 @@ int main(int argc, char **argv) {
                         int best = 0;
                         for (int b = 1; b < 256; b++)
                             if (last_logits[b] > last_logits[best]) best = b;
+                        free(logits_g);
                         gen_buf[g + 1] = (uint8_t)best;
-                        /* Print printable or dot */
                         char c = (best >= 32 && best < 127) ? (char)best : '.';
                         printf("%c", c);
                     }
