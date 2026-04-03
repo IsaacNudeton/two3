@@ -58,7 +58,7 @@
 
 #ifdef TWO3_WEIGHTED_LOSS
 
-#define WLOSS_FLOOR 0.1f    /* easy tokens keep 10% gradient */
+#define WLOSS_FLOOR 0.5f    /* easy tokens keep 50% — 2x max ratio, CFL-stable */
 #define WLOSS_CEIL  1.0f    /* hard tokens keep 100% */
 
 /* Compute per-position difficulty weights from losses.
