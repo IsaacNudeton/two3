@@ -53,8 +53,8 @@ static TrainConfig default_config(void) {
     c.use_medium = 0;
     c.use_large = 0;
     c.seq_len = 128;
-#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
-    c.lr = 1e-3f;       /* Muon + Newton–Schulz: more conservative than SGD 3e-3 */
+#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY) || defined(TWO3_GPU_RESIDENT)
+    c.lr = 1e-3f;       /* conservative — 3e-3 causes gradient explosion at dim=1024 */
 #else
     c.lr = 3e-3f;
 #endif

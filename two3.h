@@ -292,6 +292,22 @@ static inline void hadamard_transform(float *x, int n) {
         x[i] *= scale;
 }
 
+/* ═══════════════════════════════════════════════════════
+ * GPU-resident optimizer kernels (TWO3_GPU_RESIDENT)
+ * ═══════════════════════════════════════════════════════ */
+
+#ifdef TWO3_GPU_RESIDENT
+
+void gpu_clip_grad_norm(float *d_grads, int size, float max_norm, float max_elem,
+                        float *d_scratch, float *h_scratch);
+
+__global__ void kernel_adam_update(
+    float *params, float *m, float *v, const float *grads,
+    int size, float lr, float beta1, float beta2, float eps,
+    float bc1, float bc2);
+
+#endif /* TWO3_GPU_RESIDENT */
+
 #ifdef __cplusplus
 }
 #endif

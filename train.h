@@ -429,9 +429,12 @@ typedef struct {
     int   *layer_param_offsets;   /* [n_layers+1] cumulative param counts */
     int    total_ternary_params;
     float *d_grad_buf;            /* [max_layer_params] device — per-layer scratch */
+    float *d_adam_m;              /* [max_layer_params] device — Adam first moment */
+    float *d_adam_v;              /* [max_layer_params] device — Adam second moment */
     float *h_norm_scratch;        /* host scratch for norm reduction */
     float *d_norm_scratch;        /* device scratch for norm reduction */
     float *h_staging;             /* [max_layer_params] host staging for bulk H2D */
+    float *h_staging2;            /* [max_layer_params] second staging buffer */
     int    max_layer_params;
 #endif
 
@@ -627,17 +630,22 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         }
         tm->layer_param_offsets[L] = offset;
 
-        /* Per-layer gradient scratch on device */
+        /* Per-layer device buffers for GPU Adam */
         CUDA_CHECK(cudaMalloc(&tm->d_grad_buf, per_layer * sizeof(float)));
         CUDA_CHECK(cudaMemset(tm->d_grad_buf, 0, per_layer * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&tm->d_adam_m, per_layer * sizeof(float)));
+        CUDA_CHECK(cudaMemset(tm->d_adam_m, 0, per_layer * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&tm->d_adam_v, per_layer * sizeof(float)));
+        CUDA_CHECK(cudaMemset(tm->d_adam_v, 0, per_layer * sizeof(float)));
 
         /* Norm reduction scratch */
         tm->h_norm_scratch = (float*)malloc(1024 * sizeof(float));
         CUDA_CHECK(cudaMalloc(&tm->d_norm_scratch, 1024 * sizeof(float)));
 
-        /* Host staging buffer for bulk H2D per layer */
+        /* Host staging buffers for bulk H2D per layer */
         tm->max_layer_params = per_layer;
         tm->h_staging = (float*)malloc(per_layer * sizeof(float));
+        tm->h_staging2 = (float*)malloc(per_layer * sizeof(float));
 
         printf("[gpu-resident] %d params, %d layers, %.1f MB on device\n",
                tm->total_ternary_params, L, pool_bytes / 1e6); fflush(stdout);
@@ -747,9 +755,12 @@ static void trainable_model_free(TrainableModel *tm) {
 #ifdef TWO3_GPU_RESIDENT
     cudaFree(tm->d_latent_pool);
     cudaFree(tm->d_grad_buf);
+    cudaFree(tm->d_adam_m);
+    cudaFree(tm->d_adam_v);
     cudaFree(tm->d_norm_scratch);
     free(tm->h_norm_scratch);
     free(tm->h_staging);
+    free(tm->h_staging2);
     free(tm->d_latent_layer_ptrs);
     free(tm->layer_param_offsets);
 #endif
@@ -1149,8 +1160,125 @@ static void trainable_optimizer_step(TrainableModel *tm) {
             muon_update(tw->expert_up[e], tw->grad_up[e], &tw->muon_up[e], tm->lr, 0.95f, 0.01f);
             muon_update(tw->expert_down[e], tw->grad_down[e], &tw->muon_down[e], tm->lr, 0.95f, 0.01f);
         }
+#elif defined(TWO3_GPU_RESIDENT)
+        /* GPU-resident Adam: pack layer grads+m+v, bulk H2D, GPU kernels, bulk D2H.
+         * Latent weights already on device (d_latent_pool). */
+        {
+            int per_layer = tm->max_layer_params;
+            float *d_latent = tm->d_latent_layer_ptrs[l];
+
+            /* Pack grads into staging and H2D */
+            float *s = tm->h_staging;
+            memcpy(s, tw->grad_Wq, D*D*sizeof(float)); s += D*D;
+            memcpy(s, tw->grad_Wk, KV*D*sizeof(float)); s += KV*D;
+            memcpy(s, tw->grad_Wv, KV*D*sizeof(float)); s += KV*D;
+            memcpy(s, tw->grad_Wo, D*D*sizeof(float)); s += D*D;
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                /* Clip expert grads on CPU before upload */
+                clip_grad_norm(tw->grad_gate[e], INTER * D, GRAD_CLIP_NORM);
+                clip_grad_norm(tw->grad_up[e], INTER * D, GRAD_CLIP_NORM);
+                clip_grad_norm(tw->grad_down[e], D * INTER, GRAD_CLIP_NORM);
+                memcpy(s, tw->grad_gate[e], INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(s, tw->grad_up[e], INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(s, tw->grad_down[e], D*INTER*sizeof(float)); s += D*INTER;
+            }
+            CUDA_CHECK(cudaMemcpy(tm->d_grad_buf, tm->h_staging,
+                                  per_layer * sizeof(float), cudaMemcpyHostToDevice));
+
+            /* Pack Adam m into staging and H2D */
+            s = tm->h_staging;
+            memcpy(s, tw->adam_Wq.m, D*D*sizeof(float)); s += D*D;
+            memcpy(s, tw->adam_Wk.m, KV*D*sizeof(float)); s += KV*D;
+            memcpy(s, tw->adam_Wv.m, KV*D*sizeof(float)); s += KV*D;
+            memcpy(s, tw->adam_Wo.m, D*D*sizeof(float)); s += D*D;
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                memcpy(s, tw->adam_gate[e].m, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(s, tw->adam_up[e].m, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(s, tw->adam_down[e].m, D*INTER*sizeof(float)); s += D*INTER;
+            }
+            CUDA_CHECK(cudaMemcpy(tm->d_adam_m, tm->h_staging,
+                                  per_layer * sizeof(float), cudaMemcpyHostToDevice));
+
+            /* Pack Adam v into staging and H2D */
+            s = tm->h_staging;
+            memcpy(s, tw->adam_Wq.v, D*D*sizeof(float)); s += D*D;
+            memcpy(s, tw->adam_Wk.v, KV*D*sizeof(float)); s += KV*D;
+            memcpy(s, tw->adam_Wv.v, KV*D*sizeof(float)); s += KV*D;
+            memcpy(s, tw->adam_Wo.v, D*D*sizeof(float)); s += D*D;
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                memcpy(s, tw->adam_gate[e].v, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(s, tw->adam_up[e].v, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(s, tw->adam_down[e].v, D*INTER*sizeof(float)); s += D*INTER;
+            }
+            CUDA_CHECK(cudaMemcpy(tm->d_adam_v, tm->h_staging,
+                                  per_layer * sizeof(float), cudaMemcpyHostToDevice));
+
+            /* GPU: grad clip (already clipped attn on CPU, experts in pack loop) */
+            gpu_clip_grad_norm(tm->d_grad_buf, D*D, GRAD_CLIP_NORM, 5.0f,
+                               tm->d_norm_scratch, tm->h_norm_scratch);
+            gpu_clip_grad_norm(tm->d_grad_buf + D*D, KV*D, GRAD_CLIP_NORM, 5.0f,
+                               tm->d_norm_scratch, tm->h_norm_scratch);
+            gpu_clip_grad_norm(tm->d_grad_buf + D*D + KV*D, KV*D, GRAD_CLIP_NORM, 5.0f,
+                               tm->d_norm_scratch, tm->h_norm_scratch);
+            gpu_clip_grad_norm(tm->d_grad_buf + D*D + 2*KV*D, D*D, GRAD_CLIP_NORM, 5.0f,
+                               tm->d_norm_scratch, tm->h_norm_scratch);
+
+            /* GPU: Adam update — all params in one kernel launch */
+            float bc1 = 1.0f / (1.0f - powf(tm->beta1, (float)tm->step));
+            float bc2 = 1.0f / (1.0f - powf(tm->beta2, (float)tm->step));
+            int threads = 256;
+            int blocks = (per_layer + threads - 1) / threads;
+            kernel_adam_update<<<blocks, threads>>>(
+                d_latent, tm->d_adam_m, tm->d_adam_v, tm->d_grad_buf,
+                per_layer, tm->lr, tm->beta1, tm->beta2, tm->eps, bc1, bc2);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            /* D2H: Adam m back to host */
+            CUDA_CHECK(cudaMemcpy(tm->h_staging, tm->d_adam_m,
+                                  per_layer * sizeof(float), cudaMemcpyDeviceToHost));
+            s = tm->h_staging;
+            memcpy(tw->adam_Wq.m, s, D*D*sizeof(float)); s += D*D;
+            memcpy(tw->adam_Wk.m, s, KV*D*sizeof(float)); s += KV*D;
+            memcpy(tw->adam_Wv.m, s, KV*D*sizeof(float)); s += KV*D;
+            memcpy(tw->adam_Wo.m, s, D*D*sizeof(float)); s += D*D;
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                memcpy(tw->adam_gate[e].m, s, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(tw->adam_up[e].m, s, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(tw->adam_down[e].m, s, D*INTER*sizeof(float)); s += D*INTER;
+            }
+
+            /* D2H: Adam v back to host */
+            CUDA_CHECK(cudaMemcpy(tm->h_staging, tm->d_adam_v,
+                                  per_layer * sizeof(float), cudaMemcpyDeviceToHost));
+            s = tm->h_staging;
+            memcpy(tw->adam_Wq.v, s, D*D*sizeof(float)); s += D*D;
+            memcpy(tw->adam_Wk.v, s, KV*D*sizeof(float)); s += KV*D;
+            memcpy(tw->adam_Wv.v, s, KV*D*sizeof(float)); s += KV*D;
+            memcpy(tw->adam_Wo.v, s, D*D*sizeof(float)); s += D*D;
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                memcpy(tw->adam_gate[e].v, s, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(tw->adam_up[e].v, s, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(tw->adam_down[e].v, s, D*INTER*sizeof(float)); s += D*INTER;
+            }
+
+            /* Also sync latent back to host (for checkpoints/diagnostics) */
+            CUDA_CHECK(cudaMemcpy(tm->h_staging, d_latent,
+                                  per_layer * sizeof(float), cudaMemcpyDeviceToHost));
+            s = tm->h_staging;
+            memcpy(tw->W_q, s, D*D*sizeof(float)); s += D*D;
+            memcpy(tw->W_k, s, KV*D*sizeof(float)); s += KV*D;
+            memcpy(tw->W_v, s, KV*D*sizeof(float)); s += KV*D;
+            memcpy(tw->W_o, s, D*D*sizeof(float)); s += D*D;
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                memcpy(tw->expert_gate[e], s, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(tw->expert_up[e], s, INTER*D*sizeof(float)); s += INTER*D;
+                memcpy(tw->expert_down[e], s, D*INTER*sizeof(float)); s += D*INTER;
+            }
+        }
+
+        /* Expert grads already clipped in pack loop above */
 #else
-        /* Adam on STE ternary weights (default path) */
+        /* Adam on STE ternary weights (default/CPU path) */
         adam_update(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
@@ -1187,37 +1315,9 @@ static void trainable_optimizer_step(TrainableModel *tm) {
     /* Sync embedding */
     memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
 
-#ifdef TWO3_GPU_RESIDENT
-    /* GPU-resident requantize: latent already on device from optimizer update below.
-     * After CPU Adam, we H2D the updated latent back, then requantize from device. */
-    {
-        int per_layer = D*D + KV*D + KV*D + D*D
-                      + MOE_NUM_EXPERTS * (INTER*D + INTER*D + D*INTER);
-        size_t layer_bytes = (size_t)per_layer * sizeof(float);
-
-        for (int l = 0; l < L; l++) {
-            TrainableLayerWeights *tw = &tm->layer_weights[l];
-
-            /* Pack into contiguous staging buffer */
-            float *s = tm->h_staging;
-            memcpy(s, tw->W_q, D*D*sizeof(float)); s += D*D;
-            memcpy(s, tw->W_k, KV*D*sizeof(float)); s += KV*D;
-            memcpy(s, tw->W_v, KV*D*sizeof(float)); s += KV*D;
-            memcpy(s, tw->W_o, D*D*sizeof(float)); s += D*D;
-            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-                memcpy(s, tw->expert_gate[e], INTER*D*sizeof(float)); s += INTER*D;
-                memcpy(s, tw->expert_up[e], INTER*D*sizeof(float)); s += INTER*D;
-                memcpy(s, tw->expert_down[e], D*INTER*sizeof(float)); s += D*INTER;
-            }
-
-            /* ONE bulk H2D per layer */
-            cudaMemcpy(tm->d_latent_layer_ptrs[l], tm->h_staging,
-                       tm->max_layer_params * sizeof(float), cudaMemcpyHostToDevice);
-        }
-    }
-#endif
-
-    /* Requantize ternary weights (GPU-resident reads from device pool) */
+    /* Requantize ternary weights.
+     * GPU-resident: latent already on device from GPU Adam kernel.
+     * Legacy: uploads from host via H2D. */
     trainable_requantize(tm);
 }
 
