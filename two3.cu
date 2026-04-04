@@ -620,6 +620,8 @@ Two3BackwardCtx two3_backward_ctx_init(int max_M, int max_K,
     CUDA_CHECK(cudaMalloc(&ctx.d_W_latent, (size_t)max_M * max_K * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx.d_dW, (size_t)max_M * max_K * sizeof(float)));
     ctx.h_dX_tmp = (float*)malloc(S_max * max_K * sizeof(float));
+    ctx.h_dY_scaled_size = S_max * max_M;
+    ctx.h_dY_scaled = (float*)malloc((size_t)ctx.h_dY_scaled_size * sizeof(float));
 
     /* Attention backward buffers */
     if (max_seq > 0 && D > 0) {
@@ -656,6 +658,7 @@ void two3_backward_ctx_free(Two3BackwardCtx* ctx) {
     if (ctx->d_W_latent) cudaFree(ctx->d_W_latent);
     if (ctx->d_dW)      cudaFree(ctx->d_dW);
     if (ctx->h_dX_tmp)  free(ctx->h_dX_tmp);
+    if (ctx->h_dY_scaled) free(ctx->h_dY_scaled);
     /* Attention buffers */
     if (ctx->d_attn_Q)       cudaFree(ctx->d_attn_Q);
     if (ctx->d_attn_K)       cudaFree(ctx->d_attn_K);

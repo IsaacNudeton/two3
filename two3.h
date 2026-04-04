@@ -128,6 +128,8 @@ typedef struct {
     float *d_W_latent;  /* [max_M * max_K] device */
     float *d_dW;        /* [max_M * max_K] device */
     float *h_dX_tmp;    /* [max_K] host scratch for accumulate readback */
+    float *h_dY_scaled; /* [max_seq * max_M] host — pre-allocated for sqrt(K) compensation */
+    int    h_dY_scaled_size;
     int    max_M;
     int    max_K;
 
