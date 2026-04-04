@@ -455,6 +455,16 @@ typedef struct {
 #ifdef TWO3_LAYER_SKIP
     LayerSkipState layer_skip;
 #endif
+
+#ifdef TWO3_FP_EMBED
+    int fp_corpus_offset;  /* set by caller before forward_backward */
+    /* Latent weights for fp projections (trainable) */
+    float *fp_latent_Wx, *fp_latent_Wy, *fp_latent_Wz, *fp_latent_Wt;
+    /* Gradient accumulators for fp projections */
+    float *fp_grad_Wx, *fp_grad_Wy, *fp_grad_Wz, *fp_grad_Wt;
+    /* Adam states for fp projections */
+    AdamState fp_adam_Wx, fp_adam_Wy, fp_adam_Wz, fp_adam_Wt;
+#endif
 } TrainableModel;
 
 /* ═══════════════════════════════════════════════════════
@@ -660,6 +670,30 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
 
 #ifdef TWO3_LAYER_SKIP
     layer_skip_init(&tm->layer_skip, L);
+#endif
+
+#ifdef TWO3_FP_EMBED
+    /* Fingerprint projection trainable state */
+    {
+        int qdim = D / 4;
+        int fp_size = qdim * 1024;
+
+        #define INIT_FP_LATENT(name) \
+            tm->fp_latent_##name = (float*)malloc(fp_size * sizeof(float)); \
+            for (int i = 0; i < fp_size; i++) \
+                tm->fp_latent_##name[i] = 0.6f * (2.0f * (float)rand() / RAND_MAX - 1.0f); \
+            tm->fp_grad_##name = (float*)calloc(fp_size, sizeof(float)); \
+            adam_init(&tm->fp_adam_##name, fp_size);
+
+        INIT_FP_LATENT(Wx);
+        INIT_FP_LATENT(Wy);
+        INIT_FP_LATENT(Wz);
+        INIT_FP_LATENT(Wt);
+        #undef INIT_FP_LATENT
+
+        tm->fp_corpus_offset = 0;
+        printf("[init] fp embed: 4 × [%d × 1024] ternary projections\n", qdim);
+    }
 #endif
 
     printf("[init] trainable_model_init complete\n"); fflush(stdout);
@@ -1111,6 +1145,16 @@ static void trainable_zero_grads(TrainableModel *tm) {
         memset(tm->grad_gain_C_attn[l], 0, D * sizeof(float));
         memset(tm->grad_gain_C_ffn[l], 0, D * sizeof(float));
     }
+
+#ifdef TWO3_FP_EMBED
+    {
+        int fp_size = (D / 4) * 1024;
+        memset(tm->fp_grad_Wx, 0, fp_size * sizeof(float));
+        memset(tm->fp_grad_Wy, 0, fp_size * sizeof(float));
+        memset(tm->fp_grad_Wz, 0, fp_size * sizeof(float));
+        memset(tm->fp_grad_Wt, 0, fp_size * sizeof(float));
+    }
+#endif
 }
 
 static void trainable_optimizer_step(TrainableModel *tm) {
@@ -1328,6 +1372,30 @@ static void trainable_optimizer_step(TrainableModel *tm) {
          * collapsing the reservoir. C stays at init value (1.0). */
     }
 
+#ifdef TWO3_FP_EMBED
+    /* Fingerprint projection optimizer — Adam on four ternary projections */
+    {
+        int qdim = D / 4;
+        int fp_size = qdim * 1024;
+
+        clip_grad_norm(tm->fp_grad_Wx, fp_size, GRAD_CLIP_NORM);
+        clip_grad_norm(tm->fp_grad_Wy, fp_size, GRAD_CLIP_NORM);
+        clip_grad_norm(tm->fp_grad_Wz, fp_size, GRAD_CLIP_NORM);
+        clip_grad_norm(tm->fp_grad_Wt, fp_size, GRAD_CLIP_NORM);
+
+        adam_update(tm->fp_latent_Wx, tm->fp_grad_Wx, &tm->fp_adam_Wx, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(tm->fp_latent_Wy, tm->fp_grad_Wy, &tm->fp_adam_Wy, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(tm->fp_latent_Wz, tm->fp_grad_Wz, &tm->fp_adam_Wz, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(tm->fp_latent_Wt, tm->fp_grad_Wt, &tm->fp_adam_Wt, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+
+        /* Requantize fp projections */
+        requantize_gpu(&tm->backward_ctx, tm->fp_latent_Wx, &tm->model.fp_Wx, qdim, 1024, STE_THRESHOLD, NULL);
+        requantize_gpu(&tm->backward_ctx, tm->fp_latent_Wy, &tm->model.fp_Wy, qdim, 1024, STE_THRESHOLD, NULL);
+        requantize_gpu(&tm->backward_ctx, tm->fp_latent_Wz, &tm->model.fp_Wz, qdim, 1024, STE_THRESHOLD, NULL);
+        requantize_gpu(&tm->backward_ctx, tm->fp_latent_Wt, &tm->model.fp_Wt, qdim, 1024, STE_THRESHOLD, NULL);
+    }
+#endif
+
     /* Embedding and final gain — Adam */
     clip_grad_norm(tm->grad_embed, 256 * D, GRAD_CLIP_NORM);
     clip_grad_norm(tm->grad_gain_C_final, D, GRAD_CLIP_NORM);
@@ -1463,9 +1531,29 @@ static TrainResult trainable_forward_backward(
     /* We need to save hidden states BEFORE and AFTER each sublayer */
     float *hidden = (float*)calloc(seq_len * D, sizeof(float));
 
-    /* Embed */
+#ifdef TWO3_FP_EMBED
+    /* Fingerprint embedding: four ternary projections X/Y/Z/T → dim/4 each.
+     * corpus_offset is stored in the dataset — for now, use byte position
+     * from the data pointer offset into the loaded corpus. */
+    {
+        int qdim = D / 4;
+        for (int t = 0; t < seq_len; t++) {
+            /* Look up pre-computed fingerprint for this corpus position.
+             * bytes pointer offset gives us the corpus position. */
+            int corpus_pos = tm->fp_corpus_offset + t;
+            if (corpus_pos >= 0 && corpus_pos < tm->model.fp_corpus_size) {
+                fp_embed_cpu(hidden + t * D, &tm->model, corpus_pos, D);
+            } else {
+                /* Fallback: zero embedding for out-of-range positions */
+                memset(hidden + t * D, 0, D * sizeof(float));
+            }
+        }
+    }
+#else
+    /* Byte embedding: index lookup */
     for (int t = 0; t < seq_len; t++)
         byte_embed_cpu(hidden + t * D, tm->model.embed, bytes[t], D);
+#endif
 
     /* Saved activations per layer (for backprop) */
     typedef struct {
@@ -2170,6 +2258,40 @@ static TrainResult trainable_forward_backward(
          * Caller invokes trainable_optimizer_step after batch. */
     }
 
+#ifdef TWO3_FP_EMBED
+    /* Fingerprint embedding backward: gradients for four ternary projections.
+     * d_hidden[t] → backward through fp_Wx/Wy/Wz/Wt → grad accumulation. */
+    {
+        int qdim = D / 4;
+        for (int t = 0; t < seq_len; t++) {
+            int corpus_pos = tm->fp_corpus_offset + t;
+            if (corpus_pos < 0 || corpus_pos >= tm->model.fp_corpus_size) continue;
+
+            float *fp = tm->model.fp_data + (size_t)corpus_pos * 4096;
+            float *dh = d_hidden + t * D;
+
+            /* Each dimension: dW += dh[qdim_slice] @ fp[1024_slice]^T
+             * (STE: use ternary-quantized latent for dX, raw gradient for dW) */
+            for (int m = 0; m < qdim; m++) {
+                for (int k = 0; k < 1024; k++) {
+                    float g;
+                    /* X projection backward */
+                    g = dh[m] * fp[k];
+                    tm->fp_grad_Wx[m * 1024 + k] += ste_backward(g, tm->fp_latent_Wx[m * 1024 + k]);
+                    /* Y projection backward */
+                    g = dh[qdim + m] * fp[1024 + k];
+                    tm->fp_grad_Wy[m * 1024 + k] += ste_backward(g, tm->fp_latent_Wy[m * 1024 + k]);
+                    /* Z projection backward */
+                    g = dh[2*qdim + m] * fp[2048 + k];
+                    tm->fp_grad_Wz[m * 1024 + k] += ste_backward(g, tm->fp_latent_Wz[m * 1024 + k]);
+                    /* T projection backward */
+                    g = dh[3*qdim + m] * fp[3072 + k];
+                    tm->fp_grad_Wt[m * 1024 + k] += ste_backward(g, tm->fp_latent_Wt[m * 1024 + k]);
+                }
+            }
+        }
+    }
+#else
     /* Embedding gradient: backward through embedding lookup
      * d_embed[byte] += d_hidden[t] for each t where bytes[t] == byte */
     for (int t = 0; t < seq_len; t++) {
@@ -2177,6 +2299,7 @@ static TrainResult trainable_forward_backward(
         for (int d = 0; d < D; d++)
             tm->grad_embed[b * D + d] += d_hidden[t * D + d];
     }
+#endif
 
     /* Adam + requantize deferred to trainable_optimizer_step */
 

@@ -24,6 +24,7 @@ if "%1"=="debug-moon" goto debug_moon
 if "%1"=="gpu-moon" goto gpu_moon
 if "%1"=="gpu-resident" goto gpu_resident
 if "%1"=="gpu-sixq" goto gpu_sixq
+if "%1"=="fp-embed" goto fp_embed
 if "%1"=="verify-moon" goto verify_moon
 if "%1"=="hadamard" goto hadamard
 if "%1"=="hadamard-ablation" goto hadamard
@@ -40,6 +41,11 @@ goto end_verify
 echo  Building hadamard_ablation.exe (host reference, no two3.cu)
 nvcc -O2 -o hadamard_ablation.exe hadamard_ablation.cu
 goto end_hadamard
+
+:fp_embed
+echo  Building FP-EMBED (fingerprint embedding + four ternary projections)
+nvcc -O3 -arch=sm_75 -DTWO3_FP_EMBED -o train_driver.exe train_driver.cu two3.cu
+goto end
 
 :gpu_sixq
 echo  Building GPU-SIXQ (GPU-resident + weighted loss + sparse optim + layer skip)

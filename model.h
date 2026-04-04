@@ -139,66 +139,6 @@ static void byte_embed_cpu(float *out, const float *embed, int byte_val, int dim
     memcpy(out, embed + byte_val * dim, dim * sizeof(float));
 }
 
-#ifdef TWO3_FP_EMBED
-/* Structural fingerprint embedding — four ternary projections.
- * fp_data points to the pre-computed 4096-bit fingerprint for this position.
- * Projects X(1024), Y(1024), Z(1024), T(1024) → dim/4 each → concat → dim.
- *
- * This replaces byte_embed_cpu. The model sees pre-compiled structure
- * instead of learning character frequencies from scratch. */
-static void fp_embed_cpu(float *out, Model *m, int corpus_pos, int dim) {
-    int qdim = dim / 4;
-    float *fp = m->fp_data + (size_t)corpus_pos * 4096;
-
-    /* Four dimensional projections — each 1024-bit input → dim/4 output */
-    ternary_project_cpu(&m->fp_Wx, fp,        out,            1024);  /* X: bits 0-1023 */
-    ternary_project_cpu(&m->fp_Wy, fp + 1024, out + qdim,     1024);  /* Y: bits 1024-2047 */
-    ternary_project_cpu(&m->fp_Wz, fp + 2048, out + 2*qdim,   1024);  /* Z: bits 2048-3071 */
-    ternary_project_cpu(&m->fp_Wt, fp + 3072, out + 3*qdim,   1024);  /* T: bits 3072-4095 */
-}
-
-/* Load pre-computed fingerprints from .fp file into model.
- * Converts binary BitStream format to float arrays for projection input. */
-static int fp_load(Model *m, const char *fp_path) {
-    FILE *f = fopen(fp_path, "rb");
-    if (!f) return -1;
-
-    /* Read header */
-    uint32_t magic, corpus_size, win_size, fp_bits;
-    fread(&magic, 4, 1, f);
-    fread(&corpus_size, 4, 1, f);
-    fread(&win_size, 4, 1, f);
-    fread(&fp_bits, 4, 1, f);
-
-    if (magic != 0x46503031 || fp_bits != 4096) {
-        fclose(f);
-        return -2;
-    }
-
-    m->fp_corpus_size = (int)corpus_size;
-
-    /* Read raw fingerprints and convert to float */
-    m->fp_data = (float*)malloc((size_t)corpus_size * 4096 * sizeof(float));
-    uint8_t fp_raw[512];  /* 4096 bits = 512 bytes */
-
-    for (int pos = 0; pos < (int)corpus_size; pos++) {
-        fread(fp_raw, 1, 512, f);
-        /* Convert bits to floats: each bit → 0.0 or 1.0 */
-        float *fp_float = m->fp_data + (size_t)pos * 4096;
-        for (int i = 0; i < 4096; i++) {
-            int byte_idx = i / 8;
-            int bit_idx = i % 8;
-            fp_float[i] = (fp_raw[byte_idx] >> bit_idx) & 1 ? 1.0f : 0.0f;
-        }
-    }
-
-    fclose(f);
-    printf("[fp] loaded %s: %d positions, %d bits/pos\n",
-           fp_path, corpus_size, fp_bits);
-    return 0;
-}
-#endif /* TWO3_FP_EMBED */
-
 static void byte_logits_cpu(float *logits, const float *hidden, const float *embed, int dim) {
     for (int b = 0; b < 256; b++) {
         float sum = 0;
@@ -352,6 +292,54 @@ static void ternary_project_cpu(
 ) {
     ternary_project_batch_cpu(W, input, output, 1, dim_in);
 }
+
+#ifdef TWO3_FP_EMBED
+/* ═══════════════════════════════════════════════════════
+ * Fingerprint embedding — four ternary projections
+ *
+ * Pre-compiled structure → dim/4 per XYZT dimension → concat → dim.
+ * Replaces byte_embed_cpu. Model sees structure, not raw bytes.
+ * ═══════════════════════════════════════════════════════ */
+
+static void fp_embed_cpu(float *out, Model *m, int corpus_pos, int dim) {
+    int qdim = dim / 4;
+    float *fp = m->fp_data + (size_t)corpus_pos * 4096;
+
+    ternary_project_cpu(&m->fp_Wx, fp,        out,            1024);
+    ternary_project_cpu(&m->fp_Wy, fp + 1024, out + qdim,     1024);
+    ternary_project_cpu(&m->fp_Wz, fp + 2048, out + 2*qdim,   1024);
+    ternary_project_cpu(&m->fp_Wt, fp + 3072, out + 3*qdim,   1024);
+}
+
+static int fp_load(Model *m, const char *fp_path) {
+    FILE *f = fopen(fp_path, "rb");
+    if (!f) return -1;
+
+    uint32_t magic, corpus_size, win_size, fp_bits;
+    fread(&magic, 4, 1, f);
+    fread(&corpus_size, 4, 1, f);
+    fread(&win_size, 4, 1, f);
+    fread(&fp_bits, 4, 1, f);
+
+    if (magic != 0x46503031 || fp_bits != 4096) { fclose(f); return -2; }
+
+    m->fp_corpus_size = (int)corpus_size;
+    m->fp_data = (float*)malloc((size_t)corpus_size * 4096 * sizeof(float));
+    uint8_t fp_raw[512];
+
+    for (int pos = 0; pos < (int)corpus_size; pos++) {
+        fread(fp_raw, 1, 512, f);
+        float *fp_float = m->fp_data + (size_t)pos * 4096;
+        for (int i = 0; i < 4096; i++) {
+            fp_float[i] = (fp_raw[i / 8] >> (i % 8)) & 1 ? 1.0f : 0.0f;
+        }
+    }
+
+    fclose(f);
+    printf("[fp] loaded %s: %d positions, %d bits/pos\n", fp_path, corpus_size, fp_bits);
+    return 0;
+}
+#endif /* TWO3_FP_EMBED */
 
 /* ═══════════════════════════════════════════════════════
  * MoE expert forward — REAL ternary gate/up/down
@@ -565,10 +553,34 @@ static void model_init(Model *m, ModelConfig cfg) {
 
     /* Final gain norm */
     gain_init(&m->gain_final, D);
+
+#ifdef TWO3_FP_EMBED
+    /* Fingerprint projection weights — four ternary [dim/4 × 1024] */
+    {
+        int qdim = D / 4;
+        float *wx = make_random_ternary(qdim, 1024);
+        m->fp_Wx = two3_pack_weights(wx, qdim, 1024); free(wx);
+        float *wy = make_random_ternary(qdim, 1024);
+        m->fp_Wy = two3_pack_weights(wy, qdim, 1024); free(wy);
+        float *wz = make_random_ternary(qdim, 1024);
+        m->fp_Wz = two3_pack_weights(wz, qdim, 1024); free(wz);
+        float *wt = make_random_ternary(qdim, 1024);
+        m->fp_Wt = two3_pack_weights(wt, qdim, 1024); free(wt);
+        m->fp_data = NULL;
+        m->fp_corpus_size = 0;
+    }
+#endif
 }
 
 static void model_free(Model *m) {
     free(m->embed);
+#ifdef TWO3_FP_EMBED
+    two3_free_weights(&m->fp_Wx);
+    two3_free_weights(&m->fp_Wy);
+    two3_free_weights(&m->fp_Wz);
+    two3_free_weights(&m->fp_Wt);
+    if (m->fp_data) free(m->fp_data);
+#endif
     rope_free(&m->rope);
     for (int l = 0; l < m->cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];

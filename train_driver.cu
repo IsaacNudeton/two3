@@ -256,6 +256,28 @@ int main(int argc, char **argv) {
     trainable_requantize(&tm);
     printf("[init] requantize done\n"); fflush(stdout);
 
+#ifdef TWO3_FP_EMBED
+    /* Load pre-computed fingerprints */
+    {
+        /* Derive .fp path from corpus path: replace extension */
+        char fp_path[256];
+        strncpy(fp_path, argv[1], sizeof(fp_path) - 4);
+        char *dot = strrchr(fp_path, '.');
+        if (dot) strcpy(dot, ".fp");
+        else strcat(fp_path, ".fp");
+
+        printf("[init] loading fingerprints from %s...\n", fp_path); fflush(stdout);
+        int r = fp_load(&tm.model, fp_path);
+        if (r != 0) {
+            printf("  Failed to load fingerprints: %s (error %d)\n", fp_path, r);
+            printf("  Run: ibc_precompute %s %s\n", argv[1], fp_path);
+            return 1;
+        }
+        printf("[init] fingerprints loaded: %d positions\n", tm.model.fp_corpus_size);
+        fflush(stdout);
+    }
+#endif
+
     /* Flip counter on W_q of first layer (representative) */
     int D = mcfg.dim;
     printf("[init] D=%d, W_q=%p\n", D, (void*)tm.layer_weights[0].W_q); fflush(stdout);
@@ -309,6 +331,9 @@ int main(int argc, char **argv) {
 
             for (int b = 0; b < cfg.batch_size && chunk + b < ds.n_chunks; b++) {
                 uint8_t *seq = dataset_get(&ds, chunk + b);
+#ifdef TWO3_FP_EMBED
+                tm.fp_corpus_offset = ds.chunk_offsets[chunk + b];
+#endif
                 TrainResult r = trainable_forward_backward(&tm, seq, cfg.seq_len);
                 batch_loss += r.loss;
                 batch_correct += r.correct;
