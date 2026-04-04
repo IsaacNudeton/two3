@@ -231,6 +231,12 @@ static void ternary_project_batch_cpu(
     two3_dequantize_output(&Y, W, &X, output);
     two3_free_output(&Y);
     two3_free_acts(&X);
+
+    /* Normalize output by 1/sqrt(K) — outside dequant so backward
+     * gradients flow at natural scale through STE. */
+    float inv_sqrt_K = 1.0f / sqrtf((float)dim_in);
+    for (int i = 0; i < S * W->rows; i++)
+        output[i] *= inv_sqrt_K;
 }
 
 /* Multi-projection: quantize input ONCE, project against N weight matrices.
@@ -247,10 +253,16 @@ static void ternary_project_multi_cpu(
     Two3Activations X = two3_quantize_acts(input, S, dim_in);
 
     /* Project against each weight matrix — activations stay on device */
+    float inv_sqrt_K = 1.0f / sqrtf((float)dim_in);
     for (int i = 0; i < N; i++) {
         Two3Output Y = two3_forward(W_list[i], &X);
         two3_dequantize_output(&Y, W_list[i], &X, output_list[i]);
         two3_free_output(&Y);
+
+        /* Normalize output — outside dequant for clean backward */
+        int out_size = S * W_list[i]->rows;
+        for (int j = 0; j < out_size; j++)
+            output_list[i][j] *= inv_sqrt_K;
     }
 
     /* Free quantized activations once */

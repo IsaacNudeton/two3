@@ -503,12 +503,10 @@ void two3_dequantize_output(const Two3Output* Y,
      * So w_float ≈ w_t * absmean
      * Therefore: y_float ≈ acc * (absmax/127) * absmean */
     float w_scale = W->scale;
-    int K = W->cols;  /* input dimension — matmul sums K terms */
-    float inv_sqrt_K = 1.0f / sqrtf((float)K);
 
     for (int s = 0; s < S; s++) {
         float a_scale = scales_host[s] / 127.0f;
-        float combined = a_scale * w_scale * inv_sqrt_K;
+        float combined = a_scale * w_scale;
         for (int m = 0; m < M; m++) {
             y_float[s * M + m] = (float)acc_host[s * M + m] * combined;
         }
