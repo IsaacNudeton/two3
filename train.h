@@ -1350,21 +1350,14 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         adam_update(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_o, tw->grad_Wo, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
 
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            clip_grad_norm(tw->grad_gate[e], INTER * D, GRAD_CLIP_NORM);
-            clip_grad_norm(tw->grad_up[e], INTER * D, GRAD_CLIP_NORM);
-            clip_grad_norm(tw->grad_down[e], D * INTER, GRAD_CLIP_NORM);
-            adam_update(tw->expert_gate[e], tw->grad_gate[e], &tw->adam_gate[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-            adam_update(tw->expert_up[e], tw->grad_up[e], &tw->adam_up[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-            adam_update(tw->expert_down[e], tw->grad_down[e], &tw->adam_down[e], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        }
+        adam_update(tw->W_gate, tw->grad_gate, &tw->adam_gate, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(tw->W_up, tw->grad_up, &tw->adam_up, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update(tw->W_down, tw->grad_down, &tw->adam_down, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
 #endif
 
-        /* Router and gain C — Adam (float weights, not ternary) */
-        clip_grad_norm(tm->grad_router[l], D * MOE_NUM_EXPERTS, GRAD_CLIP_NORM);
+        /* Gain C — frozen */
         clip_grad_norm(tm->grad_gain_C_attn[l], D, GRAD_CLIP_NORM);
         clip_grad_norm(tm->grad_gain_C_ffn[l], D, GRAD_CLIP_NORM);
-        adam_update(ly->moe.router.W, tm->grad_router[l], &tm->adam_router[l], tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         /* C is FROZEN — not updated by Adam.
          * Lean stability proofs (Thm 68a-d) assume fixed C.
          * Making C learnable invalidates the 65× CFL safety margin.
@@ -1427,14 +1420,12 @@ static void trainable_reset_momentum(TrainableModel *tm) {
         memset(tw->adam_Wv.v, 0, KV * D * sizeof(float));
         memset(tw->adam_Wo.m, 0, D * D * sizeof(float));
         memset(tw->adam_Wo.v, 0, D * D * sizeof(float));
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            memset(tw->adam_gate[e].m, 0, INTER * D * sizeof(float));
-            memset(tw->adam_gate[e].v, 0, INTER * D * sizeof(float));
-            memset(tw->adam_up[e].m, 0, INTER * D * sizeof(float));
-            memset(tw->adam_up[e].v, 0, INTER * D * sizeof(float));
-            memset(tw->adam_down[e].m, 0, D * INTER * sizeof(float));
-            memset(tw->adam_down[e].v, 0, D * INTER * sizeof(float));
-        }
+        memset(tw->adam_gate.m, 0, INTER * D * sizeof(float));
+        memset(tw->adam_gate.v, 0, INTER * D * sizeof(float));
+        memset(tw->adam_up.m, 0, INTER * D * sizeof(float));
+        memset(tw->adam_up.v, 0, INTER * D * sizeof(float));
+        memset(tw->adam_down.m, 0, D * INTER * sizeof(float));
+        memset(tw->adam_down.v, 0, D * INTER * sizeof(float));
 #endif
     }
 }
@@ -1476,14 +1467,7 @@ static void trainable_dump_diagnostics(TrainableModel *tm, int step) {
                l, dep_attn / D, min_R_attn, dep_ffn / D, min_R_ffn);
     }
 
-    /* Per-expert routing fractions from reservoir state */
-    for (int l = 0; l < L; l++) {
-        MoERouter *r = &tm->model.layers[l].moe.router;
-        printf("    L%d experts R: [", l);
-        for (int e = 0; e < r->n_experts; e++)
-            printf("%.3f%s", r->R_expert[e], e < r->n_experts - 1 ? " " : "");
-        printf("]\n");
-    }
+    /* (MoE routing diagnostics removed — dense FFN has no router) */
 
     /* Ternary weight entropy per layer (sample W_q):
      * count {-1, 0, +1} fractions, compute H = -sum(p*log2(p)) */
@@ -1592,15 +1576,13 @@ static TrainResult trainable_forward_backward(
         float *v_store;             /* [seq_len × KV] V store */
         float *attn_out;            /* [seq_len × D] attention output */
         float *o_proj;              /* [seq_len × D] after O projection */
-        float *pre_ffn_normed;      /* [seq_len × D] after gain norm, before MoE */
+        float *pre_ffn_normed;      /* [seq_len × D] after gain norm, before FFN */
         float *R_ffn_saved;         /* [D] reservoir state before FFN gain */
-        MoESelection *moe_sel;      /* [seq_len] routing decisions */
-        /* Per-expert saved activations */
-        float *expert_gate_pre;     /* [seq_len × INTER] gate before squared ReLU */
-        float *expert_up_out;       /* [seq_len × INTER] up projection output */
-        float *moe_out;             /* [seq_len × D] MoE output before residual */
-        float *expert1_out;         /* [seq_len × D] expert 1's raw output (for router grad) */
-        int   *selected_experts;    /* [seq_len × MOE_TOP_K] which experts were used */
+        /* Dense FFN saved activations */
+        float *ffn_gate_pre;        /* [seq_len × INTER] gate BEFORE squared ReLU */
+        float *ffn_up_out;          /* [seq_len × INTER] up projection output */
+        float *ffn_h;               /* [seq_len × INTER] gate_activated * up (down input) */
+        float *ffn_out;             /* [seq_len × D] FFN output before residual */
         float *hidden_pre_attn;     /* [seq_len × D] hidden before attention block */
         float *hidden_pre_ffn;      /* [seq_len × D] hidden before FFN block */
     } LayerSaved;
@@ -1645,11 +1627,10 @@ static TrainResult trainable_forward_backward(
         sv->o_proj = (float*)calloc(seq_len * D, sizeof(float));
         sv->pre_ffn_normed = (float*)calloc(seq_len * D, sizeof(float));
         sv->R_ffn_saved = (float*)malloc(D * sizeof(float));
-        sv->moe_sel = (MoESelection*)calloc(seq_len, sizeof(MoESelection));
-        sv->expert_gate_pre = (float*)calloc(seq_len * INTER, sizeof(float));
-        sv->expert_up_out = (float*)calloc(seq_len * INTER, sizeof(float));
-        sv->moe_out = (float*)calloc(seq_len * D, sizeof(float));
-        sv->expert1_out = (float*)calloc(seq_len * D, sizeof(float));
+        sv->ffn_gate_pre = (float*)calloc(seq_len * INTER, sizeof(float));
+        sv->ffn_up_out = (float*)calloc(seq_len * INTER, sizeof(float));
+        sv->ffn_h = (float*)calloc(seq_len * INTER, sizeof(float));
+        sv->ffn_out = (float*)calloc(seq_len * D, sizeof(float));
         sv->hidden_pre_attn = (float*)malloc(seq_len * D * sizeof(float));
         sv->hidden_pre_ffn = (float*)malloc(seq_len * D * sizeof(float));
 
@@ -1713,131 +1694,43 @@ static TrainResult trainable_forward_backward(
         T_START();
         memcpy(sv->R_ffn_saved, ly->gain_ffn.R, D * sizeof(float));
 
-        /* ── MoE block (expert-grouped batched projections) ── */
+        /* ── Dense FFN block ── */
 
-        /* Step 7: Gain norm all positions (sequential) */
+        /* Step 7: Gain norm all positions */
         for (int t = 0; t < seq_len; t++)
             gain_forward_cpu(sv->pre_ffn_normed + t * D, hidden + t * D,
                              ly->gain_ffn.R, ly->gain_ffn.C, D);
 
-        /* Step 8: Route all positions */
-        for (int t = 0; t < seq_len; t++)
-            moe_route(&ly->moe.router, sv->pre_ffn_normed + t * D, &sv->moe_sel[t]);
-
-        /* Step 9: Expert-grouped forward — gather, batch, scatter.
-         * For each expert: gather positions routed to it, batch-project
-         * gate+up+down, scatter outputs back. */
-        memset(sv->moe_out, 0, seq_len * D * sizeof(float));
+        /* Step 8-9: Dense FFN forward with saved activations for backward.
+         * gate + up projections, save pre-activation, squared ReLU, hadamard, down. */
         {
-            /* Group positions by expert (top-K routing) */
-            int *expert_pos_flat = (int*)malloc(MOE_NUM_EXPERTS * seq_len * sizeof(int));
-            #define EP(e, i) expert_pos_flat[(e) * seq_len + (i)]
-            int expert_cnt[MOE_NUM_EXPERTS];
+            /* Gate and Up projections — quantize once, project 2x */
+            const Two3Weights *W_gu[2] = { &ly->ffn.gate, &ly->ffn.up };
+            float *out_gu[2] = { sv->ffn_gate_pre, sv->ffn_up_out };
+            ternary_project_multi_cpu(W_gu, out_gu, sv->pre_ffn_normed, 2, seq_len, D);
 
-            /* Scratch buffers for batched projections */
-            float *gather_in  = (float*)malloc(seq_len * D * sizeof(float));
-            float *gate_batch = (float*)malloc(seq_len * INTER * sizeof(float));
-            float *up_batch   = (float*)malloc(seq_len * INTER * sizeof(float));
-            float *h_expert   = (float*)malloc(seq_len * INTER * sizeof(float));
-            float *down_batch = (float*)malloc(seq_len * D * sizeof(float));
-
-            for (int k_sel = 0; k_sel < MOE_TOP_K; k_sel++) {
-                /* Collect which positions route to each expert for this top-K slot */
-                memset(expert_cnt, 0, sizeof(expert_cnt));
-                for (int t = 0; t < seq_len; t++) {
-                    int eid = sv->moe_sel[t].expert_ids[k_sel];
-                    EP(eid, expert_cnt[eid]++) = t;
-                }
-
-                /* Process each active expert */
-                for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-                    int cnt = expert_cnt[e];
-                    if (cnt == 0) continue;
-
-                    /* Gather: collect input vectors for this expert */
-                    for (int i = 0; i < cnt; i++)
-                        memcpy(gather_in + i * D, sv->pre_ffn_normed + EP(e, i) * D,
-                               D * sizeof(float));
-
-                    /* Batch gate + up — quantize once, project 2x */
-                    {
-                        const Two3Weights *W_gu[2] = { &ly->moe.experts[e].gate, &ly->moe.experts[e].up };
-                        float *out_gu[2] = { gate_batch, up_batch };
-                        ternary_project_multi_cpu(W_gu, out_gu, gather_in, 2, cnt, D);
-                    }
-
-                    /* Scale */
-                    float scale = 1.0f / sqrtf((float)D);
-                    for (int i = 0; i < cnt * INTER; i++) {
-                        gate_batch[i] *= scale;
-                        up_batch[i] *= scale;
-                    }
-
-                    /* Save pre-activation gate + up BEFORE squared ReLU.
-                     * Backward needs original x for dx = (x>0) ? dy*2x : 0. */
-                    if (k_sel == 0) {
-                        for (int i = 0; i < cnt; i++) {
-                            int t = EP(e, i);
-                            memcpy(sv->expert_gate_pre + t * INTER,
-                                   gate_batch + i * INTER, INTER * sizeof(float));
-                            memcpy(sv->expert_up_out + t * INTER,
-                                   up_batch + i * INTER, INTER * sizeof(float));
-                        }
-                    }
-
-                    /* Squared ReLU in-place, then multiply */
-                    for (int i = 0; i < cnt * INTER; i++) {
-                        float g = gate_batch[i];
-                        gate_batch[i] = (g > 0.0f) ? g * g : 0.0f;
-                    }
-                    for (int i = 0; i < cnt * INTER; i++)
-                        h_expert[i] = gate_batch[i] * up_batch[i];
-
-                    /* Batch down projection */
-                    ternary_project_batch_cpu(&ly->moe.experts[e].down,
-                                             h_expert, down_batch, cnt, INTER);
-
-                    /* Scatter outputs + save expert1_out for backward */
-                    for (int i = 0; i < cnt; i++) {
-                        int t = EP(e, i);
-                        float w = sv->moe_sel[t].expert_weights[k_sel];
-                        for (int d = 0; d < D; d++)
-                            sv->moe_out[t * D + d] += w * down_batch[i * D + d];
-
-                        if (k_sel == 0)
-                            memcpy(sv->expert1_out + t * D,
-                                   down_batch + i * D, D * sizeof(float));
-                    }
-                }
-
-                /* Update reservoirs for load balancing (after expert dispatch, before scatter) */
-                moe_update_reservoir(&ly->moe.router, expert_cnt, seq_len);
-
-#ifdef TWO3_DEBUG_MOE
-                if (l == 0) { /* layer 0 only, cheap */
-                    printf("step=%d layer=%d ", tm->step, l);
-                    printf("counts:");
-                    for (int e = 0; e < MOE_NUM_EXPERTS; e++) printf(" %d", expert_cnt[e]);
-                    printf("  R:");
-                    for (int e = 0; e < MOE_NUM_EXPERTS; e++) printf(" %.3f", ly->moe.router.R_expert[e]);
-                    printf("\n");
-                }
-#endif
+            /* Scale before squaring */
+            float scale = 1.0f / sqrtf((float)D);
+            for (int i = 0; i < seq_len * INTER; i++) {
+                sv->ffn_gate_pre[i] *= scale;
+                sv->ffn_up_out[i] *= scale;
             }
 
-            free(expert_pos_flat);
-            #undef EP
-            free(gather_in); free(gate_batch); free(up_batch);
-            free(h_expert); free(down_batch);
+            /* Squared ReLU on gate, then hadamard product → h */
+            for (int i = 0; i < seq_len * INTER; i++) {
+                float g = sv->ffn_gate_pre[i];
+                float ga = (g > 0.0f) ? g * g : 0.0f;
+                sv->ffn_h[i] = ga * sv->ffn_up_out[i];
+            }
+
+            /* Down projection */
+            ternary_project_batch_cpu(&ly->ffn.down, sv->ffn_h, sv->ffn_out, seq_len, INTER);
         }
 
-        /* Step 10: Residual add (scaled by 1/sqrt(D) like attention) */
-        {
-            float moe_s = res_scale;
-            for (int t = 0; t < seq_len; t++)
-                for (int i = 0; i < D; i++)
-                    hidden[t * D + i] += moe_s * sv->moe_out[t * D + i];
-        }
+        /* Step 10: Residual add */
+        for (int t = 0; t < seq_len; t++)
+            for (int i = 0; i < D; i++)
+                hidden[t * D + i] += res_scale * sv->ffn_out[t * D + i];
 
         T_ACC(_ms_moe_fwd);
 
@@ -2032,8 +1925,8 @@ static TrainResult trainable_forward_backward(
             free(sv->q_all); free(sv->k_store); free(sv->v_store);
             free(sv->attn_out); free(sv->o_proj);
             free(sv->pre_ffn_normed); free(sv->R_ffn_saved);
-            free(sv->moe_sel); free(sv->expert_gate_pre); free(sv->expert_up_out);
-            free(sv->moe_out); free(sv->expert1_out);
+            free(sv->ffn_gate_pre); free(sv->ffn_up_out);
+            free(sv->ffn_h); free(sv->ffn_out);
             free(sv->hidden_pre_attn); free(sv->hidden_pre_ffn);
             tm->layer_skip.total_skipped++;
             continue;
@@ -2052,137 +1945,76 @@ static TrainResult trainable_forward_backward(
         float *dW_k = tw->grad_Wk;
         float *dW_v = tw->grad_Wv;
         float *dW_o = tw->grad_Wo;
-        float *dW_gate[MOE_NUM_EXPERTS], *dW_up[MOE_NUM_EXPERTS], *dW_down[MOE_NUM_EXPERTS];
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            dW_gate[e] = tw->grad_gate[e];
-            dW_up[e]   = tw->grad_up[e];
-            dW_down[e] = tw->grad_down[e];
-        }
+        float *dW_gate = tw->grad_gate;
+        float *dW_up   = tw->grad_up;
+        float *dW_down = tw->grad_down;
 
-        /* ── Backward through FFN block (expert-grouped) ── */
+        /* ── Backward through dense FFN block ── */
         T_START();
         {
             float scale = 1.0f / sqrtf((float)D);
 
-            /* Step 10 backward: d_moe_out_all = (res_scale/sqrt(D)) * d_hidden */
-            float moe_s = res_scale;
-            float *d_moe_out_all = (float*)malloc(seq_len * D * sizeof(float));
+            /* Step 10 backward: d_ffn_out = res_scale * d_hidden */
+            float *d_ffn_out = (float*)malloc(seq_len * D * sizeof(float));
             for (int i = 0; i < seq_len * D; i++)
-                d_moe_out_all[i] = moe_s * d_hidden[i];
+                d_ffn_out[i] = res_scale * d_hidden[i];
 
-            /* d_normed_ffn_all accumulates gradients from expert backward + router */
+            /* d_normed_ffn_all accumulates gradient flowing back through FFN to gain */
             float *d_normed_ffn_all = (float*)calloc(seq_len * D, sizeof(float));
 
-            /* Group positions by top-1 expert for backward */
-            int *expert_pos_flat = (int*)malloc(MOE_NUM_EXPERTS * seq_len * sizeof(int));
-            #define EPB(e, i) expert_pos_flat[(e) * seq_len + (i)]
-            int expert_cnt[MOE_NUM_EXPERTS];
-            memset(expert_cnt, 0, sizeof(expert_cnt));
+            /* Dense FFN backward:
+             * 1. d_h = d_ffn_out @ W_down^T  (backward through down projection)
+             * 2. d_gate_activated = d_h * up_out, d_up = d_h * gate_activated
+             * 3. d_gate_pre = d_gate_activated * squared_relu_backward
+             * 4. d_normed_gate = d_gate_pre @ W_gate^T
+             * 5. d_normed_up = d_up @ W_up^T
+             * 6. d_normed = d_normed_gate + d_normed_up
+             * Plus weight gradients: dW_down, dW_gate, dW_up */
 
-            for (int t = 0; t < seq_len; t++) {
-                int eid = sv->moe_sel[t].expert_ids[0];
-                EPB(eid, expert_cnt[eid]++) = t;
+            /* Step 1: backward through down projection */
+            float *d_h = (float*)calloc(seq_len * INTER, sizeof(float));
+            ternary_project_backward_gpu_batch(&tm->backward_ctx,
+                &ly->ffn.down, d_ffn_out, sv->ffn_h, tw->W_down,
+                d_h, dW_down, seq_len, D, INTER);
+
+            /* Step 2-3: backward through hadamard product + squared ReLU */
+            float *d_gate_pre = (float*)malloc(seq_len * INTER * sizeof(float));
+            float *d_up = (float*)malloc(seq_len * INTER * sizeof(float));
+            for (int i = 0; i < seq_len * INTER; i++) {
+                float gate_pre = sv->ffn_gate_pre[i];
+                float up_val = sv->ffn_up_out[i];
+                float gate_act = (gate_pre > 0.0f) ? gate_pre * gate_pre : 0.0f;
+
+                /* d_gate_activated = d_h * up_val */
+                float d_gate_act = d_h[i] * up_val;
+                /* d_up = d_h * gate_activated */
+                d_up[i] = d_h[i] * gate_act * scale;
+
+                /* squared ReLU backward: d_gate_pre = d_gate_act * 2*gate_pre (if > 0) */
+                d_gate_pre[i] = (gate_pre > 0.0f) ? d_gate_act * 2.0f * gate_pre * scale : 0.0f;
             }
+            free(d_h);
 
-            /* Scratch buffers for batched backward */
-            float *g_d_expert_out = (float*)malloc(seq_len * D * sizeof(float));
-            float *g_h_expert     = (float*)malloc(seq_len * INTER * sizeof(float));
-            float *g_d_h_expert   = (float*)calloc(seq_len * INTER, sizeof(float));
-            float *g_d_gate       = (float*)malloc(seq_len * INTER * sizeof(float));
-            float *g_d_up         = (float*)malloc(seq_len * INTER * sizeof(float));
-            float *g_normed_in    = (float*)malloc(seq_len * D * sizeof(float));
-            float *g_d_normed_out = (float*)calloc(seq_len * D, sizeof(float));
+            /* Step 4: backward through gate projection */
+            float *d_normed_gate = (float*)calloc(seq_len * D, sizeof(float));
+            ternary_project_backward_gpu_batch(&tm->backward_ctx,
+                &ly->ffn.gate, d_gate_pre, sv->pre_ffn_normed, tw->W_gate,
+                d_normed_gate, dW_gate, seq_len, INTER, D);
+            free(d_gate_pre);
 
-            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-                int cnt = expert_cnt[e];
-                if (cnt == 0) continue;
+            /* Step 5: backward through up projection */
+            float *d_normed_up = (float*)calloc(seq_len * D, sizeof(float));
+            ternary_project_backward_gpu_batch(&tm->backward_ctx,
+                &ly->ffn.up, d_up, sv->pre_ffn_normed, tw->W_up,
+                d_normed_up, dW_up, seq_len, INTER, D);
+            free(d_up);
 
-                /* Gather: d_expert_out = d_moe_out * w0 */
-                for (int i = 0; i < cnt; i++) {
-                    int t = EPB(e, i);
-                    float w0 = sv->moe_sel[t].expert_weights[0];
-                    for (int d = 0; d < D; d++)
-                        g_d_expert_out[i * D + d] = d_moe_out_all[t * D + d] * w0;
-
-                    /* Recompute h_expert from saved gate_pre and up_out */
-                    float *gate = sv->expert_gate_pre + t * INTER;
-                    float *up   = sv->expert_up_out + t * INTER;
-                    for (int j = 0; j < INTER; j++) {
-                        float gs = gate[j] * scale;
-                        float us = up[j] * scale;
-                        float ga = (gs > 0.0f) ? gs * gs : 0.0f;
-                        g_h_expert[i * INTER + j] = ga * us;
-                    }
-
-                    memcpy(g_normed_in + i * D, sv->pre_ffn_normed + t * D,
-                           D * sizeof(float));
-                }
-
-                /* Batch down backward: [cnt, D] → [cnt, INTER] */
-                memset(g_d_h_expert, 0, cnt * INTER * sizeof(float));
-                ternary_project_backward_gpu_batch(&tm->backward_ctx,
-                    &ly->moe.experts[e].down,
-                    g_d_expert_out, g_h_expert,
-                    tw->expert_down[e],
-                    g_d_h_expert, dW_down[e],
-                    cnt, D, INTER);
-
-                /* CPU: d_gate and d_up from d_h_expert (per element) */
-                for (int i = 0; i < cnt; i++) {
-                    int t = EPB(e, i);
-                    float *gate = sv->expert_gate_pre + t * INTER;
-                    float *up   = sv->expert_up_out + t * INTER;
-                    for (int j = 0; j < INTER; j++) {
-                        float gs = gate[j] * scale;
-                        float us = up[j] * scale;
-                        float ga = (gs > 0.0f) ? gs * gs : 0.0f;
-                        float dh = g_d_h_expert[i * INTER + j];
-                        /* d_gate_act = dh * up_scaled, d_up_scaled = dh * gate_activated */
-                        float d_gate_act = dh * us;
-                        float d_up_scaled = dh * ga;
-                        /* squared_relu backward: d_gate_scaled = (gs > 0) ? d_gate_act * 2*gs : 0 */
-                        float d_gate_scaled = (gs > 0.0f) ? d_gate_act * 2.0f * gs : 0.0f;
-                        /* backward through scaling */
-                        g_d_gate[i * INTER + j] = d_gate_scaled * scale;
-                        g_d_up[i * INTER + j] = d_up_scaled * scale;
-                    }
-                }
-
-                /* Batch gate backward: [cnt, INTER] dY, [cnt, D] X → accumulate dW_gate, d_normed */
-                memset(g_d_normed_out, 0, cnt * D * sizeof(float));
-                ternary_project_backward_gpu_batch(&tm->backward_ctx,
-                    &ly->moe.experts[e].gate,
-                    g_d_gate, g_normed_in,
-                    tw->expert_gate[e],
-                    g_d_normed_out, dW_gate[e],
-                    cnt, INTER, D);
-
-                /* Batch up backward: same pattern, accumulate into same d_normed */
-                ternary_project_backward_gpu_batch(&tm->backward_ctx,
-                    &ly->moe.experts[e].up,
-                    g_d_up, g_normed_in,
-                    tw->expert_up[e],
-                    g_d_normed_out, dW_up[e],
-                    cnt, INTER, D);
-
-                /* Scatter d_normed back to position order */
-                for (int i = 0; i < cnt; i++) {
-                    int t = EPB(e, i);
-                    for (int d = 0; d < D; d++)
-                        d_normed_ffn_all[t * D + d] += g_d_normed_out[i * D + d];
-                }
-            }
-
-            /* Router backward (CPU, per position — cheap) */
-            for (int t = 0; t < seq_len; t++) {
-                float d_expert_w[MOE_TOP_K] = {0};
-                for (int i = 0; i < D; i++)
-                    d_expert_w[0] += d_moe_out_all[t * D + i] * sv->expert1_out[t * D + i];
-                moe_router_backward_cpu(d_expert_w, &sv->moe_sel[t],
-                    sv->pre_ffn_normed + t * D, &ly->moe.router,
-                    d_normed_ffn_all + t * D, tm->grad_router[l]);
-            }
-
+            /* Step 6: combine gate + up gradients into d_normed */
+            for (int i = 0; i < seq_len * D; i++)
+                d_normed_ffn_all[i] = d_normed_gate[i] + d_normed_up[i];
+            free(d_normed_gate);
+            free(d_normed_up);
+            /* (Old MoE backward deleted — replaced with dense FFN above) */
             /* Gain backward per position */
             for (int t = 0; t < seq_len; t++) {
                 float *d_h_pre_ffn = (float*)calloc(D, sizeof(float));
@@ -2194,11 +2026,7 @@ static TrainResult trainable_forward_backward(
                 free(d_h_pre_ffn);
             }
 
-            free(d_moe_out_all); free(d_normed_ffn_all);
-            free(expert_pos_flat);
-            #undef EPB
-            free(g_d_expert_out); free(g_h_expert); free(g_d_h_expert);
-            free(g_d_gate); free(g_d_up); free(g_normed_in); free(g_d_normed_out);
+            free(d_ffn_out); free(d_normed_ffn_all);
         }
 
         T_ACC(_ms_bwd_moe);
@@ -2341,9 +2169,8 @@ static TrainResult trainable_forward_backward(
         free(sv->q_all); free(sv->k_store); free(sv->v_store);
         free(sv->attn_out); free(sv->o_proj);
         free(sv->pre_ffn_normed); free(sv->R_ffn_saved);
-        free(sv->moe_sel);
-        free(sv->expert_gate_pre); free(sv->expert_up_out);
-        free(sv->moe_out); free(sv->expert1_out);
+        free(sv->ffn_gate_pre); free(sv->ffn_up_out);
+        free(sv->ffn_h); free(sv->ffn_out);
         free(sv->hidden_pre_attn); free(sv->hidden_pre_ffn);
     }
     free(saved);
@@ -2414,14 +2241,9 @@ static int trainable_save(const TrainableModel *tm, const char *path) {
         fwrite(tw->W_v, sizeof(float), KV * D, f);
         fwrite(tw->W_o, sizeof(float), D * D, f);
 
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            fwrite(tw->expert_gate[e], sizeof(float), INTER * D, f);
-            fwrite(tw->expert_up[e], sizeof(float), INTER * D, f);
-            fwrite(tw->expert_down[e], sizeof(float), D * INTER, f);
-        }
-
-        /* Router weights */
-        fwrite(tm->model.layers[l].moe.router.W, sizeof(float), D * MOE_NUM_EXPERTS, f);
+        fwrite(tw->W_gate, sizeof(float), INTER * D, f);
+        fwrite(tw->W_up, sizeof(float), INTER * D, f);
+        fwrite(tw->W_down, sizeof(float), D * INTER, f);
 
         /* Gain C */
         fwrite(tm->model.layers[l].gain_attn.C, sizeof(float), D, f);
@@ -2463,13 +2285,10 @@ static int trainable_load(TrainableModel *tm, const char *path) {
         fread(tw->W_v, sizeof(float), KV * D, f);
         fread(tw->W_o, sizeof(float), D * D, f);
 
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            fread(tw->expert_gate[e], sizeof(float), INTER * D, f);
-            fread(tw->expert_up[e], sizeof(float), INTER * D, f);
-            fread(tw->expert_down[e], sizeof(float), D * INTER, f);
-        }
+        fread(tw->W_gate, sizeof(float), INTER * D, f);
+        fread(tw->W_up, sizeof(float), INTER * D, f);
+        fread(tw->W_down, sizeof(float), D * INTER, f);
 
-        fread(tm->model.layers[l].moe.router.W, sizeof(float), D * MOE_NUM_EXPERTS, f);
         fread(tm->model.layers[l].gain_attn.C, sizeof(float), D, f);
         fread(tm->model.layers[l].gain_ffn.C, sizeof(float), D, f);
     }

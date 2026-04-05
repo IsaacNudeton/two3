@@ -221,7 +221,7 @@ int main(int argc, char **argv) {
 
     printf("  Model: dim=%d, layers=%d, heads=%d, kv=%d, inter=%d\n",
            mcfg.dim, mcfg.n_layers, mcfg.n_heads, mcfg.n_kv_heads, mcfg.intermediate);
-    printf("  MoE: %d experts, top-%d\n", MOE_NUM_EXPERTS, MOE_TOP_K);
+    printf("  FFN: dense, intermediate=%d\n", mcfg.intermediate);
     printf("  Seq len: %d bytes\n", cfg.seq_len);
     printf("  LR: %.4f\n", cfg.lr);
 #if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
