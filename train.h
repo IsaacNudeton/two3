@@ -337,8 +337,8 @@ static void adam_update(
          * Without this, Adam's adaptive denominator can teleport
          * a weight past multiple ternary boundaries in one step.
          * One grid cell per tick. Same as FDTD Yee grid. */
-        if (update >  0.33f) update =  0.33f;
-        if (update < -0.33f) update = -0.33f;
+        if (update >  0.1f) update =  0.1f;
+        if (update < -0.1f) update = -0.1f;
         params[i] -= update;
     }
 }

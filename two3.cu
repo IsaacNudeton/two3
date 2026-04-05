@@ -1138,9 +1138,9 @@ __global__ void kernel_adam_update(
     float v_hat = v[i] * bc2;
     float update = lr * m_hat / (sqrtf(v_hat) + eps);
 
-    /* CFL: clamp update to ternary grid spacing (0.33) */
-    if (update >  0.33f) update =  0.33f;
-    if (update < -0.33f) update = -0.33f;
+    /* CFL: clamp update to sub-grid spacing (0.1) — ~3 steps to cross boundary */
+    if (update >  0.1f) update =  0.1f;
+    if (update < -0.1f) update = -0.1f;
     params[i] -= update;
 }
 
