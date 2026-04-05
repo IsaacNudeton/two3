@@ -363,7 +363,7 @@ int main(int argc, char **argv) {
                  * Same as genesis expansion rate — faster where impedance is low. */
                 if (pre_loss < tm.last_requant_loss) {
                     tm.flip_K = tm.flip_K + 2;  /* model absorbed flips, allow more */
-                    if (tm.flip_K > 100) tm.flip_K = 100;
+                    if (tm.flip_K > 20) tm.flip_K = 20;
                 } else {
                     tm.flip_K = tm.flip_K / 2;  /* model struggling, slow down */
                     if (tm.flip_K < 2) tm.flip_K = 2;
