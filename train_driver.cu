@@ -359,13 +359,14 @@ int main(int argc, char **argv) {
                 trainable_requantize(&tm);
                 trainable_reset_momentum(&tm);
 
-                /* Adaptive K: expand if loss improved, contract if not.
-                 * Same as genesis expansion rate — faster where impedance is low. */
+                /* Adaptive K: symmetric walk. +2 on improvement, -2 on regression.
+                 * Grows and shrinks at the same rate — five bad steps undoes five
+                 * good steps, not fifty. No geometric ratchet. */
                 if (pre_loss < tm.last_requant_loss) {
-                    tm.flip_K = tm.flip_K + 2;  /* model absorbed flips, allow more */
+                    tm.flip_K = tm.flip_K + 2;
                     if (tm.flip_K > 20) tm.flip_K = 20;
                 } else {
-                    tm.flip_K = tm.flip_K / 2;  /* model struggling, slow down */
+                    tm.flip_K = tm.flip_K - 2;
                     if (tm.flip_K < 2) tm.flip_K = 2;
                 }
                 tm.last_requant_loss = pre_loss;
