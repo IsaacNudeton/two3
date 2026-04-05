@@ -77,6 +77,9 @@ static void gain_free(GainState *g) {
 
 #ifdef __CUDACC__
 
+/* GPU gain forward: RMS normalize, then reservoir modulate.
+ * Must match gain_forward_cpu exactly. Uses shared memory for RMS reduction.
+ * Launch with ONE block of <=1024 threads, dim <= 1024. */
 __global__ void kernel_gain_forward(
     float       *y,      /* [dim] output */
     const float *x,      /* [dim] input */
@@ -85,25 +88,34 @@ __global__ void kernel_gain_forward(
     int dim,
     float alpha, float beta, float gamma_r, float kappa
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    extern __shared__ float sdata[];
+    int i = threadIdx.x;
     if (i >= dim) return;
 
     float xi = x[i];
-    float E = fabsf(xi);
+
+    /* Step 1: RMS normalization (shared memory reduction) */
+    sdata[i] = xi * xi;
+    __syncthreads();
+    /* Parallel reduction for sum of squares */
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (i < s && i + s < dim) sdata[i] += sdata[i + s];
+        __syncthreads();
+    }
+    float rms = sqrtf(sdata[0] / (float)dim + 1e-8f);
+    float x_norm = xi / rms;
+
+    /* Step 2: Reservoir update on normalized signal */
+    float E = fabsf(x_norm);
     float Ri = R[i];
     float Ci = C[i];
-
-    /* Reservoir update: R' = R + γ(C - R) - κ·R·E */
     float R_new = Ri + gamma_r * (Ci - Ri) - kappa * Ri * E;
-    if (R_new < GAIN_R_MIN) R_new = GAIN_R_MIN;  /* reservoir floor */
+    if (R_new < GAIN_R_MIN) R_new = GAIN_R_MIN;
 
-    /* Amplitude control: y = x · (1 + α·R - β) */
+    /* Step 3: Modulate */
     float gain = 1.0f + alpha * R_new - beta;
-    float yi = xi * gain;
-
-    /* Write back */
+    y[i] = x_norm * gain;
     R[i] = R_new;
-    y[i] = yi;
 }
 
 /* Gain backward: gradient through the gain operation
