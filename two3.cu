@@ -348,13 +348,7 @@ Two3Weights two3_pack_weights(const float* w_float, int rows, int cols) {
         sum_abs += fabs((double)w_float[i]);
     }
     result.scale = (float)(sum_abs / total);
-
-    /* Bake 1/sqrt(K) into weight scale so dequant output is O(1).
-     * This normalizes the forward path WITHOUT affecting the backward —
-     * the STE backward uses raw ternary weights, not dequant.
-     * Same principle as the transmission line: impedance (scale) is
-     * part of the substrate, not the signal. */
-    result.scale /= sqrtf((float)cols);
+    result.scale /= sqrtf((float)cols);  /* 1/sqrt(K) for O(1) output */
 
     if (result.scale < 1e-10f) {
         fprintf(stderr, "two3: weight scale is near zero\n");
