@@ -361,13 +361,12 @@ static int test_memory_footprint(void) {
 
     size_t embed = 256 * D * sizeof(float);
     size_t attn_per_layer = (D*D + KV*D + KV*D + D*D) / 4;  /* ternary packed */
-    size_t moe_router = D * MOE_NUM_EXPERTS * sizeof(float);
-    size_t moe_experts = MOE_NUM_EXPERTS * 3 * (size_t)INTER * D / 4;  /* ternary */
+    size_t ffn_per_layer = 3 * (size_t)INTER * D / 4;  /* ternary gate+up+down */
     size_t gain_per_layer = 2 * D * sizeof(float) * 2;  /* R + C, attn + ffn */
     size_t rope = cfg.max_seq * (cfg.head_dim / 2) * sizeof(float) * 2;
 
     size_t total = embed
-                 + L * (attn_per_layer + moe_router + moe_experts + gain_per_layer)
+                 + L * (attn_per_layer + ffn_per_layer + gain_per_layer)
                  + rope;
 
     printf("  Config: dim=%d, layers=%d, heads=%d, kv=%d, inter=%d\n",
@@ -375,10 +374,8 @@ static int test_memory_footprint(void) {
     printf("  Embedding (256 bytes): %.1f KB\n", embed / 1024.0);
     printf("  Attention (ternary):   %.1f KB × %d = %.1f MB\n",
            attn_per_layer / 1024.0, L, L * attn_per_layer / 1e6);
-    printf("  MoE router (float):    %.1f KB × %d = %.1f KB\n",
-           moe_router / 1024.0, L, L * moe_router / 1024.0);
-    printf("  MoE experts (ternary): %.1f MB × %d = %.1f MB\n",
-           moe_experts / 1e6, L, L * moe_experts / 1e6);
+    printf("  Dense FFN (ternary):   %.1f MB × %d = %.1f MB\n",
+           ffn_per_layer / 1e6, L, L * ffn_per_layer / 1e6);
     printf("  Gain states:           %.1f KB × %d = %.1f KB\n",
            gain_per_layer / 1024.0, L, L * gain_per_layer / 1024.0);
     printf("  RoPE tables:           %.1f KB\n", rope / 1024.0);
@@ -424,10 +421,10 @@ int main(void) {
         printf("\n  Layer 2 verified.\n"
                "  Causal attention: REAL.\n"
                "  Ternary projections: REAL.\n"
-               "  MoE expert forward: REAL.\n"
+               "  Dense FFN forward: REAL.\n"
                "  Position encoding: REAL.\n"
                "  Bytes in. Bytes out. No tokenizer.\n"
-               "  Next: Layer 3 — MoE load balancing.\n"
+               "  Dense FFN. No router. No dispatch.\n"
                "  Then Layer 4 — training with STE.\n\n");
 
     return (passed == total) ? 0 : 1;

@@ -69,8 +69,8 @@ static ModelConfig model_config_medium(void) {
     c.n_heads = 4;
     c.n_kv_heads = 2;
     c.head_dim = 32;
-    c.intermediate = 256;
-    c.n_layers = 4;       /* 4 layers — layer-wise gradient clipping prevents explosion */
+    c.intermediate = 512;  /* 4× dim, dense FFN */
+    c.n_layers = 4;
     c.max_seq = 512;
     c.rope_theta = 1000000.0f;
     return c;
@@ -82,7 +82,7 @@ static ModelConfig model_config_large(void) {
     c.n_heads = 8;
     c.n_kv_heads = 4;
     c.head_dim = 32;
-    c.intermediate = 512;
+    c.intermediate = 1024;  /* 4× dim, dense FFN */
     c.n_layers = 8;
     c.max_seq = 512;
     c.rope_theta = 1000000.0f;

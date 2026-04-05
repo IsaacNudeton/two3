@@ -25,7 +25,10 @@
 #include "gain.h"
 #include "rope.h"
 #include "activation.h"
-#include "moe.h"
+#include "ffn.h"
+#ifdef TWO3_IBC
+#include "ibc.h"
+#endif
 
 #include <string.h>
 #include <float.h>
@@ -70,7 +73,7 @@ static ModelConfig model_config_default(void) {
     c.n_heads = 8;
     c.n_kv_heads = 4;
     c.head_dim = 128;     /* 1024 / 8 */
-    c.intermediate = 2048;
+    c.intermediate = 4096;  /* 4× dim, dense FFN */
     c.n_layers = 12;
     c.max_seq = 4096;
     c.rope_theta = 1000000.0f;
@@ -89,8 +92,8 @@ typedef struct {
     Two3Weights W_o;    /* [dim, dim] ternary */
     GainState   gain_attn;
 
-    /* MoE FFN */
-    MoELayer    moe;
+    /* Dense FFN */
+    DenseFFN    ffn;
     GainState   gain_ffn;
 } ModelLayer;
 
@@ -332,79 +335,6 @@ static int fp_load(Model *m, const char *fp_path) {
 #endif /* TWO3_FP_EMBED */
 
 /* ═══════════════════════════════════════════════════════
- * MoE expert forward — REAL ternary gate/up/down
- *
- * gate = ternary_matmul(x, expert.gate) → squared_relu
- * up   = ternary_matmul(x, expert.up)
- * h    = gate * up
- * out  = ternary_matmul(h, expert.down)
- * ═══════════════════════════════════════════════════════ */
-
-static void moe_expert_forward_real(
-    const MoEExpert *expert,
-    const float *x,          /* [dim] */
-    float *output,           /* [dim] */
-    int dim, int intermediate
-) {
-    float *gate = (float*)malloc(intermediate * sizeof(float));
-    float *up   = (float*)malloc(intermediate * sizeof(float));
-
-    /* Gate + Up share input — quantize once, project 2x */
-    {
-        const Two3Weights *W_gu[2] = { &expert->gate, &expert->up };
-        float *out_gu[2] = { gate, up };
-        ternary_project_multi_cpu(W_gu, out_gu, x, 2, 1, dim);
-    }
-
-    /* Scale BEFORE squared ReLU — critical: squaring amplifies magnitude.
-     * Same pattern as Layer 1 integration test. */
-    float scale = 1.0f / sqrtf((float)dim);
-    for (int i = 0; i < intermediate; i++) {
-        gate[i] *= scale;
-        up[i] *= scale;
-    }
-
-    /* Squared ReLU on gate */
-    squared_relu_cpu(gate, gate, intermediate);
-
-    /* Element-wise: gate * up */
-    for (int i = 0; i < intermediate; i++)
-        gate[i] *= up[i];
-
-    /* Down projection (ternary) */
-    ternary_project_cpu(&expert->down, gate, output, intermediate);
-
-    free(gate);
-    free(up);
-}
-
-/* MoE forward with real expert computation */
-static void moe_forward_real(
-    const MoELayer *moe,
-    const float *x,          /* [dim] */
-    float *output,           /* [dim] */
-    const MoESelection *sel
-) {
-    int D = moe->dim;
-    memset(output, 0, D * sizeof(float));
-
-    float *expert_out = (float*)malloc(D * sizeof(float));
-
-    for (int k = 0; k < MOE_TOP_K; k++) {
-        int eid = sel->expert_ids[k];
-        float w = sel->expert_weights[k];
-
-        moe_expert_forward_real(&moe->experts[eid], x, expert_out,
-                                 D, moe->intermediate);
-
-        for (int i = 0; i < D; i++)
-            output[i] += w * expert_out[i];
-    }
-
-    free(expert_out);
-}
-
-/* ═══════════════════════════════════════════════════════
  * Causal attention — the real thing
  *
  * For position `pos`, attending to positions 0..pos:
@@ -494,11 +424,23 @@ static void model_init(Model *m, ModelConfig cfg) {
     int KV = cfg.n_kv_heads * cfg.head_dim;
     int INTER = cfg.intermediate;
 
+#ifdef TWO3_IBC
+    /* IBC codebook embedding: deterministic, fixed, no trainable params.
+     * Each byte maps to a structured int8 vector, scaled to [-1/127, 1/127]. */
+    m->embed = (float*)malloc(256 * D * sizeof(float));
+    {
+        IBCCodebook cb;
+        ibc_codebook_init(&cb);
+        for (int b = 0; b < 256; b++)
+            ibc_to_float(cb.vectors[b], m->embed + b * D, D);
+    }
+#else
     /* Byte embedding: tiny — 256 × dim */
     m->embed = (float*)malloc(256 * D * sizeof(float));
     float scale = 1.0f / sqrtf((float)D);
     for (int i = 0; i < 256 * D; i++)
         m->embed[i] = scale * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+#endif
 
     /* RoPE */
     rope_init(&m->rope, cfg.head_dim, cfg.max_seq, cfg.rope_theta);
@@ -524,21 +466,16 @@ static void model_init(Model *m, ModelConfig cfg) {
         gain_init(&ly->gain_attn, D);
         gain_init(&ly->gain_ffn, D);
 
-        /* MoE — router (float) + expert weights (ternary) */
-        moe_router_init(&ly->moe.router, D, MOE_NUM_EXPERTS);
-        ly->moe.dim = D;
-        ly->moe.intermediate = INTER;
-
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            float *wg = make_random_ternary(INTER, D);
-            ly->moe.experts[e].gate = two3_pack_weights(wg, INTER, D); free(wg);
-
-            float *wu = make_random_ternary(INTER, D);
-            ly->moe.experts[e].up = two3_pack_weights(wu, INTER, D); free(wu);
-
-            float *wd = make_random_ternary(D, INTER);
-            ly->moe.experts[e].down = two3_pack_weights(wd, D, INTER); free(wd);
-        }
+        /* Dense FFN — gate/up/down ternary */
+        ly->ffn.dim = D;
+        ly->ffn.intermediate = INTER;
+        float *wg = make_random_ternary(INTER, D);
+        ly->ffn.gate = two3_pack_weights(wg, INTER, D); free(wg);
+        float *wu = make_random_ternary(INTER, D);
+        ly->ffn.up = two3_pack_weights(wu, INTER, D); free(wu);
+        float *wd = make_random_ternary(D, INTER);
+        ly->ffn.down = two3_pack_weights(wd, D, INTER); free(wd);
+        dense_ffn_init_buffers(&ly->ffn, cfg.max_seq);
     }
 
     /* Final gain norm */
@@ -580,12 +517,10 @@ static void model_free(Model *m) {
         two3_free_weights(&ly->W_o);
         gain_free(&ly->gain_attn);
         gain_free(&ly->gain_ffn);
-        moe_router_free(&ly->moe.router);
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            two3_free_weights(&ly->moe.experts[e].gate);
-            two3_free_weights(&ly->moe.experts[e].up);
-            two3_free_weights(&ly->moe.experts[e].down);
-        }
+        two3_free_weights(&ly->ffn.gate);
+        two3_free_weights(&ly->ffn.up);
+        two3_free_weights(&ly->ffn.down);
+        dense_ffn_free_buffers(&ly->ffn);
     }
     free(m->layers);
     gain_free(&m->gain_final);
@@ -685,82 +620,23 @@ static void model_forward_sequence_cpu(
 
         /* ── FFN block (expert-grouped batched projections) ── */
 
-        /* Phase 7: gain norm all positions (sequential) */
+        /* Phase 7: gain norm all positions */
         for (int t = 0; t < seq_len; t++)
             gain_forward_cpu(normed_all + t * D, hidden + t * D,
                              ly->gain_ffn.R, ly->gain_ffn.C, D);
 
-        /* Phase 8: route all positions */
-        MoESelection *all_sel = (MoESelection*)malloc(seq_len * sizeof(MoESelection));
-        for (int t = 0; t < seq_len; t++)
-            moe_route(&ly->moe.router, normed_all + t * D, &all_sel[t]);
-
-        /* Phase 9: expert-grouped forward */
+        /* Phase 8: dense FFN — batch all positions */
         {
-            int *expert_pos_flat = (int*)malloc(MOE_NUM_EXPERTS * seq_len * sizeof(int));
-            #define EP(e, i) expert_pos_flat[(e) * seq_len + (i)]
-            int expert_cnt[MOE_NUM_EXPERTS];
-            float *gather_in  = (float*)malloc(seq_len * D * sizeof(float));
-            int INTER = m->cfg.intermediate;
-            float *gate_b     = (float*)malloc(seq_len * INTER * sizeof(float));
-            float *up_b       = (float*)malloc(seq_len * INTER * sizeof(float));
-            float *h_exp      = (float*)malloc(seq_len * INTER * sizeof(float));
-            float *down_b     = (float*)malloc(seq_len * D * sizeof(float));
-            float *moe_result = (float*)calloc(seq_len * D, sizeof(float));
+            float *ffn_out = (float*)malloc(seq_len * D * sizeof(float));
+            dense_ffn_forward_batch(&ly->ffn, normed_all, ffn_out,
+                                     seq_len, D, m->cfg.intermediate);
 
-            for (int k_sel = 0; k_sel < MOE_TOP_K; k_sel++) {
-                memset(expert_cnt, 0, sizeof(expert_cnt));
-                for (int t = 0; t < seq_len; t++) {
-                    int eid = all_sel[t].expert_ids[k_sel];
-                    EP(eid, expert_cnt[eid]++) = t;
-                }
-
-                for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-                    int cnt = expert_cnt[e];
-                    if (cnt == 0) continue;
-
-                    for (int i = 0; i < cnt; i++)
-                        memcpy(gather_in + i * D, normed_all + EP(e, i) * D,
-                               D * sizeof(float));
-
-                    const Two3Weights *W_gu[2] = { &ly->moe.experts[e].gate, &ly->moe.experts[e].up };
-                    float *out_gu[2] = { gate_b, up_b };
-                    ternary_project_multi_cpu(W_gu, out_gu, gather_in, 2, cnt, D);
-
-                    float scale = 1.0f / sqrtf((float)D);
-                    for (int i = 0; i < cnt * INTER; i++) {
-                        gate_b[i] *= scale;
-                        up_b[i] *= scale;
-                    }
-                    for (int i = 0; i < cnt * INTER; i++) {
-                        float g = gate_b[i];
-                        gate_b[i] = (g > 0.0f) ? g * g : 0.0f;
-                    }
-                    for (int i = 0; i < cnt * INTER; i++)
-                        h_exp[i] = gate_b[i] * up_b[i];
-
-                    ternary_project_batch_cpu(&ly->moe.experts[e].down,
-                                             h_exp, down_b, cnt, INTER);
-
-                    for (int i = 0; i < cnt; i++) {
-                        int t = EP(e, i);
-                        float w = all_sel[t].expert_weights[k_sel];
-                        for (int d = 0; d < D; d++)
-                            moe_result[t * D + d] += w * down_b[i * D + d];
-                    }
-                }
-            }
-
+            /* Phase 9: residual add */
             for (int t = 0; t < seq_len; t++)
                 for (int i = 0; i < D; i++)
-                    hidden[t * D + i] += res_scale * moe_result[t * D + i];
-
-            free(expert_pos_flat);
-            #undef EP
-            free(gather_in); free(gate_b); free(up_b);
-            free(h_exp); free(down_b); free(moe_result);
+                    hidden[t * D + i] += res_scale * ffn_out[t * D + i];
+            free(ffn_out);
         }
-        free(all_sel);
 
         /* ═══════════════════════════════════════════════════════
          * Reservoir depletion early exit.
@@ -939,57 +815,18 @@ static void model_forward_cached(
         for (int i = 0; i < D; i++)
             hidden[i] += res_scale * o_proj[i];
 
-        /* FFN block (MoE) */
+        /* FFN block (dense) */
         gain_forward_cpu(normed, hidden, ly->gain_ffn.R, ly->gain_ffn.C, D);
-        MoESelection sel;
-        moe_route(&ly->moe.router, normed, &sel);
 
-        /* Process top-K experts */
-        float *expert_out = (float*)calloc(D, sizeof(float));
-        for (int k = 0; k < MOE_TOP_K; k++) {
-            int e = sel.expert_ids[k];
-            float *gate_h = (float*)malloc(m->cfg.intermediate * sizeof(float));
-            float *up_h = (float*)malloc(m->cfg.intermediate * sizeof(float));
-            float *h = (float*)malloc(m->cfg.intermediate * sizeof(float));
+        float *ffn_out = (float*)malloc(D * sizeof(float));
+        dense_ffn_forward(&ly->ffn, normed, ffn_out, D, m->cfg.intermediate);
 
-            ternary_project_cpu(&ly->moe.experts[e].gate, normed, gate_h, D);
-            ternary_project_cpu(&ly->moe.experts[e].up, normed, up_h, D);
-
-            float scale = 1.0f / sqrtf((float)D);
-            for (int i = 0; i < m->cfg.intermediate; i++) {
-                gate_h[i] *= scale;
-                up_h[i] *= scale;
-            }
-
-            /* Squared ReLU */
-            for (int i = 0; i < m->cfg.intermediate; i++) {
-                float g = gate_h[i];
-                gate_h[i] = (g > 0.0f) ? g * g : 0.0f;
-            }
-
-            /* Hadamard product */
-            for (int i = 0; i < m->cfg.intermediate; i++)
-                h[i] = gate_h[i] * up_h[i];
-
-            /* Down projection */
-            float *down_out = (float*)malloc(D * sizeof(float));
-            ternary_project_cpu(&ly->moe.experts[e].down, h, down_out, m->cfg.intermediate);
-
-            /* Weighted combine (down projection scaled by 1/sqrt(INTER)) */
-            float w = sel.expert_weights[k];
-            float ds = 1.0f / sqrtf((float)m->cfg.intermediate);
-            for (int i = 0; i < D; i++)
-                expert_out[i] += w * ds * down_out[i];
-
-            free(gate_h); free(up_h); free(h); free(down_out);
-        }
-
-        /* Residual add (scaled by 1/sqrt(D) like attention residual) */
+        /* Residual add */
         {
             for (int i = 0; i < D; i++)
-                hidden[i] += res_scale * expert_out[i];
+                hidden[i] += res_scale * ffn_out[i];
         }
-        free(expert_out);
+        free(ffn_out);
     }
 
     /* Final norm + logits */
