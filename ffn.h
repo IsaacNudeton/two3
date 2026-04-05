@@ -118,13 +118,15 @@ static void dense_ffn_forward(
     for (int i = 0; i < intermediate; i++)
         gate_h[i] *= up_h[i];
 
-    /* Down projection */
+    /* Down projection + 1/sqrt(INTER) scale */
     {
         Two3Activations X = two3_quantize_acts(gate_h, 1, intermediate);
         Two3Output Y = two3_forward(&ffn->down, &X);
         two3_dequantize_output(&Y, &ffn->down, &X, output);
         two3_free_output(&Y);
         two3_free_acts(&X);
+        float ds = 1.0f / sqrtf((float)intermediate);
+        for (int i = 0; i < dim; i++) output[i] *= ds;
     }
 }
 
@@ -177,13 +179,15 @@ static void dense_ffn_forward_batch(
     for (int i = 0; i < S * intermediate; i++)
         gate_b[i] *= up_b[i];
 
-    /* Down projection — batch */
+    /* Down projection — batch + 1/sqrt(INTER) scale */
     {
         Two3Activations X = two3_quantize_acts(gate_b, S, intermediate);
         Two3Output Y = two3_forward(&ffn->down, &X);
         two3_dequantize_output(&Y, &ffn->down, &X, output);
         two3_free_output(&Y);
         two3_free_acts(&X);
+        float ds = 1.0f / sqrtf((float)intermediate);
+        for (int i = 0; i < S * dim; i++) output[i] *= ds;
     }
 }
 

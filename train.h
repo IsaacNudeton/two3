@@ -1723,8 +1723,13 @@ static TrainResult trainable_forward_backward(
                 sv->ffn_h[i] = ga * sv->ffn_up_out[i];
             }
 
-            /* Down projection */
+            /* Down projection + scale by 1/sqrt(INTER) */
             ternary_project_batch_cpu(&ly->ffn.down, sv->ffn_h, sv->ffn_out, seq_len, INTER);
+            {
+                float down_scale = 1.0f / sqrtf((float)INTER);
+                for (int i = 0; i < seq_len * D; i++)
+                    sv->ffn_out[i] *= down_scale;
+            }
         }
 
         /* Step 10: Residual add */
@@ -1971,7 +1976,11 @@ static TrainResult trainable_forward_backward(
              * 6. d_normed = d_normed_gate + d_normed_up
              * Plus weight gradients: dW_down, dW_gate, dW_up */
 
-            /* Step 1: backward through down projection */
+            /* Step 1: backward through down projection (include 1/sqrt(INTER) from forward) */
+            float down_scale = 1.0f / sqrtf((float)INTER);
+            for (int i = 0; i < seq_len * D; i++)
+                d_ffn_out[i] *= down_scale;
+
             float *d_h = (float*)calloc(seq_len * INTER, sizeof(float));
             ternary_project_backward_gpu_batch(&tm->backward_ctx,
                 &ly->ffn.down, d_ffn_out, sv->ffn_h, tw->W_down,
