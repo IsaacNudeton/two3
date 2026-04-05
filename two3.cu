@@ -349,6 +349,13 @@ Two3Weights two3_pack_weights(const float* w_float, int rows, int cols) {
     }
     result.scale = (float)(sum_abs / total);
 
+    /* Bake 1/sqrt(K) into weight scale so dequant output is O(1).
+     * This normalizes the forward path WITHOUT affecting the backward —
+     * the STE backward uses raw ternary weights, not dequant.
+     * Same principle as the transmission line: impedance (scale) is
+     * part of the substrate, not the signal. */
+    result.scale /= sqrtf((float)cols);
+
     if (result.scale < 1e-10f) {
         fprintf(stderr, "two3: weight scale is near zero\n");
         result.scale = 1e-10f;
@@ -1129,7 +1136,12 @@ __global__ void kernel_adam_update(
     v[i] = beta2 * v[i] + (1.0f - beta2) * g * g;
     float m_hat = m[i] * bc1;
     float v_hat = v[i] * bc2;
-    params[i] -= lr * m_hat / (sqrtf(v_hat) + eps);
+    float update = lr * m_hat / (sqrtf(v_hat) + eps);
+
+    /* CFL: clamp update to ternary grid spacing (0.33) */
+    if (update >  0.33f) update =  0.33f;
+    if (update < -0.33f) update = -0.33f;
+    params[i] -= update;
 }
 
 #endif /* TWO3_GPU_RESIDENT */

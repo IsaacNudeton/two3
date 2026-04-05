@@ -331,7 +331,15 @@ static void adam_update(
         s->v[i] = beta2 * s->v[i] + (1.0f - beta2) * g * g;
         float m_hat = s->m[i] * b1_corr;
         float v_hat = s->v[i] * b2_corr;
-        params[i] -= lr * m_hat / (sqrtf(v_hat) + eps);
+        float update = lr * m_hat / (sqrtf(v_hat) + eps);
+
+        /* CFL: update cannot exceed ternary grid spacing (0.33).
+         * Without this, Adam's adaptive denominator can teleport
+         * a weight past multiple ternary boundaries in one step.
+         * One grid cell per tick. Same as FDTD Yee grid. */
+        if (update >  0.33f) update =  0.33f;
+        if (update < -0.33f) update = -0.33f;
+        params[i] -= update;
     }
 }
 

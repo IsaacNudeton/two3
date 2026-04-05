@@ -542,6 +542,7 @@ static void requantize_gpu(
     float scale_buf[2];
     cudaMemcpy(scale_buf, ctx->d_dY, 2 * sizeof(float), cudaMemcpyDeviceToHost);
     float scale = scale_buf[0] / (float)total;  /* = nonzero_count / total */
+    scale /= sqrtf((float)cols);  /* bake 1/sqrt(K) into weight scale */
     if (scale < 1e-10f) scale = 1e-10f;
 
     /* Fused quantize + pack on GPU — writes directly to w->packed */

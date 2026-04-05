@@ -236,12 +236,11 @@ int main(int argc, char **argv) {
 
     TrainableModel tm;
     trainable_model_init(&tm, mcfg);
-    /* µP width scaling: lr ∝ 1/dim. Base: lr=3e-3 at dim=128.
-     * The 1/sqrt(K) forward normalization makes gradients 1/sqrt(K) smaller.
-     * Adam handles this once v converges, but the LR needs to match. */
-    tm.lr = cfg.lr * (128.0f / (float)mcfg.dim);
-    printf("  LR (width-scaled): %.6f (base %.4f × 128/%d)\n",
-           tm.lr, cfg.lr, mcfg.dim);
+    /* LR is not width-scaled — the 1/sqrt(K) is baked into weight_scale
+     * in the dequant, not in the signal path. Backward gradients flow
+     * at natural scale. The substrate carries the impedance, not the signal. */
+    tm.lr = cfg.lr;
+    printf("  LR: %.6f\n", tm.lr);
     fflush(stdout);
 
     if (cfg.resume[0]) {
