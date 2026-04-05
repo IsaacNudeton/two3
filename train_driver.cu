@@ -355,8 +355,20 @@ int main(int argc, char **argv) {
             #define REQUANT_INTERVAL 50
             #endif
             if (global_step % REQUANT_INTERVAL == 0) {
+                float pre_loss = batch_loss / actual_batch;
                 trainable_requantize(&tm);
                 trainable_reset_momentum(&tm);
+
+                /* Adaptive K: expand if loss improved, contract if not.
+                 * Same as genesis expansion rate — faster where impedance is low. */
+                if (pre_loss < tm.last_requant_loss) {
+                    tm.flip_K = tm.flip_K + 2;  /* model absorbed flips, allow more */
+                    if (tm.flip_K > 100) tm.flip_K = 100;
+                } else {
+                    tm.flip_K = tm.flip_K / 2;  /* model struggling, slow down */
+                    if (tm.flip_K < 2) tm.flip_K = 2;
+                }
+                tm.last_requant_loss = pre_loss;
             }
             
             TrainResult r;

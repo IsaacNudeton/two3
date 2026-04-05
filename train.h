@@ -460,6 +460,11 @@ typedef struct {
     float **grad_gain_C_ffn;
     float *grad_gain_C_final;
 
+    /* Ternary snapshot for flip metering — stored after each requantize */
+    int8_t **ternary_snapshot;   /* [n_layers][per_layer_params] */
+    int      flip_K;             /* adaptive: max flips per tensor per requantize */
+    float    last_requant_loss;  /* loss at last requantize, for adaptive K */
+
 #ifdef TWO3_LAYER_SKIP
     LayerSkipState layer_skip;
 #endif
@@ -676,6 +681,37 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     }
 #endif
 
+    /* Ternary snapshot for flip metering */
+    {
+        int per_layer = D*D + KV*D + KV*D + D*D
+                      + MOE_NUM_EXPERTS * (INTER*D + INTER*D + D*INTER);
+        tm->ternary_snapshot = (int8_t**)malloc(L * sizeof(int8_t*));
+        for (int l = 0; l < L; l++) {
+            tm->ternary_snapshot[l] = (int8_t*)calloc(per_layer, sizeof(int8_t));
+            /* Init snapshot from initial ternary quantization */
+            TrainableLayerWeights *tw = &tm->layer_weights[l];
+            int off = 0;
+            float *tensors[] = { tw->W_q, tw->W_k, tw->W_v, tw->W_o };
+            int sizes[] = { D*D, KV*D, KV*D, D*D };
+            for (int t = 0; t < 4; t++) {
+                for (int i = 0; i < sizes[t]; i++)
+                    tm->ternary_snapshot[l][off + i] = (tensors[t][i] > 0.33f) ? 1 : (tensors[t][i] < -0.33f) ? -1 : 0;
+                off += sizes[t];
+            }
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                float *et[] = { tw->expert_gate[e], tw->expert_up[e], tw->expert_down[e] };
+                int es[] = { INTER*D, INTER*D, D*INTER };
+                for (int t = 0; t < 3; t++) {
+                    for (int i = 0; i < es[t]; i++)
+                        tm->ternary_snapshot[l][off + i] = (et[t][i] > 0.33f) ? 1 : (et[t][i] < -0.33f) ? -1 : 0;
+                    off += es[t];
+                }
+            }
+        }
+        tm->flip_K = 10;  /* initial: 10 flips per tensor per requantize */
+        tm->last_requant_loss = 100.0f;
+    }
+
 #ifdef TWO3_LAYER_SKIP
     layer_skip_init(&tm->layer_skip, L);
 #endif
@@ -717,70 +753,86 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
 #define MAX_FLIPS_PER_TENSOR 10
 #endif
 
-static void meter_flips(float *latent, int size) {
-    float threshold = 0.33f;  /* STE_THRESHOLD */
+/* Meter flips on a single latent tensor.
+ * Compares current latent ternary against old_ternary snapshot.
+ * Keeps only top-K pending flips (by margin). Rest pushed back.
+ * O(n × log K) via min-heap of size K. */
+static void meter_flips(float *latent, const int8_t *old_ternary, int size, int max_flips) {
+    float threshold = 0.33f;
+    if (max_flips <= 0) max_flips = 1;
 
-    /* Count pending flips and collect margins */
-    typedef struct { int idx; float margin; } FlipCandidate;
-    FlipCandidate *candidates = (FlipCandidate*)malloc(size * sizeof(FlipCandidate));
-    int n_candidates = 0;
+    /* Min-heap of size max_flips: tracks the K largest-margin flips */
+    int *heap_idx = (int*)malloc(max_flips * sizeof(int));
+    float *heap_margin = (float*)malloc(max_flips * sizeof(float));
+    int heap_size = 0;
+    int n_pending = 0;
 
     for (int i = 0; i < size; i++) {
         float w = latent[i];
-        float old_ternary;
-        /* What ternary value would this produce? */
-        if (w > threshold) old_ternary = 1.0f;
-        else if (w < -threshold) old_ternary = -1.0f;
-        else old_ternary = 0.0f;
+        int8_t new_t = (w > threshold) ? 1 : (w < -threshold) ? -1 : 0;
+        if (new_t == old_ternary[i]) continue;
+        n_pending++;
 
-        /* What was it at init (approximately)? We check if it CROSSED a boundary
-         * by seeing if the current ternary differs from what the weight was
-         * initialized as. Actually, we can't know the old ternary from just the
-         * latent. Instead: identify weights near boundaries that are about to flip.
-         * A weight "wants to flip" if it's within a small epsilon of a boundary
-         * but on the new side. */
-        /* Simpler: we can't track old ternary without storing it. Instead,
-         * just limit total non-zero margin: if |w| is barely past threshold,
-         * it's a recent crossing. Sort by margin, keep top K. */
-        float margin;
-        if (w > threshold) margin = w - threshold;
-        else if (w < -threshold) margin = -w - threshold;
-        else continue;  /* in the 0-region, no flip risk */
+        float margin = (new_t != 0) ? (fabsf(w) - threshold) : fabsf(w);
 
-        /* Only count weights that are CLOSE to threshold (recent crossing) */
-        if (margin < 0.5f) {  /* within 0.5 of boundary = recent */
-            candidates[n_candidates].idx = i;
-            candidates[n_candidates].margin = margin;
-            n_candidates++;
-        }
-    }
-
-    if (n_candidates <= MAX_FLIPS_PER_TENSOR) {
-        free(candidates);
-        return;  /* few enough flips, let them all through */
-    }
-
-    /* Sort by margin descending — most confident first */
-    for (int i = 0; i < n_candidates - 1; i++) {
-        for (int j = i + 1; j < n_candidates; j++) {
-            if (candidates[j].margin > candidates[i].margin) {
-                FlipCandidate tmp = candidates[i];
-                candidates[i] = candidates[j];
-                candidates[j] = tmp;
+        if (heap_size < max_flips) {
+            /* Insert into heap */
+            heap_idx[heap_size] = i;
+            heap_margin[heap_size] = margin;
+            heap_size++;
+            /* Sift up */
+            int c = heap_size - 1;
+            while (c > 0) {
+                int p = (c - 1) / 2;
+                if (heap_margin[c] < heap_margin[p]) {
+                    float tm2 = heap_margin[c]; heap_margin[c] = heap_margin[p]; heap_margin[p] = tm2;
+                    int ti = heap_idx[c]; heap_idx[c] = heap_idx[p]; heap_idx[p] = ti;
+                    c = p;
+                } else break;
+            }
+        } else if (margin > heap_margin[0]) {
+            /* Replace min in heap */
+            heap_idx[0] = i;
+            heap_margin[0] = margin;
+            /* Sift down */
+            int p = 0;
+            while (1) {
+                int l = 2*p+1, r = 2*p+2, smallest = p;
+                if (l < heap_size && heap_margin[l] < heap_margin[smallest]) smallest = l;
+                if (r < heap_size && heap_margin[r] < heap_margin[smallest]) smallest = r;
+                if (smallest == p) break;
+                float tm2 = heap_margin[p]; heap_margin[p] = heap_margin[smallest]; heap_margin[smallest] = tm2;
+                int ti = heap_idx[p]; heap_idx[p] = heap_idx[smallest]; heap_idx[smallest] = ti;
+                p = smallest;
             }
         }
     }
 
-    /* Keep top MAX_FLIPS_PER_TENSOR, push the rest back inside boundary */
-    for (int i = MAX_FLIPS_PER_TENSOR; i < n_candidates; i++) {
-        int idx = candidates[i].idx;
-        float w = latent[idx];
-        /* Push back to just inside the boundary */
-        if (w > threshold) latent[idx] = threshold - 0.01f;
-        else if (w < -threshold) latent[idx] = -threshold + 0.01f;
+    if (n_pending <= max_flips) {
+        free(heap_idx); free(heap_margin);
+        return;
     }
 
-    free(candidates);
+    /* Mark allowed flips, push rest back */
+    int8_t *allowed = (int8_t*)calloc(size, sizeof(int8_t));
+    for (int k = 0; k < heap_size; k++) allowed[heap_idx[k]] = 1;
+
+    for (int i = 0; i < size; i++) {
+        if (allowed[i]) continue;
+        float w = latent[i];
+        int8_t new_t = (w > threshold) ? 1 : (w < -threshold) ? -1 : 0;
+        if (new_t == old_ternary[i]) continue;
+        /* Push back: restore to just inside old ternary region */
+        if (old_ternary[i] == 0) {
+            latent[i] = (w > 0) ? threshold - 0.01f : -threshold + 0.01f;
+        } else if (old_ternary[i] == 1) {
+            latent[i] = threshold + 0.01f;
+        } else {
+            latent[i] = -threshold - 0.01f;
+        }
+    }
+
+    free(allowed); free(heap_idx); free(heap_margin);
 }
 
 static void trainable_requantize(TrainableModel *tm) {
@@ -791,17 +843,50 @@ static void trainable_requantize(TrainableModel *tm) {
     /* Re-quantize embedding (it stays float, just sync) */
     memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
 
-    /* Meter flips: only top-K most confident boundary crossings per tensor */
-    for (int l = 0; l < tm->cfg.n_layers; l++) {
-        TrainableLayerWeights *tw = &tm->layer_weights[l];
-        meter_flips(tw->W_q, D * D);
-        meter_flips(tw->W_k, KV * D);
-        meter_flips(tw->W_v, KV * D);
-        meter_flips(tw->W_o, D * D);
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            meter_flips(tw->expert_gate[e], INTER * D);
-            meter_flips(tw->expert_up[e], INTER * D);
-            meter_flips(tw->expert_down[e], D * INTER);
+    /* Meter flips: for each tensor, keep only top-K most confident
+     * boundary crossings. Rest pushed back. O(n log K) per tensor. */
+    {
+        int per_layer = D*D + KV*D + KV*D + D*D
+                      + MOE_NUM_EXPERTS * (INTER*D + INTER*D + D*INTER);
+
+        for (int l = 0; l < tm->cfg.n_layers; l++) {
+            TrainableLayerWeights *tw = &tm->layer_weights[l];
+            int off = 0;
+
+            /* Attention weights */
+            float *tensors[] = { tw->W_q, tw->W_k, tw->W_v, tw->W_o };
+            int sizes[] = { D*D, KV*D, KV*D, D*D };
+            for (int t = 0; t < 4; t++) {
+                meter_flips(tensors[t], tm->ternary_snapshot[l] + off, sizes[t], tm->flip_K);
+                off += sizes[t];
+            }
+
+            /* Expert weights */
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                float *et[] = { tw->expert_gate[e], tw->expert_up[e], tw->expert_down[e] };
+                int es[] = { INTER*D, INTER*D, D*INTER };
+                for (int t = 0; t < 3; t++) {
+                    meter_flips(et[t], tm->ternary_snapshot[l] + off, es[t], tm->flip_K);
+                    off += es[t];
+                }
+            }
+
+            /* Update snapshot after metering */
+            off = 0;
+            for (int t = 0; t < 4; t++) {
+                for (int i = 0; i < sizes[t]; i++)
+                    tm->ternary_snapshot[l][off + i] = (tensors[t][i] > 0.33f) ? 1 : (tensors[t][i] < -0.33f) ? -1 : 0;
+                off += sizes[t];
+            }
+            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+                float *et[] = { tw->expert_gate[e], tw->expert_up[e], tw->expert_down[e] };
+                int es[] = { INTER*D, INTER*D, D*INTER };
+                for (int t = 0; t < 3; t++) {
+                    for (int i = 0; i < es[t]; i++)
+                        tm->ternary_snapshot[l][off + i] = (et[t][i] > 0.33f) ? 1 : (et[t][i] < -0.33f) ? -1 : 0;
+                    off += es[t];
+                }
+            }
         }
     }
 
