@@ -387,30 +387,18 @@ typedef struct {
     float *W_v;     /* [dim × kv_dim] latent */
     float *W_o;     /* [dim × dim] latent */
 
-    /* MoE expert latent weights */
-    float *expert_gate[MOE_NUM_EXPERTS];  /* [intermediate × dim] */
-    float *expert_up[MOE_NUM_EXPERTS];    /* [intermediate × dim] */
-    float *expert_down[MOE_NUM_EXPERTS];  /* [dim × intermediate] */
+    /* Dense FFN latent weights */
+    float *W_gate;  /* [intermediate × dim] */
+    float *W_up;    /* [intermediate × dim] */
+    float *W_down;  /* [dim × intermediate] */
 
-    /* Gradient accumulators (persist across batch for accumulation) */
+    /* Gradient accumulators */
     float *grad_Wq, *grad_Wk, *grad_Wv, *grad_Wo;
-    float *grad_gate[MOE_NUM_EXPERTS];
-    float *grad_up[MOE_NUM_EXPERTS];
-    float *grad_down[MOE_NUM_EXPERTS];
+    float *grad_gate, *grad_up, *grad_down;
 
-#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
-    /* Muon states for ternary weights (momentum only, half memory) */
-    MuonState muon_Wq, muon_Wk, muon_Wv, muon_Wo;
-    MuonState muon_gate[MOE_NUM_EXPERTS];
-    MuonState muon_up[MOE_NUM_EXPERTS];
-    MuonState muon_down[MOE_NUM_EXPERTS];
-#else
-    /* Adam states for ternary weights (default path) */
+    /* Adam states for all ternary weights */
     AdamState adam_Wq, adam_Wk, adam_Wv, adam_Wo;
-    AdamState adam_gate[MOE_NUM_EXPERTS];
-    AdamState adam_up[MOE_NUM_EXPERTS];
-    AdamState adam_down[MOE_NUM_EXPERTS];
-#endif
+    AdamState adam_gate, adam_up, adam_down;
 } TrainableLayerWeights;
 
 typedef struct {
@@ -423,7 +411,6 @@ typedef struct {
 
     /* Adam states for non-ternary params */
     AdamState adam_embed;
-    AdamState *adam_router;   /* [n_layers] for router W */
     AdamState *adam_gain_C_attn;  /* [n_layers] */
     AdamState *adam_gain_C_ffn;   /* [n_layers] */
     AdamState adam_gain_C_final;
@@ -455,7 +442,6 @@ typedef struct {
 
     /* Gradient accumulators for non-STE params */
     float *grad_embed;       /* [256 × dim] */
-    float **grad_router;     /* [n_layers][dim × MOE_NUM_EXPERTS] */
     float **grad_gain_C_attn;
     float **grad_gain_C_ffn;
     float *grad_gain_C_final;
@@ -509,10 +495,8 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
 
     /* Per-layer latent weights and Adam states */
     tm->layer_weights = (TrainableLayerWeights*)calloc(L, sizeof(TrainableLayerWeights));
-    tm->adam_router = (AdamState*)calloc(L, sizeof(AdamState));
     tm->adam_gain_C_attn = (AdamState*)calloc(L, sizeof(AdamState));
     tm->adam_gain_C_ffn = (AdamState*)calloc(L, sizeof(AdamState));
-    tm->grad_router = (float**)calloc(L, sizeof(float*));
     tm->grad_gain_C_attn = (float**)calloc(L, sizeof(float*));
     tm->grad_gain_C_ffn = (float**)calloc(L, sizeof(float*));
 
@@ -563,36 +547,23 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         tw->grad_Wv = (float*)calloc(KV * D, sizeof(float));
         tw->grad_Wo = (float*)calloc(D * D, sizeof(float));
 
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            tw->expert_gate[e] = (float*)malloc(INTER * D * sizeof(float));
-            tw->expert_up[e]   = (float*)malloc(INTER * D * sizeof(float));
-            tw->expert_down[e] = (float*)malloc(D * INTER * sizeof(float));
+        /* Dense FFN latent weights */
+        tw->W_gate = (float*)malloc(INTER * D * sizeof(float));
+        tw->W_up   = (float*)malloc(INTER * D * sizeof(float));
+        tw->W_down = (float*)malloc(D * INTER * sizeof(float));
+        INIT_TERNARY_LATENT(tw->W_gate, INTER * D);
+        INIT_TERNARY_LATENT(tw->W_up, INTER * D);
+        INIT_TERNARY_LATENT(tw->W_down, D * INTER);
+        adam_init(&tw->adam_gate, INTER * D);
+        adam_init(&tw->adam_up, INTER * D);
+        adam_init(&tw->adam_down, D * INTER);
+        tw->grad_gate = (float*)calloc(INTER * D, sizeof(float));
+        tw->grad_up   = (float*)calloc(INTER * D, sizeof(float));
+        tw->grad_down = (float*)calloc(D * INTER, sizeof(float));
 
-            INIT_TERNARY_LATENT(tw->expert_gate[e], INTER * D);
-            INIT_TERNARY_LATENT(tw->expert_up[e], INTER * D);
-            INIT_TERNARY_LATENT(tw->expert_down[e], D * INTER);
-
-#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
-            muon_init(&tw->muon_gate[e], INTER, D);
-            muon_init(&tw->muon_up[e], INTER, D);
-            muon_init(&tw->muon_down[e], D, INTER);
-#else
-            adam_init(&tw->adam_gate[e], INTER * D);
-            adam_init(&tw->adam_up[e], INTER * D);
-            adam_init(&tw->adam_down[e], D * INTER);
-#endif
-
-            tw->grad_gate[e] = (float*)calloc(INTER * D, sizeof(float));
-            tw->grad_up[e]   = (float*)calloc(INTER * D, sizeof(float));
-            tw->grad_down[e] = (float*)calloc(D * INTER, sizeof(float));
-        }
-
-        /* Router and gain Adam states */
-        adam_init(&tm->adam_router[l], D * MOE_NUM_EXPERTS);
+        /* Gain Adam states */
         adam_init(&tm->adam_gain_C_attn[l], D);
         adam_init(&tm->adam_gain_C_ffn[l], D);
-
-        tm->grad_router[l] = (float*)calloc(D * MOE_NUM_EXPERTS, sizeof(float));
         tm->grad_gain_C_attn[l] = (float*)calloc(D, sizeof(float));
         tm->grad_gain_C_ffn[l] = (float*)calloc(D, sizeof(float));
     }
@@ -946,31 +917,19 @@ static void trainable_model_free(TrainableModel *tm) {
         adam_free(&tw->adam_Wv); adam_free(&tw->adam_Wo);
 #endif
 
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            free(tw->expert_gate[e]); free(tw->expert_up[e]); free(tw->expert_down[e]);
-            free(tw->grad_gate[e]); free(tw->grad_up[e]); free(tw->grad_down[e]);
-#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
-            muon_free(&tw->muon_gate[e]); muon_free(&tw->muon_up[e]);
-            muon_free(&tw->muon_down[e]);
-#else
-            adam_free(&tw->adam_gate[e]); adam_free(&tw->adam_up[e]);
-            adam_free(&tw->adam_down[e]);
-#endif
-        }
+        free(tw->W_gate); free(tw->W_up); free(tw->W_down);
+        free(tw->grad_gate); free(tw->grad_up); free(tw->grad_down);
+        adam_free(&tw->adam_gate); adam_free(&tw->adam_up); adam_free(&tw->adam_down);
 
-        adam_free(&tm->adam_router[l]);
         adam_free(&tm->adam_gain_C_attn[l]);
         adam_free(&tm->adam_gain_C_ffn[l]);
-        free(tm->grad_router[l]);
         free(tm->grad_gain_C_attn[l]);
         free(tm->grad_gain_C_ffn[l]);
     }
 
     free(tm->layer_weights);
-    free(tm->adam_router);
     free(tm->adam_gain_C_attn);
     free(tm->adam_gain_C_ffn);
-    free(tm->grad_router);
     free(tm->grad_gain_C_attn);
     free(tm->grad_gain_C_ffn);
 

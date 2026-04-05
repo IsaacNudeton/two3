@@ -1,3 +1,10 @@
 *.exe
 *.t2l4
 train_log.txt
+shakespeare.fp
+shakespeare.ibc
+*.obj
+.xyzt/
+train_default_out.txt
+train_log.txt
+test_train_*.txt
