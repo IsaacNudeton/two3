@@ -598,7 +598,7 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     {
         /* Count total ternary params per layer and overall */
         int per_layer = D*D + KV*D + KV*D + D*D  /* Q,K,V,O */
-                      + MOE_NUM_EXPERTS * (INTER*D + INTER*D + D*INTER);  /* experts */
+                      + INTER*D + INTER*D + D*INTER;  /* gate,up,down */
         tm->total_ternary_params = per_layer * L;
         size_t pool_bytes = (size_t)tm->total_ternary_params * sizeof(float);
 
@@ -621,11 +621,9 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
             cudaMemcpy(d, tw->W_k, KV*D*sizeof(float), cudaMemcpyHostToDevice); d += KV*D;
             cudaMemcpy(d, tw->W_v, KV*D*sizeof(float), cudaMemcpyHostToDevice); d += KV*D;
             cudaMemcpy(d, tw->W_o, D*D*sizeof(float), cudaMemcpyHostToDevice); d += D*D;
-            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-                cudaMemcpy(d, tw->expert_gate[e], INTER*D*sizeof(float), cudaMemcpyHostToDevice); d += INTER*D;
-                cudaMemcpy(d, tw->expert_up[e], INTER*D*sizeof(float), cudaMemcpyHostToDevice); d += INTER*D;
-                cudaMemcpy(d, tw->expert_down[e], D*INTER*sizeof(float), cudaMemcpyHostToDevice); d += D*INTER;
-            }
+            cudaMemcpy(d, tw->W_gate, INTER*D*sizeof(float), cudaMemcpyHostToDevice); d += INTER*D;
+            cudaMemcpy(d, tw->W_up, INTER*D*sizeof(float), cudaMemcpyHostToDevice); d += INTER*D;
+            cudaMemcpy(d, tw->W_down, D*INTER*sizeof(float), cudaMemcpyHostToDevice); d += D*INTER;
             offset += per_layer;
         }
         tm->layer_param_offsets[L] = offset;
@@ -655,7 +653,7 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     /* Ternary snapshot for flip metering */
     {
         int per_layer = D*D + KV*D + KV*D + D*D
-                      + MOE_NUM_EXPERTS * (INTER*D + INTER*D + D*INTER);
+                      + INTER*D + INTER*D + D*INTER;
         tm->ternary_snapshot = (int8_t**)malloc(L * sizeof(int8_t*));
         for (int l = 0; l < L; l++) {
             tm->ternary_snapshot[l] = (int8_t*)calloc(per_layer, sizeof(int8_t));
@@ -669,8 +667,8 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
                     tm->ternary_snapshot[l][off + i] = (tensors[t][i] > 0.33f) ? 1 : (tensors[t][i] < -0.33f) ? -1 : 0;
                 off += sizes[t];
             }
-            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-                float *et[] = { tw->expert_gate[e], tw->expert_up[e], tw->expert_down[e] };
+            {
+                float *et[] = { tw->W_gate, tw->W_up, tw->W_down };
                 int es[] = { INTER*D, INTER*D, D*INTER };
                 for (int t = 0; t < 3; t++) {
                     for (int i = 0; i < es[t]; i++)
@@ -679,7 +677,7 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
                 }
             }
         }
-        tm->flip_K = 10;  /* initial: 10 flips per tensor per requantize */
+        tm->flip_K = 10;
         tm->last_requant_loss = 100.0f;
     }
 
@@ -818,7 +816,7 @@ static void trainable_requantize(TrainableModel *tm) {
      * boundary crossings. Rest pushed back. O(n log K) per tensor. */
     {
         int per_layer = D*D + KV*D + KV*D + D*D
-                      + MOE_NUM_EXPERTS * (INTER*D + INTER*D + D*INTER);
+                      + INTER*D + INTER*D + D*INTER;
 
         for (int l = 0; l < tm->cfg.n_layers; l++) {
             TrainableLayerWeights *tw = &tm->layer_weights[l];
@@ -833,8 +831,8 @@ static void trainable_requantize(TrainableModel *tm) {
             }
 
             /* Expert weights */
-            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-                float *et[] = { tw->expert_gate[e], tw->expert_up[e], tw->expert_down[e] };
+            {
+                float *et[] = { tw->W_gate, tw->W_up, tw->W_down };
                 int es[] = { INTER*D, INTER*D, D*INTER };
                 for (int t = 0; t < 3; t++) {
                     meter_flips(et[t], tm->ternary_snapshot[l] + off, es[t], tm->flip_K);
@@ -849,8 +847,8 @@ static void trainable_requantize(TrainableModel *tm) {
                     tm->ternary_snapshot[l][off + i] = (tensors[t][i] > 0.33f) ? 1 : (tensors[t][i] < -0.33f) ? -1 : 0;
                 off += sizes[t];
             }
-            for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-                float *et[] = { tw->expert_gate[e], tw->expert_up[e], tw->expert_down[e] };
+            {
+                float *et[] = { tw->W_gate, tw->W_up, tw->W_down };
                 int es[] = { INTER*D, INTER*D, D*INTER };
                 for (int t = 0; t < 3; t++) {
                     for (int i = 0; i < es[t]; i++)
@@ -875,25 +873,18 @@ static void trainable_requantize(TrainableModel *tm) {
         requantize_gpu(&tm->backward_ctx, NULL, &ly->W_k, KV, D, STE_THRESHOLD, d); d += KV*D;
         requantize_gpu(&tm->backward_ctx, NULL, &ly->W_v, KV, D, STE_THRESHOLD, d); d += KV*D;
         requantize_gpu(&tm->backward_ctx, NULL, &ly->W_o, D, D, STE_THRESHOLD, d); d += D*D;
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            requantize_gpu(&tm->backward_ctx, NULL, &ly->moe.experts[e].gate, INTER, D, STE_THRESHOLD, d); d += INTER*D;
-            requantize_gpu(&tm->backward_ctx, NULL, &ly->moe.experts[e].up, INTER, D, STE_THRESHOLD, d); d += INTER*D;
-            requantize_gpu(&tm->backward_ctx, NULL, &ly->moe.experts[e].down, D, INTER, STE_THRESHOLD, d); d += D*INTER;
-        }
+        requantize_gpu(&tm->backward_ctx, NULL, &ly->ffn.gate, INTER, D, STE_THRESHOLD, d); d += INTER*D;
+        requantize_gpu(&tm->backward_ctx, NULL, &ly->ffn.up, INTER, D, STE_THRESHOLD, d); d += INTER*D;
+        requantize_gpu(&tm->backward_ctx, NULL, &ly->ffn.down, D, INTER, STE_THRESHOLD, d); d += D*INTER;
 #else
         /* Legacy: upload from host */
         requantize_gpu(&tm->backward_ctx, tw->W_q, &ly->W_q, D, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_k, &ly->W_k, KV, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_v, &ly->W_v, KV, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_o, &ly->W_o, D, D, STE_THRESHOLD, NULL);
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            requantize_gpu(&tm->backward_ctx, tw->expert_gate[e],
-                          &ly->moe.experts[e].gate, INTER, D, STE_THRESHOLD, NULL);
-            requantize_gpu(&tm->backward_ctx, tw->expert_up[e],
-                          &ly->moe.experts[e].up, INTER, D, STE_THRESHOLD, NULL);
-            requantize_gpu(&tm->backward_ctx, tw->expert_down[e],
-                          &ly->moe.experts[e].down, D, INTER, STE_THRESHOLD, NULL);
-        }
+        requantize_gpu(&tm->backward_ctx, tw->W_gate, &ly->ffn.gate, INTER, D, STE_THRESHOLD, NULL);
+        requantize_gpu(&tm->backward_ctx, tw->W_up, &ly->ffn.up, INTER, D, STE_THRESHOLD, NULL);
+        requantize_gpu(&tm->backward_ctx, tw->W_down, &ly->ffn.down, D, INTER, STE_THRESHOLD, NULL);
 #endif
     }
 }
@@ -1166,84 +1157,7 @@ static void causal_attention_backward_cpu(
     free(attn_weights);
 }
 
-/* Backward through MoE router:
- * logits = x @ W, then softmax, then top-2.
- * We need dW and dx. For simplicity, we backprop through
- * the selected experts only (the non-selected get zero gradient). */
-static void moe_router_backward_cpu(
-    const float *d_expert_weights, /* [MOE_TOP_K] gradient on expert weights */
-    const MoESelection *sel,
-    const float *x,                /* [dim] router input */
-    const MoERouter *router,
-    float *dx,                     /* [dim] ACCUMULATE */
-    float *dW                      /* [dim × n_experts] ACCUMULATE */
-) {
-    int D = router->dim;
-    int N = router->n_experts;
-
-    /* Recompute softmax for selected experts */
-    float logits[MOE_NUM_EXPERTS];
-    for (int e = 0; e < N; e++) {
-        float sum = 0;
-        for (int d = 0; d < D; d++)
-            sum += x[d] * router->W[d * N + e];
-        logits[e] = sum;
-    }
-
-    float max_l = logits[0];
-    for (int e = 1; e < N; e++)
-        if (logits[e] > max_l) max_l = logits[e];
-    float probs[MOE_NUM_EXPERTS];
-    float sum_exp = 0;
-    for (int e = 0; e < N; e++) {
-        probs[e] = expf(logits[e] - max_l);
-        sum_exp += probs[e];
-    }
-    for (int e = 0; e < N; e++)
-        probs[e] /= sum_exp;
-
-    /* Renormalized weights: w_k = probs[sel_k] / sum(probs[sel_*])
-     * Backward through renormalization + softmax to get d_logits */
-    float d_logits[MOE_NUM_EXPERTS];
-    memset(d_logits, 0, sizeof(d_logits));
-
-    /* Chain: d_expert_weights → d_probs (through renorm) → d_logits (through softmax) */
-    float sel_sum = 0;
-    for (int k = 0; k < MOE_TOP_K; k++)
-        sel_sum += probs[sel->expert_ids[k]];
-
-    /* d_probs from renormalization */
-    float d_probs[MOE_NUM_EXPERTS];
-    memset(d_probs, 0, sizeof(d_probs));
-    for (int k = 0; k < MOE_TOP_K; k++) {
-        int eid = sel->expert_ids[k];
-        /* w_k = probs[eid] / sel_sum */
-        /* dw_k/d(probs[eid]) = (sel_sum - probs[eid]) / sel_sum^2 */
-        /* dw_k/d(probs[other_sel]) = -probs[eid] / sel_sum^2 */
-        for (int j = 0; j < MOE_TOP_K; j++) {
-            int jid = sel->expert_ids[j];
-            if (jid == eid)
-                d_probs[jid] += d_expert_weights[k] * (sel_sum - probs[eid]) / (sel_sum * sel_sum);
-            else
-                d_probs[jid] += d_expert_weights[k] * (-probs[eid]) / (sel_sum * sel_sum);
-        }
-    }
-
-    /* Backward through softmax: d_logits[e] = probs[e] * (d_probs[e] - sum_j probs[j] * d_probs[j]) */
-    float dot_dp = 0;
-    for (int e = 0; e < N; e++)
-        dot_dp += probs[e] * d_probs[e];
-    for (int e = 0; e < N; e++)
-        d_logits[e] = probs[e] * (d_probs[e] - dot_dp);
-
-    /* d_logits → dW and dx */
-    for (int e = 0; e < N; e++) {
-        for (int d = 0; d < D; d++) {
-            dW[d * N + e] += d_logits[e] * x[d];
-            dx[d] += d_logits[e] * router->W[d * N + e];
-        }
-    }
-}
+/* (MoE router backward deleted — dense FFN has no router) */
 
 /* ═══════════════════════════════════════════════════════
  * Batch training API
@@ -1270,12 +1184,9 @@ static void trainable_zero_grads(TrainableModel *tm) {
         memset(tw->grad_Wk, 0, KV * D * sizeof(float));
         memset(tw->grad_Wv, 0, KV * D * sizeof(float));
         memset(tw->grad_Wo, 0, D * D * sizeof(float));
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            memset(tw->grad_gate[e], 0, INTER * D * sizeof(float));
-            memset(tw->grad_up[e], 0, INTER * D * sizeof(float));
-            memset(tw->grad_down[e], 0, D * INTER * sizeof(float));
-        }
-        memset(tm->grad_router[l], 0, D * MOE_NUM_EXPERTS * sizeof(float));
+        memset(tw->grad_gate, 0, INTER * D * sizeof(float));
+        memset(tw->grad_up, 0, INTER * D * sizeof(float));
+        memset(tw->grad_down, 0, D * INTER * sizeof(float));
         memset(tm->grad_gain_C_attn[l], 0, D * sizeof(float));
         memset(tm->grad_gain_C_ffn[l], 0, D * sizeof(float));
     }
@@ -1309,57 +1220,12 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         clip_grad_norm(tw->grad_Wv, KV * D, GRAD_CLIP_NORM);
         clip_grad_norm(tw->grad_Wo, D * D, GRAD_CLIP_NORM);
 
-        /* ═══════════════════════════════════════════════════════
-         * Optimizer selection:
-         *   TWO3_MUON_GPU     → GPU Newton-Schulz via cuBLAS (fastest)
-         *   TWO3_USE_MUON_TERNARY → CPU Newton-Schulz (slow, debug only)
-         *   default           → SGD (fast, production)
-         * ═══════════════════════════════════════════════════════ */
+        /* Adam on all ternary weights */
+        clip_grad_norm(tw->grad_gate, INTER * D, GRAD_CLIP_NORM);
+        clip_grad_norm(tw->grad_up, INTER * D, GRAD_CLIP_NORM);
+        clip_grad_norm(tw->grad_down, D * INTER, GRAD_CLIP_NORM);
 
-#ifdef TWO3_MUON_GPU
-        /* GPU Muon — Newton-Schulz on GPU via cuBLAS */
-        muon_update_gpu_tensor(&tm->backward_ctx,
-            tw->W_q, tw->grad_Wq, tw->muon_Wq.momentum, D, D,
-            tm->lr, 0.95f, 0.01f);
-        muon_update_gpu_tensor(&tm->backward_ctx,
-            tw->W_k, tw->grad_Wk, tw->muon_Wk.momentum, KV, D,
-            tm->lr, 0.95f, 0.01f);
-        muon_update_gpu_tensor(&tm->backward_ctx,
-            tw->W_v, tw->grad_Wv, tw->muon_Wv.momentum, KV, D,
-            tm->lr, 0.95f, 0.01f);
-        muon_update_gpu_tensor(&tm->backward_ctx,
-            tw->W_o, tw->grad_Wo, tw->muon_Wo.momentum, D, D,
-            tm->lr, 0.95f, 0.01f);
-
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            clip_grad_norm(tw->grad_gate[e], INTER * D, GRAD_CLIP_NORM);
-            clip_grad_norm(tw->grad_up[e], INTER * D, GRAD_CLIP_NORM);
-            clip_grad_norm(tw->grad_down[e], D * INTER, GRAD_CLIP_NORM);
-            muon_update_gpu_tensor(&tm->backward_ctx,
-                tw->expert_gate[e], tw->grad_gate[e], tw->muon_gate[e].momentum,
-                INTER, D, tm->lr, 0.95f, 0.01f);
-            muon_update_gpu_tensor(&tm->backward_ctx,
-                tw->expert_up[e], tw->grad_up[e], tw->muon_up[e].momentum,
-                INTER, D, tm->lr, 0.95f, 0.01f);
-            muon_update_gpu_tensor(&tm->backward_ctx,
-                tw->expert_down[e], tw->grad_down[e], tw->muon_down[e].momentum,
-                D, INTER, tm->lr, 0.95f, 0.01f);
-        }
-#elif defined(TWO3_USE_MUON_TERNARY)
-        /* CPU Muon — Newton-Schulz on CPU (slow, ~100x SGD) */
-        muon_update(tw->W_q, tw->grad_Wq, &tw->muon_Wq, tm->lr, 0.95f, 0.01f);
-        muon_update(tw->W_k, tw->grad_Wk, &tw->muon_Wk, tm->lr, 0.95f, 0.01f);
-        muon_update(tw->W_v, tw->grad_Wv, &tw->muon_Wv, tm->lr, 0.95f, 0.01f);
-        muon_update(tw->W_o, tw->grad_Wo, &tw->muon_Wo, tm->lr, 0.95f, 0.01f);
-
-        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
-            clip_grad_norm(tw->grad_gate[e], INTER * D, GRAD_CLIP_NORM);
-            clip_grad_norm(tw->grad_up[e], INTER * D, GRAD_CLIP_NORM);
-            clip_grad_norm(tw->grad_down[e], D * INTER, GRAD_CLIP_NORM);
-            muon_update(tw->expert_gate[e], tw->grad_gate[e], &tw->muon_gate[e], tm->lr, 0.95f, 0.01f);
-            muon_update(tw->expert_up[e], tw->grad_up[e], &tw->muon_up[e], tm->lr, 0.95f, 0.01f);
-            muon_update(tw->expert_down[e], tw->grad_down[e], &tw->muon_down[e], tm->lr, 0.95f, 0.01f);
-        }
+#if defined(TWO3_GPU_RESIDENT)
 #elif defined(TWO3_GPU_RESIDENT)
         /* GPU-resident Adam: pack layer grads+m+v, bulk H2D, GPU kernels, bulk D2H.
          * Latent weights already on device (d_latent_pool). */
