@@ -1407,10 +1407,38 @@ static void trainable_optimizer_step(TrainableModel *tm) {
     /* Sync embedding */
     memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
 
-    /* Requantize ternary weights.
-     * GPU-resident: latent already on device from GPU Adam kernel.
-     * Legacy: uploads from host via H2D. */
-    trainable_requantize(tm);
+    /* Requantize is now called externally at REQUANT_INTERVAL
+     * for temporal staggering (Yee CFL). See train_driver.cu. */
+}
+
+/* Reset Adam momentum after requantize — old momentum was built
+ * for the pre-flip topology, now stale. Fresh start on new ternary. */
+static void trainable_reset_momentum(TrainableModel *tm) {
+    int D = tm->cfg.dim;
+    int KV = tm->cfg.n_kv_heads * tm->cfg.head_dim;
+    int INTER = tm->cfg.intermediate;
+
+    for (int l = 0; l < tm->cfg.n_layers; l++) {
+        TrainableLayerWeights *tw = &tm->layer_weights[l];
+#if !defined(TWO3_MUON_GPU) && !defined(TWO3_USE_MUON_TERNARY)
+        memset(tw->adam_Wq.m, 0, D * D * sizeof(float));
+        memset(tw->adam_Wq.v, 0, D * D * sizeof(float));
+        memset(tw->adam_Wk.m, 0, KV * D * sizeof(float));
+        memset(tw->adam_Wk.v, 0, KV * D * sizeof(float));
+        memset(tw->adam_Wv.m, 0, KV * D * sizeof(float));
+        memset(tw->adam_Wv.v, 0, KV * D * sizeof(float));
+        memset(tw->adam_Wo.m, 0, D * D * sizeof(float));
+        memset(tw->adam_Wo.v, 0, D * D * sizeof(float));
+        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            memset(tw->adam_gate[e].m, 0, INTER * D * sizeof(float));
+            memset(tw->adam_gate[e].v, 0, INTER * D * sizeof(float));
+            memset(tw->adam_up[e].m, 0, INTER * D * sizeof(float));
+            memset(tw->adam_up[e].v, 0, INTER * D * sizeof(float));
+            memset(tw->adam_down[e].m, 0, D * INTER * sizeof(float));
+            memset(tw->adam_down[e].v, 0, D * INTER * sizeof(float));
+        }
+#endif
+    }
 }
 
 /* ═══════════════════════════════════════════════════════

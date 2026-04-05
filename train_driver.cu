@@ -342,10 +342,22 @@ int main(int argc, char **argv) {
                 actual_batch++;
             }
 
-            /* One optimizer step for the whole batch */
+            /* One optimizer step for the whole batch (latent weights only) */
             trainable_optimizer_step(&tm);
 
             global_step++;
+
+            /* Yee-style temporal staggering: requantize every N steps.
+             * Forward/backward run on frozen ternary topology.
+             * Latent floats move every step. Ternary topology changes atomically.
+             * Adam momentum reset after requantize — old velocity is stale. */
+            #ifndef REQUANT_INTERVAL
+            #define REQUANT_INTERVAL 50
+            #endif
+            if (global_step % REQUANT_INTERVAL == 0) {
+                trainable_requantize(&tm);
+                trainable_reset_momentum(&tm);
+            }
             
             TrainResult r;
             r.loss = batch_loss / actual_batch;
