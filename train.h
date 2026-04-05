@@ -709,6 +709,80 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
 
 /* Re-quantize all latent weights → ternary for the model.
  * Called after init and after each Adam step. */
+/* Meter flips on a single latent weight tensor.
+ * Only the top MAX_FLIPS_PER_TENSOR weights with largest margin past the
+ * ternary boundary are allowed to flip. The rest are clamped back inside.
+ * Crystals, not explosions. */
+#ifndef MAX_FLIPS_PER_TENSOR
+#define MAX_FLIPS_PER_TENSOR 10
+#endif
+
+static void meter_flips(float *latent, int size) {
+    float threshold = 0.33f;  /* STE_THRESHOLD */
+
+    /* Count pending flips and collect margins */
+    typedef struct { int idx; float margin; } FlipCandidate;
+    FlipCandidate *candidates = (FlipCandidate*)malloc(size * sizeof(FlipCandidate));
+    int n_candidates = 0;
+
+    for (int i = 0; i < size; i++) {
+        float w = latent[i];
+        float old_ternary;
+        /* What ternary value would this produce? */
+        if (w > threshold) old_ternary = 1.0f;
+        else if (w < -threshold) old_ternary = -1.0f;
+        else old_ternary = 0.0f;
+
+        /* What was it at init (approximately)? We check if it CROSSED a boundary
+         * by seeing if the current ternary differs from what the weight was
+         * initialized as. Actually, we can't know the old ternary from just the
+         * latent. Instead: identify weights near boundaries that are about to flip.
+         * A weight "wants to flip" if it's within a small epsilon of a boundary
+         * but on the new side. */
+        /* Simpler: we can't track old ternary without storing it. Instead,
+         * just limit total non-zero margin: if |w| is barely past threshold,
+         * it's a recent crossing. Sort by margin, keep top K. */
+        float margin;
+        if (w > threshold) margin = w - threshold;
+        else if (w < -threshold) margin = -w - threshold;
+        else continue;  /* in the 0-region, no flip risk */
+
+        /* Only count weights that are CLOSE to threshold (recent crossing) */
+        if (margin < 0.5f) {  /* within 0.5 of boundary = recent */
+            candidates[n_candidates].idx = i;
+            candidates[n_candidates].margin = margin;
+            n_candidates++;
+        }
+    }
+
+    if (n_candidates <= MAX_FLIPS_PER_TENSOR) {
+        free(candidates);
+        return;  /* few enough flips, let them all through */
+    }
+
+    /* Sort by margin descending — most confident first */
+    for (int i = 0; i < n_candidates - 1; i++) {
+        for (int j = i + 1; j < n_candidates; j++) {
+            if (candidates[j].margin > candidates[i].margin) {
+                FlipCandidate tmp = candidates[i];
+                candidates[i] = candidates[j];
+                candidates[j] = tmp;
+            }
+        }
+    }
+
+    /* Keep top MAX_FLIPS_PER_TENSOR, push the rest back inside boundary */
+    for (int i = MAX_FLIPS_PER_TENSOR; i < n_candidates; i++) {
+        int idx = candidates[i].idx;
+        float w = latent[idx];
+        /* Push back to just inside the boundary */
+        if (w > threshold) latent[idx] = threshold - 0.01f;
+        else if (w < -threshold) latent[idx] = -threshold + 0.01f;
+    }
+
+    free(candidates);
+}
+
 static void trainable_requantize(TrainableModel *tm) {
     int D = tm->cfg.dim;
     int KV = tm->cfg.n_kv_heads * tm->cfg.head_dim;
@@ -716,6 +790,20 @@ static void trainable_requantize(TrainableModel *tm) {
 
     /* Re-quantize embedding (it stays float, just sync) */
     memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
+
+    /* Meter flips: only top-K most confident boundary crossings per tensor */
+    for (int l = 0; l < tm->cfg.n_layers; l++) {
+        TrainableLayerWeights *tw = &tm->layer_weights[l];
+        meter_flips(tw->W_q, D * D);
+        meter_flips(tw->W_k, KV * D);
+        meter_flips(tw->W_v, KV * D);
+        meter_flips(tw->W_o, D * D);
+        for (int e = 0; e < MOE_NUM_EXPERTS; e++) {
+            meter_flips(tw->expert_gate[e], INTER * D);
+            meter_flips(tw->expert_up[e], INTER * D);
+            meter_flips(tw->expert_down[e], D * INTER);
+        }
+    }
 
     /* Fused GPU requantize: latent → ternary → packed in one pass.
      * No malloc/free per matrix. No printf spam. No host round-trip.
