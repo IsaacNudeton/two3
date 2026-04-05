@@ -53,11 +53,7 @@ static TrainConfig default_config(void) {
     c.use_medium = 0;
     c.use_large = 0;
     c.seq_len = 128;
-#if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY) || defined(TWO3_GPU_RESIDENT)
-    c.lr = 1e-3f;       /* conservative — 3e-3 causes gradient explosion at dim=1024 */
-#else
-    c.lr = 3e-3f;
-#endif
+    c.lr = 3e-3f;        /* base LR — width-scaled by 128/dim at init */
     c.epochs = 1;
     c.batch_size = 8;
     c.ckpt_every = 100;
@@ -240,7 +236,13 @@ int main(int argc, char **argv) {
 
     TrainableModel tm;
     trainable_model_init(&tm, mcfg);
-    tm.lr = cfg.lr;
+    /* µP width scaling: lr ∝ 1/dim. Base: lr=3e-3 at dim=128.
+     * The 1/sqrt(K) forward normalization makes gradients 1/sqrt(K) smaller.
+     * Adam handles this once v converges, but the LR needs to match. */
+    tm.lr = cfg.lr * (128.0f / (float)mcfg.dim);
+    printf("  LR (width-scaled): %.6f (base %.4f × 128/%d)\n",
+           tm.lr, cfg.lr, mcfg.dim);
+    fflush(stdout);
 
     if (cfg.resume[0]) {
         int r = trainable_load(&tm, cfg.resume);

@@ -885,15 +885,9 @@ static void ternary_project_backward_gpu_batch(
     float *dX, float *dW_latent,
     int S, int rows, int cols
 ) {
-    /* Compensate for 1/sqrt(K) forward scaling: scale dY back up by sqrt(K)
-     * so weight gradients (dW = dY @ X^T) are at natural scale for the optimizer.
-     * Uses pre-allocated h_dY_scaled buffer from backward ctx. */
-    float sqrt_K = sqrtf((float)cols);
-    float *dY_scaled = ctx->h_dY_scaled;
-    for (int i = 0; i < S * rows; i++)
-        dY_scaled[i] = dY[i] * sqrt_K;
-
-    two3_backward_fast(ctx, W_packed, dY_scaled, X, W_latent, dX, dW_latent,
+    /* No gradient scaling — let 1/sqrt(K) from forward chain rule flow naturally.
+     * Adam is scale-invariant once v-estimate converges. Scale the LR instead. */
+    two3_backward_fast(ctx, W_packed, dY, X, W_latent, dX, dW_latent,
                        S, rows, cols, STE_CLIP);
 }
 
