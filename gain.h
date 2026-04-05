@@ -144,12 +144,25 @@ static void gain_forward_cpu(
     float *y, const float *x, float *R, const float *C,
     int dim
 ) {
+    /* Step 1: NORMALIZE — RMS normalization makes activations O(1).
+     * This is the impedance measurement. Forward stability regardless of dim.
+     * The backward gradient flows through 1/rms which is a SCALAR — same
+     * scale factor for all dimensions, so relative gradient structure preserved. */
+    float rms = 0.0f;
+    for (int i = 0; i < dim; i++) rms += x[i] * x[i];
+    rms = sqrtf(rms / (float)dim + 1e-8f);
+    float inv_rms = 1.0f / rms;
+
+    /* Step 2: MODULATE — reservoir-dependent gain on normalized signal.
+     * This is the impedance transformation. Sets gradient magnitude
+     * independently of forward magnitude. */
     for (int i = 0; i < dim; i++) {
-        float E = fabsf(x[i]);
+        float x_norm = x[i] * inv_rms;  /* O(1) regardless of dim */
+        float E = fabsf(x_norm);
         float R_new = R[i] + GAIN_GAMMA * (C[i] - R[i]) - GAIN_KAPPA * R[i] * E;
         if (R_new < GAIN_R_MIN) R_new = GAIN_R_MIN;
         float gain = 1.0f + GAIN_ALPHA * R_new - GAIN_BETA;
-        y[i] = x[i] * gain;
+        y[i] = x_norm * gain;
         R[i] = R_new;
     }
 }

@@ -348,7 +348,7 @@ Two3Weights two3_pack_weights(const float* w_float, int rows, int cols) {
         sum_abs += fabs((double)w_float[i]);
     }
     result.scale = (float)(sum_abs / total);
-    result.scale /= sqrtf((float)cols);  /* 1/sqrt(K) for O(1) output */
+    /* No 1/sqrt(K) here — gain kernel handles normalization. */
 
     if (result.scale < 1e-10f) {
         fprintf(stderr, "two3: weight scale is near zero\n");
