@@ -347,21 +347,27 @@ int main(int argc, char **argv) {
 
             global_step++;
 
-            /* Yee-style temporal staggering: requantize every N steps.
-             * Forward/backward run on frozen ternary topology.
-             * Latent floats move every step. Ternary topology changes atomically.
-             * Adam momentum reset after requantize — old velocity is stale. */
+            /* Staggered requantize: one layer per cycle.
+             * Instead of updating all layers every 50 steps, update
+             * one layer every 50/n_layers steps. Each layer changes
+             * alone — 3 stable layers absorb the shock from the 1 that changed.
+             * Full sweep takes 50 steps × n_layers cycles. */
             #ifndef REQUANT_INTERVAL
             #define REQUANT_INTERVAL 50
             #endif
             if (global_step % REQUANT_INTERVAL == 0) {
-                float pre_loss = batch_loss / actual_batch;
-                trainable_requantize(&tm);
-                trainable_reset_momentum(&tm);
+                int n_layers = tm.cfg.n_layers;
+                int layer = (global_step / REQUANT_INTERVAL) % n_layers;
 
-                /* Adaptive K: symmetric walk. +2 on improvement, -2 on regression.
-                 * Grows and shrinks at the same rate — five bad steps undoes five
-                 * good steps, not fifty. No geometric ratchet. */
+                /* Sync embedding (always) */
+                memcpy(tm.model.embed, tm.latent_embed, 256 * tm.cfg.dim * sizeof(float));
+
+                /* Requantize + reset momentum for ONE layer */
+                trainable_requantize_layer(&tm, layer);
+                trainable_reset_momentum_layer(&tm, layer);
+
+                /* Adaptive K */
+                float pre_loss = batch_loss / actual_batch;
                 if (pre_loss < tm.last_requant_loss) {
                     tm.flip_K = tm.flip_K + 2;
                     if (tm.flip_K > 20) tm.flip_K = 20;

@@ -889,6 +889,84 @@ static void trainable_requantize(TrainableModel *tm) {
     }
 }
 
+/* Per-layer requantize — only update one layer's ternary weights.
+ * Used with staggered requantize: one layer per cycle instead of all. */
+static void trainable_requantize_layer(TrainableModel *tm, int l) {
+    int D = tm->cfg.dim;
+    int KV = tm->cfg.n_kv_heads * tm->cfg.head_dim;
+    int INTER = tm->cfg.intermediate;
+
+    TrainableLayerWeights *tw = &tm->layer_weights[l];
+    ModelLayer *ly = &tm->model.layers[l];
+
+    /* Meter flips for this layer */
+    {
+        int off = 0;
+        float *tensors[] = { tw->W_q, tw->W_k, tw->W_v, tw->W_o };
+        int sizes[] = { D*D, KV*D, KV*D, D*D };
+        for (int t = 0; t < 4; t++) {
+            meter_flips(tensors[t], tm->ternary_snapshot[l] + off, sizes[t], tm->flip_K);
+            off += sizes[t];
+        }
+        {
+            float *et[] = { tw->W_gate, tw->W_up, tw->W_down };
+            int es[] = { INTER*D, INTER*D, D*INTER };
+            for (int t = 0; t < 3; t++) {
+                meter_flips(et[t], tm->ternary_snapshot[l] + off, es[t], tm->flip_K);
+                off += es[t];
+            }
+        }
+        /* Update snapshot */
+        off = 0;
+        for (int t = 0; t < 4; t++) {
+            for (int i = 0; i < sizes[t]; i++)
+                tm->ternary_snapshot[l][off + i] = (tensors[t][i] > 0.33f) ? 1 : (tensors[t][i] < -0.33f) ? -1 : 0;
+            off += sizes[t];
+        }
+        {
+            float *et[] = { tw->W_gate, tw->W_up, tw->W_down };
+            int es[] = { INTER*D, INTER*D, D*INTER };
+            for (int t = 0; t < 3; t++) {
+                for (int i = 0; i < es[t]; i++)
+                    tm->ternary_snapshot[l][off + i] = (et[t][i] > 0.33f) ? 1 : (et[t][i] < -0.33f) ? -1 : 0;
+                off += es[t];
+            }
+        }
+    }
+
+    /* Requantize this layer's weights */
+    requantize_gpu(&tm->backward_ctx, tw->W_q, &ly->W_q, D, D, STE_THRESHOLD, NULL);
+    requantize_gpu(&tm->backward_ctx, tw->W_k, &ly->W_k, KV, D, STE_THRESHOLD, NULL);
+    requantize_gpu(&tm->backward_ctx, tw->W_v, &ly->W_v, KV, D, STE_THRESHOLD, NULL);
+    requantize_gpu(&tm->backward_ctx, tw->W_o, &ly->W_o, D, D, STE_THRESHOLD, NULL);
+    requantize_gpu(&tm->backward_ctx, tw->W_gate, &ly->ffn.gate, INTER, D, STE_THRESHOLD, NULL);
+    requantize_gpu(&tm->backward_ctx, tw->W_up, &ly->ffn.up, INTER, D, STE_THRESHOLD, NULL);
+    requantize_gpu(&tm->backward_ctx, tw->W_down, &ly->ffn.down, D, INTER, STE_THRESHOLD, NULL);
+}
+
+/* Per-layer momentum reset */
+static void trainable_reset_momentum_layer(TrainableModel *tm, int l) {
+    int D = tm->cfg.dim;
+    int KV = tm->cfg.n_kv_heads * tm->cfg.head_dim;
+    int INTER = tm->cfg.intermediate;
+    TrainableLayerWeights *tw = &tm->layer_weights[l];
+
+    memset(tw->adam_Wq.m, 0, D * D * sizeof(float));
+    memset(tw->adam_Wq.v, 0, D * D * sizeof(float));
+    memset(tw->adam_Wk.m, 0, KV * D * sizeof(float));
+    memset(tw->adam_Wk.v, 0, KV * D * sizeof(float));
+    memset(tw->adam_Wv.m, 0, KV * D * sizeof(float));
+    memset(tw->adam_Wv.v, 0, KV * D * sizeof(float));
+    memset(tw->adam_Wo.m, 0, D * D * sizeof(float));
+    memset(tw->adam_Wo.v, 0, D * D * sizeof(float));
+    memset(tw->adam_gate.m, 0, INTER * D * sizeof(float));
+    memset(tw->adam_gate.v, 0, INTER * D * sizeof(float));
+    memset(tw->adam_up.m, 0, INTER * D * sizeof(float));
+    memset(tw->adam_up.v, 0, INTER * D * sizeof(float));
+    memset(tw->adam_down.m, 0, D * INTER * sizeof(float));
+    memset(tw->adam_down.v, 0, D * INTER * sizeof(float));
+}
+
 static void trainable_model_free(TrainableModel *tm) {
     int L = tm->cfg.n_layers;
 
