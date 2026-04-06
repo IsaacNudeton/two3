@@ -111,20 +111,28 @@ static void monitor_init(TrainMonitor *mon, const unsigned char *corpus, int cor
 
     /* Milestone 0: most common byte (trivial baseline) */
     float top1 = (float)sorted[0] / (float)corpus_size;
-    mon->milestones[0] = (MonMilestone){top1, "TRIVIAL BASELINE (top-1 byte)", 0};
+    mon->milestones[0].threshold = top1;
+    mon->milestones[0].name = "TRIVIAL BASELINE (top-1 byte)";
+    mon->milestones[0].fired = 0;
 
     /* Milestone 1: top-2 bytes (whitespace likely) */
     float top2 = (float)(sorted[0] + sorted[1]) / (float)corpus_size;
-    mon->milestones[1] = (MonMilestone){top2, "TOP-2 BYTES", 0};
+    mon->milestones[1].threshold = top2;
+    mon->milestones[1].name = "TOP-2 BYTES";
+    mon->milestones[1].fired = 0;
 
     /* Milestone 2: top-5 bytes */
     float top5 = 0;
     for (int i = 0; i < 5 && i < 256; i++) top5 += sorted[i];
     top5 /= (float)corpus_size;
-    mon->milestones[2] = (MonMilestone){top5, "TOP-5 BYTES (real learning)", 0};
+    mon->milestones[2].threshold = top5;
+    mon->milestones[2].name = "TOP-5 BYTES (real learning)";
+    mon->milestones[2].fired = 0;
 
     /* Milestone 3: 50% accuracy */
-    mon->milestones[3] = (MonMilestone){0.50f, "50% ACCURACY", 0};
+    mon->milestones[3].threshold = 0.50f;
+    mon->milestones[3].name = "50% ACCURACY";
+    mon->milestones[3].fired = 0;
 
     mon->n_milestones = 4;
 

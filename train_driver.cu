@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 #include "train.h"
 #include "data.h"
+#include "monitor.h"
 
 /* ═══════════════════════════════════════════════════════
  * Training config
@@ -294,6 +295,19 @@ int main(int argc, char **argv) {
     }
     printf("[init] log file opened\n"); fflush(stdout);
 
+    /* Training monitor — milestone alerts, plateau detection, cascade detection */
+    TrainMonitor mon;
+    monitor_init(&mon, ds.data, (int)ds.total_bytes);
+
+    /* Rolling loss window for match gate (engine pattern 1: match-gated learning)
+     * Only allow topology changes when loss is actually trending down.
+     * Compare current loss to oldest loss in a 20-step window. */
+    #define MATCH_WINDOW 20
+    float loss_ring[MATCH_WINDOW];
+    memset(loss_ring, 0, sizeof(loss_ring));
+    int loss_ring_pos  = 0;
+    int loss_ring_count = 0;
+
     /* ═══════════════════════════════════════════════════════
      * TRAINING LOOP
      * ═══════════════════════════════════════════════════════ */
@@ -349,6 +363,24 @@ int main(int argc, char **argv) {
 
             global_step++;
 
+            /* Update rolling loss ring for match gate */
+            {
+                float cur_loss = batch_loss / (actual_batch > 0 ? actual_batch : 1);
+                loss_ring[loss_ring_pos % MATCH_WINDOW] = cur_loss;
+                loss_ring_pos++;
+                if (loss_ring_count < MATCH_WINDOW) loss_ring_count++;
+            }
+
+            /* Match gate: open only when loss is trending down.
+             * Compare current loss to oldest loss in the window.
+             * If flat or rising, freeze topology — don't allow flips. */
+            int gate_open = 1;
+            if (loss_ring_count >= MATCH_WINDOW) {
+                float oldest  = loss_ring[loss_ring_pos % MATCH_WINDOW];
+                float current = loss_ring[(loss_ring_pos - 1 + MATCH_WINDOW) % MATCH_WINDOW];
+                gate_open = (current < oldest * 0.99f);  /* must improve by >1% over window */
+            }
+
             /* Staggered requantize: one layer per cycle.
              * Instead of updating all layers every 50 steps, update
              * one layer every 50/n_layers steps. Each layer changes
@@ -357,7 +389,7 @@ int main(int argc, char **argv) {
             #ifndef REQUANT_INTERVAL
             #define REQUANT_INTERVAL 50
             #endif
-            if (global_step % REQUANT_INTERVAL == 0) {
+            if (gate_open && global_step % REQUANT_INTERVAL == 0) {
                 int n_layers = tm.cfg.n_layers;
                 int layer = (global_step / REQUANT_INTERVAL) % n_layers;
 
@@ -428,7 +460,7 @@ int main(int argc, char **argv) {
 
                 /* Step 3: COMMIT or REVERT */
                 float pre_loss = batch_loss / actual_batch;
-                if (test_loss <= pre_loss * 1.1f) {
+                if (test_loss <= pre_loss * 1.001f) {
                     /* Verified: loss didn't get significantly worse.
                      * Keep the new topology. Reset momentum. Cool plasticity.
                      * From infer.c: +2 for verified, plasticity -= COOL */
@@ -497,6 +529,10 @@ int main(int argc, char **argv) {
                             flips, fc.total_flips, step_ms);
                     fflush(logf);
                 }
+
+                /* Monitor: milestone alerts, plateau/cascade detection */
+                monitor_step(&mon, global_step, r.loss, accuracy, r.max_grad,
+                             flips, fc.total_flips);
 
                 /* Plateau diagnostics every 10x log_every */
                 if (global_step % (cfg.log_every * 10) == 0)
@@ -570,6 +606,8 @@ int main(int argc, char **argv) {
 #ifdef TWO3_EARLY_EXIT
     printf("  (TWO3_EARLY_EXIT: margin+stable early exit in model_forward_sequence_cpu, seq_len==1 only)\n");
 #endif
+
+    monitor_summary(&mon);
 
     printf("\n============================================\n");
     printf("  Training complete.\n");
