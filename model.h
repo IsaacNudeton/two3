@@ -89,10 +89,17 @@ static ModelConfig model_config_default(void) {
 
 typedef struct {
     /* Attention */
+#ifdef TWO3_BINARY
+    BinaryWeights W_q;  /* [dim, dim] binary */
+    BinaryWeights W_k;  /* [dim, kv_dim] binary */
+    BinaryWeights W_v;  /* [dim, kv_dim] binary */
+    BinaryWeights W_o;  /* [dim, dim] binary */
+#else
     Two3Weights W_q;    /* [dim, dim] ternary */
     Two3Weights W_k;    /* [dim, kv_dim] ternary */
     Two3Weights W_v;    /* [dim, kv_dim] ternary */
     Two3Weights W_o;    /* [dim, dim] ternary */
+#endif
     GainState   gain_attn;
 
     /* Dense FFN */
@@ -453,18 +460,35 @@ static void model_init(Model *m, ModelConfig cfg) {
     for (int l = 0; l < cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];
 
+#ifdef TWO3_BINARY
+        /* Attention weights — binary */
+        {
+            float *wq = (float*)malloc(D * D * sizeof(float));
+            float *wk = (float*)malloc(KV * D * sizeof(float));
+            float *wv = (float*)malloc(KV * D * sizeof(float));
+            float *wo = (float*)malloc(D * D * sizeof(float));
+            for (int i = 0; i < D*D; i++) wq[i] = (float)rand() / (float)RAND_MAX;
+            for (int i = 0; i < KV*D; i++) wk[i] = (float)rand() / (float)RAND_MAX;
+            for (int i = 0; i < KV*D; i++) wv[i] = (float)rand() / (float)RAND_MAX;
+            for (int i = 0; i < D*D; i++) wo[i] = (float)rand() / (float)RAND_MAX;
+            ly->W_q = binary_pack_weights(wq, D, D); free(wq);
+            ly->W_k = binary_pack_weights(wk, KV, D); free(wk);
+            ly->W_v = binary_pack_weights(wv, KV, D); free(wv);
+            ly->W_o = binary_pack_weights(wo, D, D); free(wo);
+        }
+#else
         /* Attention weights — ternary */
-        float *wq = make_random_ternary(D, D);
-        ly->W_q = two3_pack_weights(wq, D, D); free(wq);
-
-        float *wk = make_random_ternary(KV, D);
-        ly->W_k = two3_pack_weights(wk, KV, D); free(wk);
-
-        float *wv = make_random_ternary(KV, D);
-        ly->W_v = two3_pack_weights(wv, KV, D); free(wv);
-
-        float *wo = make_random_ternary(D, D);
-        ly->W_o = two3_pack_weights(wo, D, D); free(wo);
+        {
+            float *wq = make_random_ternary(D, D);
+            ly->W_q = two3_pack_weights(wq, D, D); free(wq);
+            float *wk = make_random_ternary(KV, D);
+            ly->W_k = two3_pack_weights(wk, KV, D); free(wk);
+            float *wv = make_random_ternary(KV, D);
+            ly->W_v = two3_pack_weights(wv, KV, D); free(wv);
+            float *wo = make_random_ternary(D, D);
+            ly->W_o = two3_pack_weights(wo, D, D); free(wo);
+        }
+#endif
 
         gain_init(&ly->gain_attn, D);
         gain_init(&ly->gain_ffn, D);
@@ -531,10 +555,17 @@ static void model_free(Model *m) {
     rope_free(&m->rope);
     for (int l = 0; l < m->cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];
+#ifdef TWO3_BINARY
+        binary_free_weights(&ly->W_q);
+        binary_free_weights(&ly->W_k);
+        binary_free_weights(&ly->W_v);
+        binary_free_weights(&ly->W_o);
+#else
         two3_free_weights(&ly->W_q);
         two3_free_weights(&ly->W_k);
         two3_free_weights(&ly->W_v);
         two3_free_weights(&ly->W_o);
+#endif
         gain_free(&ly->gain_attn);
         gain_free(&ly->gain_ffn);
 #ifdef TWO3_BINARY
@@ -618,11 +649,19 @@ static void model_forward_sequence_cpu(
 
         /* Phase 2: multi-projection Q/K/V — quantize once, project 3x.
          * 1 quantize + 3 GPU matmuls instead of 3 quantize + 3 matmuls. */
+#ifdef TWO3_BINARY
+        {
+            const BinaryWeights *W_qkv[3] = { &ly->W_q, &ly->W_k, &ly->W_v };
+            float *out_qkv[3] = { q_all, k_all, v_all };
+            binary_project_multi_cpu(W_qkv, out_qkv, normed_all, 3, seq_len, D);
+        }
+#else
         {
             const Two3Weights *W_qkv[3] = { &ly->W_q, &ly->W_k, &ly->W_v };
             float *out_qkv[3] = { q_all, k_all, v_all };
             ternary_project_multi_cpu(W_qkv, out_qkv, normed_all, 3, seq_len, D);
         }
+#endif
 
         /* Phase 3: RoPE all positions (CPU, cheap) */
         for (int t = 0; t < seq_len; t++)
@@ -634,7 +673,11 @@ static void model_forward_sequence_cpu(
                                  attn_out_all + t * D, t, NH, NKV, HD);
 
         /* Phase 5: batch O projection — 1 GPU call instead of seq_len */
+#ifdef TWO3_BINARY
+        binary_project_batch_cpu(&ly->W_o, attn_out_all, o_proj_all, seq_len, D);
+#else
         ternary_project_batch_cpu(&ly->W_o, attn_out_all, o_proj_all, seq_len, D);
+#endif
 
         /* Phase 6: scale + residual add (CPU) */
         {
@@ -811,9 +854,15 @@ static void model_forward_cached(
         gain_forward_cpu(normed, hidden, ly->gain_attn.R, ly->gain_attn.C, D);
 
         /* Q/K/V projections — single position */
+#ifdef TWO3_BINARY
+        binary_project_cpu(&ly->W_q, normed, q, D);
+        binary_project_cpu(&ly->W_k, normed, k_new, D);
+        binary_project_cpu(&ly->W_v, normed, v_new, D);
+#else
         ternary_project_cpu(&ly->W_q, normed, q, D);
         ternary_project_cpu(&ly->W_k, normed, k_new, D);
         ternary_project_cpu(&ly->W_v, normed, v_new, D);
+#endif
 
         /* Store K,V into cache (device-resident) */
         cudaMemcpy(kv_K_at(kv, l, pos), k_new, KV * sizeof(float), cudaMemcpyHostToDevice);
@@ -835,7 +884,11 @@ static void model_forward_cached(
         free(v_cached);
 
         /* O projection */
+#ifdef TWO3_BINARY
+        binary_project_cpu(&ly->W_o, attn_out, o_proj, D);
+#else
         ternary_project_cpu(&ly->W_o, attn_out, o_proj, D);
+#endif
 
         /* Residual */
         for (int i = 0; i < D; i++)

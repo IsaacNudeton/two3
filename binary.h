@@ -349,7 +349,12 @@ static void binary_backward_cpu(
 ) {
     int packed_cols = (K + 31) / 32;
 
-    /* dX = W^T @ dY — transpose masked sum */
+    /* dX = W^T @ dY — transpose masked sum, scaled by 1/sqrt(density*M).
+     * Without scaling, binary backward sums O(density*M) terms without
+     * sign cancellation (all positive connections). Ternary had natural
+     * cancellation from ±1 weights → O(sqrt(M)). Binary needs explicit
+     * sqrt normalization to match. */
+    float bwd_scale = 1.0f / sqrtf(W_packed->density * (float)M + 1e-6f);
     for (int k = 0; k < K; k++) {
         float sum = 0.0f;
         int word = k / 32;
@@ -358,7 +363,7 @@ static void binary_backward_cpu(
             if (W_packed->packed[m * packed_cols + word] & mask)
                 sum += dY[m];
         }
-        dX[k] += sum;
+        dX[k] += sum * bwd_scale;
     }
 
     /* dW_latent = dY @ X^T — outer product with STE clip */

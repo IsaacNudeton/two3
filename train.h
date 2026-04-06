@@ -883,10 +883,17 @@ static void trainable_requantize(TrainableModel *tm) {
 #endif
 #else
         /* Legacy: upload from host */
+#ifdef TWO3_BINARY
+        binary_free_weights(&ly->W_q); ly->W_q = binary_pack_weights(tw->W_q, D, D);
+        binary_free_weights(&ly->W_k); ly->W_k = binary_pack_weights(tw->W_k, KV, D);
+        binary_free_weights(&ly->W_v); ly->W_v = binary_pack_weights(tw->W_v, KV, D);
+        binary_free_weights(&ly->W_o); ly->W_o = binary_pack_weights(tw->W_o, D, D);
+#else
         requantize_gpu(&tm->backward_ctx, tw->W_q, &ly->W_q, D, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_k, &ly->W_k, KV, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_v, &ly->W_v, KV, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_o, &ly->W_o, D, D, STE_THRESHOLD, NULL);
+#endif
 #ifdef TWO3_BINARY
         binary_free_weights(&ly->ffn.gate);
         ly->ffn.gate = binary_pack_weights(tw->W_gate, INTER, D);
@@ -949,10 +956,17 @@ static void trainable_requantize_layer(TrainableModel *tm, int l) {
     }
 
     /* Requantize this layer's weights */
+#ifdef TWO3_BINARY
+    binary_free_weights(&ly->W_q); ly->W_q = binary_pack_weights(tw->W_q, D, D);
+    binary_free_weights(&ly->W_k); ly->W_k = binary_pack_weights(tw->W_k, KV, D);
+    binary_free_weights(&ly->W_v); ly->W_v = binary_pack_weights(tw->W_v, KV, D);
+    binary_free_weights(&ly->W_o); ly->W_o = binary_pack_weights(tw->W_o, D, D);
+#else
     requantize_gpu(&tm->backward_ctx, tw->W_q, &ly->W_q, D, D, STE_THRESHOLD, NULL);
     requantize_gpu(&tm->backward_ctx, tw->W_k, &ly->W_k, KV, D, STE_THRESHOLD, NULL);
     requantize_gpu(&tm->backward_ctx, tw->W_v, &ly->W_v, KV, D, STE_THRESHOLD, NULL);
     requantize_gpu(&tm->backward_ctx, tw->W_o, &ly->W_o, D, D, STE_THRESHOLD, NULL);
+#endif
 #ifdef TWO3_BINARY
     binary_free_weights(&ly->ffn.gate);
     ly->ffn.gate = binary_pack_weights(tw->W_gate, INTER, D);
@@ -1753,11 +1767,19 @@ static TrainResult trainable_forward_backward(
 
         /* Phase 2: multi-projection Q/K/V — quantize once, project 3x */
         T_START();
+#ifdef TWO3_BINARY
+        {
+            const BinaryWeights *W_qkv[3] = { &ly->W_q, &ly->W_k, &ly->W_v };
+            float *out_qkv[3] = { sv->q_all, sv->k_store, sv->v_store };
+            binary_project_multi_cpu(W_qkv, out_qkv, sv->pre_attn_normed, 3, seq_len, D);
+        }
+#else
         {
             const Two3Weights *W_qkv[3] = { &ly->W_q, &ly->W_k, &ly->W_v };
             float *out_qkv[3] = { sv->q_all, sv->k_store, sv->v_store };
             ternary_project_multi_cpu(W_qkv, out_qkv, sv->pre_attn_normed, 3, seq_len, D);
         }
+#endif
 
         T_ACC(_ms_qkv_proj);
 
@@ -1776,7 +1798,11 @@ static TrainResult trainable_forward_backward(
 
         /* Phase 5: batch O projection — 1 GPU call instead of seq_len */
         T_START();
+#ifdef TWO3_BINARY
+        binary_project_batch_cpu(&ly->W_o, sv->attn_out, sv->o_proj, seq_len, D);
+#else
         ternary_project_batch_cpu(&ly->W_o, sv->attn_out, sv->o_proj, seq_len, D);
+#endif
 
         /* Phase 6: scale + residual add */
         {
@@ -2183,9 +2209,14 @@ static TrainResult trainable_forward_backward(
             for (int i = 0; i < seq_len * D; i++)
                 d_o_proj_all[i] = s * d_hidden[i];
         }
+#ifdef TWO3_BINARY
+        binary_backward_batch_cpu(d_o_proj_all, sv->attn_out, tw->W_o,
+            &ly->W_o, d_attn_out_all, dW_o, seq_len, D, D);
+#else
         ternary_project_backward_gpu_batch(&tm->backward_ctx,
             &ly->W_o, d_o_proj_all, sv->attn_out,
             tw->W_o, d_attn_out_all, dW_o, seq_len, D, D);
+#endif
         free(d_o_proj_all);
 
         /* Phase 2: batched causal attention backward on GPU */
@@ -2213,17 +2244,24 @@ static TrainResult trainable_forward_backward(
         T_START();
         float *d_normed_attn_all = (float*)calloc(seq_len * D, sizeof(float));
 
+#ifdef TWO3_BINARY
+        binary_backward_batch_cpu(dq_all, sv->pre_attn_normed, tw->W_q,
+            &ly->W_q, d_normed_attn_all, dW_q, seq_len, D, D);
+        binary_backward_batch_cpu(dk_store, sv->pre_attn_normed, tw->W_k,
+            &ly->W_k, d_normed_attn_all, dW_k, seq_len, KV, D);
+        binary_backward_batch_cpu(dv_store, sv->pre_attn_normed, tw->W_v,
+            &ly->W_v, d_normed_attn_all, dW_v, seq_len, KV, D);
+#else
         ternary_project_backward_gpu_batch(&tm->backward_ctx,
             &ly->W_q, dq_all, sv->pre_attn_normed,
             tw->W_q, d_normed_attn_all, dW_q, seq_len, D, D);
-
         ternary_project_backward_gpu_batch(&tm->backward_ctx,
             &ly->W_k, dk_store, sv->pre_attn_normed,
             tw->W_k, d_normed_attn_all, dW_k, seq_len, KV, D);
-
         ternary_project_backward_gpu_batch(&tm->backward_ctx,
             &ly->W_v, dv_store, sv->pre_attn_normed,
             tw->W_v, d_normed_attn_all, dW_v, seq_len, KV, D);
+#endif
 
         free(dq_all); free(dk_store); free(dv_store);
 
