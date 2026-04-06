@@ -118,32 +118,44 @@ __global__ void kernel_gain_forward(
     R[i] = R_new;
 }
 
-/* Gain backward: gradient through the gain operation
- * Forward: y = x * (1 + α*R - β)
- * dy/dx = (1 + α*R - β) = gain
- * dy/dR = x * α
- * dR/dx: R depends on |x| through depletion term, but for STE we ignore this */
+/* Gain backward: full RMS norm + modulation backward
+ * Forward was TWO ops:
+ *   1. x_norm = x / rms(x),  rms = sqrt(mean(x²) + eps)
+ *   2. y = x_norm * gain,    gain = 1 + α*R - β
+ *
+ * NOTE: this kernel requires dot = mean(dx_norm · x_norm) pre-computed
+ * on the host (CPU reduction) and passed in — GPU reduction across dim
+ * is a separate kernel call. For now the CPU path (gain_backward_cpu in
+ * train.h) is used for all active training. This kernel is here for
+ * completeness and future GPU-resident use.
+ *
+ * Caller must pass:
+ *   inv_rms  = 1 / sqrt(mean(x²) + eps)
+ *   mean_dot = mean_i(dy[i] * gain[i] * x[i] * inv_rms)
+ */
 __global__ void kernel_gain_backward(
-    float       *dx,     /* [dim] gradient w.r.t. input */
-    const float *dy,     /* [dim] gradient from above */
-    const float *x,      /* [dim] saved input */
-    const float *R,      /* [dim] reservoir at time of forward */
-    float       *dC,     /* [dim] gradient w.r.t. capacity (for learning C) */
-    int dim,
-    float alpha, float beta, float gamma_r
+    float       *dx,       /* [dim] gradient w.r.t. input */
+    const float *dy,       /* [dim] gradient from above */
+    const float *x,        /* [dim] saved input (pre-norm) */
+    const float *R,        /* [dim] reservoir at time of forward */
+    float       *dC,       /* [dim] gradient w.r.t. capacity */
+    int          dim,
+    float        alpha, float beta, float gamma_r,
+    float        inv_rms,  /* precomputed: 1/rms(x) */
+    float        mean_dot  /* precomputed: mean(dx_norm · x_norm) */
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= dim) return;
 
-    float gain = 1.0f + alpha * R[i] - beta;
-    dx[i] = dy[i] * gain;
+    float x_norm    = x[i] * inv_rms;
+    float gain      = 1.0f + alpha * R[i] - beta;
+    float dx_norm_i = dy[i] * gain;
 
-    /* dC: through the reservoir update path
-     * R' = R + γ(C - R) - κ*R*E
-     * dR'/dC = γ
-     * dy/dC = dy/dR' * dR'/dC = x * α * γ
-     * Accumulate across tokens */
-    dC[i] += dy[i] * x[i] * alpha * gamma_r;
+    /* Full RMS norm backward with projection correction */
+    dx[i] = (dx_norm_i - x_norm * mean_dot) * inv_rms;
+
+    /* dC: forward used x_norm (not x) in the gain/reservoir path */
+    dC[i] += dy[i] * x_norm * alpha * gamma_r;
 }
 
 #endif /* __CUDACC__ */

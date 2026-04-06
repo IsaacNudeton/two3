@@ -1150,19 +1150,52 @@ static void ternary_project_backward_gpu(
                        1, rows, cols, STE_CLIP);
 }
 
-/* Backward through gain normalization (CPU version of kernel_gain_backward) */
+/* Backward through gain normalization (CPU version of kernel_gain_backward)
+ *
+ * Forward was TWO ops:
+ *   1. rms = sqrt(mean(x²) + eps),  x_norm = x / rms
+ *   2. y = x_norm * gain,           gain = 1 + α*R - β
+ *
+ * Backward op2: dx_norm[i] = dy[i] * gain[i]
+ * Backward op1 (RMS norm):
+ *   dx[i] = (dx_norm[i] - x_norm[i] * mean(dx_norm · x_norm)) * inv_rms
+ *
+ * The projection term (- x_norm * mean_dot) removes the gradient component
+ * that would change the norm of x — the RMS norm would immediately undo it
+ * on the next forward, so those gradient components are pure waste without it.
+ */
 static void gain_backward_cpu(
     float *dx,          /* [dim] gradient w.r.t. input (OUTPUT) */
     const float *dy,    /* [dim] gradient from above */
-    const float *x,     /* [dim] saved input */
+    const float *x,     /* [dim] saved input (pre-norm) */
     const float *R,     /* [dim] reservoir at time of forward */
     float *dC,          /* [dim] gradient w.r.t. capacity (ACCUMULATE) */
     int dim
 ) {
+    /* Recompute rms from saved x — same as forward */
+    float sum_sq = 0.0f;
+    for (int i = 0; i < dim; i++) sum_sq += x[i] * x[i];
+    float rms     = sqrtf(sum_sq / (float)dim + 1e-8f);
+    float inv_rms = 1.0f / rms;
+
+    /* Pass 1: dx_norm[i] = dy[i] * gain[i], accumulate dot and dC */
+    float dot = 0.0f;
     for (int i = 0; i < dim; i++) {
-        float gain = 1.0f + GAIN_ALPHA * R[i] - GAIN_BETA;
-        dx[i] = dy[i] * gain;
-        dC[i] += dy[i] * x[i] * GAIN_ALPHA * GAIN_GAMMA;
+        float x_norm    = x[i] * inv_rms;
+        float gain      = 1.0f + GAIN_ALPHA * R[i] - GAIN_BETA;
+        float dx_norm_i = dy[i] * gain;
+        dot += dx_norm_i * x_norm;
+        /* dC: forward used x_norm (not x) in gain path — fix vs old code */
+        dC[i] += dy[i] * x_norm * GAIN_ALPHA * GAIN_GAMMA;
+    }
+
+    /* Pass 2: apply RMS norm backward with projection correction */
+    float mean_dot = dot / (float)dim;
+    for (int i = 0; i < dim; i++) {
+        float x_norm    = x[i] * inv_rms;
+        float gain      = 1.0f + GAIN_ALPHA * R[i] - GAIN_BETA;
+        float dx_norm_i = dy[i] * gain;
+        dx[i] = (dx_norm_i - x_norm * mean_dot) * inv_rms;
     }
 }
 
