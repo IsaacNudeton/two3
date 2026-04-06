@@ -495,6 +495,20 @@ int main(int argc, char **argv) {
                 free(saved_gate); free(saved_up); free(saved_down);
 #endif
                 tm.last_requant_loss = pre_loss;
+
+#ifdef TWO3_FP_EMBED
+                /* fp projection requantize — gated same as attention/FFN.
+                 * Adam latent updates happen every step (in optimizer_step).
+                 * Snapping to ternary only happens here, under the match gate,
+                 * staggered at the same interval. No unconstrained per-step churn. */
+                {
+                    int qdim = tm.cfg.dim / 4;
+                    requantize_gpu(&tm.backward_ctx, tm.fp_latent_Wx, &tm.model.fp_Wx, qdim, 1024, STE_THRESHOLD, NULL);
+                    requantize_gpu(&tm.backward_ctx, tm.fp_latent_Wy, &tm.model.fp_Wy, qdim, 1024, STE_THRESHOLD, NULL);
+                    requantize_gpu(&tm.backward_ctx, tm.fp_latent_Wz, &tm.model.fp_Wz, qdim, 1024, STE_THRESHOLD, NULL);
+                    requantize_gpu(&tm.backward_ctx, tm.fp_latent_Wt, &tm.model.fp_Wt, qdim, 1024, STE_THRESHOLD, NULL);
+                }
+#endif
             }
             
             TrainResult r;

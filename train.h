@@ -1497,11 +1497,9 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         adam_update(tm->fp_latent_Wz, tm->fp_grad_Wz, &tm->fp_adam_Wz, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tm->fp_latent_Wt, tm->fp_grad_Wt, &tm->fp_adam_Wt, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
 
-        /* Requantize fp projections */
-        requantize_gpu(&tm->backward_ctx, tm->fp_latent_Wx, &tm->model.fp_Wx, qdim, 1024, STE_THRESHOLD, NULL);
-        requantize_gpu(&tm->backward_ctx, tm->fp_latent_Wy, &tm->model.fp_Wy, qdim, 1024, STE_THRESHOLD, NULL);
-        requantize_gpu(&tm->backward_ctx, tm->fp_latent_Wz, &tm->model.fp_Wz, qdim, 1024, STE_THRESHOLD, NULL);
-        requantize_gpu(&tm->backward_ctx, tm->fp_latent_Wt, &tm->model.fp_Wt, qdim, 1024, STE_THRESHOLD, NULL);
+        /* fp requantize is NOT done here — it's gated in train_driver.cu
+         * alongside attention/FFN requantize, under the match gate.
+         * Adam updates above are fine every step. Snapping to ternary is not. */
     }
 #endif
 
@@ -2301,7 +2299,12 @@ static TrainResult trainable_forward_backward(
             int corpus_pos = tm->fp_corpus_offset + t;
             if (corpus_pos < 0 || corpus_pos >= tm->model.fp_corpus_size) continue;
 
-            float *fp = tm->model.fp_data + (size_t)corpus_pos * 4096;
+            /* Unpack packed bits → float[4096] on the stack */
+            float fp[4096];
+            const uint8_t *raw = tm->model.fp_data + (size_t)corpus_pos * 512;
+            for (int i = 0; i < 4096; i++)
+                fp[i] = (raw[i >> 3] >> (i & 7)) & 1 ? 1.0f : 0.0f;
+
             float *dh = d_hidden + t * D;
 
             /* Each dimension: dW += dh[qdim_slice] @ fp[1024_slice]^T
