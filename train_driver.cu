@@ -364,24 +364,104 @@ int main(int argc, char **argv) {
                 /* Sync embedding (always) */
                 memcpy(tm.model.embed, tm.latent_embed, 256 * tm.cfg.dim * sizeof(float));
 
-                /* Requantize + reset momentum for ONE layer */
-                trainable_requantize_layer(&tm, layer);
-                trainable_reset_momentum_layer(&tm, layer);
+                /* ── PROPOSE-TEST-COMMIT from infer.c cortex loop ──
+                 *
+                 * 1. PROPOSE: save current packed weights, requantize the layer.
+                 * 2. TEST: run one forward pass, measure loss.
+                 * 3. COMMIT or REVERT: if loss improved, keep. If not, revert.
+                 *
+                 * Cost: one extra forward pass per requantize (2% overhead).
+                 * Benefit: NO bad flips ever persist. The sponge filters them. */
 
-                /* Asymmetric K update from infer.c: +2 verified, -1 unverified.
-                 * Commitment has momentum. Erosion is slow.
-                 * From engine.c: structural_match gates learning rate.
-                 * low match = near freeze, high match = crystallize fast. */
+                /* Step 1: PROPOSE — save old weights, apply new topology */
+                ModelLayer *ly = &tm.model.layers[layer];
+                int D = tm.cfg.dim, KV = tm.cfg.n_kv_heads * tm.cfg.head_dim;
+                int INTER = tm.cfg.intermediate;
+
+                /* Save old packed weights (cheap: just pointers + small allocs) */
+#ifdef TWO3_BINARY
+                int attn_sizes[] = {
+                    D * ((D+31)/32), KV * ((D+31)/32),
+                    KV * ((D+31)/32), D * ((D+31)/32)
+                };
+                int ffn_sizes[] = {
+                    INTER * ((D+31)/32), INTER * ((D+31)/32),
+                    D * ((INTER+31)/32)
+                };
+                uint32_t *saved_q = (uint32_t*)malloc(attn_sizes[0] * 4);
+                uint32_t *saved_k = (uint32_t*)malloc(attn_sizes[1] * 4);
+                uint32_t *saved_v = (uint32_t*)malloc(attn_sizes[2] * 4);
+                uint32_t *saved_o = (uint32_t*)malloc(attn_sizes[3] * 4);
+                uint32_t *saved_gate = (uint32_t*)malloc(ffn_sizes[0] * 4);
+                uint32_t *saved_up = (uint32_t*)malloc(ffn_sizes[1] * 4);
+                uint32_t *saved_down = (uint32_t*)malloc(ffn_sizes[2] * 4);
+                memcpy(saved_q, ly->W_q.packed, attn_sizes[0] * 4);
+                memcpy(saved_k, ly->W_k.packed, attn_sizes[1] * 4);
+                memcpy(saved_v, ly->W_v.packed, attn_sizes[2] * 4);
+                memcpy(saved_o, ly->W_o.packed, attn_sizes[3] * 4);
+                memcpy(saved_gate, ly->ffn.gate.packed, ffn_sizes[0] * 4);
+                memcpy(saved_up, ly->ffn.up.packed, ffn_sizes[1] * 4);
+                memcpy(saved_down, ly->ffn.down.packed, ffn_sizes[2] * 4);
+                float saved_densities[7] = {
+                    ly->W_q.density, ly->W_k.density, ly->W_v.density, ly->W_o.density,
+                    ly->ffn.gate.density, ly->ffn.up.density, ly->ffn.down.density
+                };
+#endif
+
+                /* Apply proposed topology change */
+                trainable_requantize_layer(&tm, layer);
+
+                /* Step 2: TEST — one forward pass on next batch */
+                float test_loss = 0;
+                {
+                    int next_chunk = chunk + cfg.batch_size;
+                    if (next_chunk < ds.n_chunks) {
+                        uint8_t *test_seq = dataset_get(&ds, next_chunk);
+                        TrainResult tr = trainable_forward_backward(&tm, test_seq, cfg.seq_len);
+                        test_loss = tr.loss;
+                        /* Zero the gradients from this test pass — it was just verification */
+                        trainable_zero_grads(&tm);
+                    } else {
+                        test_loss = batch_loss / actual_batch;  /* can't test, assume current */
+                    }
+                }
+
+                /* Step 3: COMMIT or REVERT */
                 float pre_loss = batch_loss / actual_batch;
-                if (pre_loss < tm.last_requant_loss) {
-                    /* Loss improved — this requantize was good. Strengthen: +2 */
+                if (test_loss <= pre_loss * 1.1f) {
+                    /* Verified: loss didn't get significantly worse.
+                     * Keep the new topology. Reset momentum. Cool plasticity.
+                     * From infer.c: +2 for verified, plasticity -= COOL */
+                    trainable_reset_momentum_layer(&tm, layer);
                     tm.flip_K = tm.flip_K + 2;
                     if (tm.flip_K > 20) tm.flip_K = 20;
                 } else {
-                    /* Loss worsened — this requantize was bad. Weaken: -1 (not -2) */
+                    /* Unverified: loss got worse. Revert the topology change.
+                     * From infer.c: -1 for unverified, plasticity += HEAT */
+#ifdef TWO3_BINARY
+                    memcpy(ly->W_q.packed, saved_q, attn_sizes[0] * 4);
+                    memcpy(ly->W_k.packed, saved_k, attn_sizes[1] * 4);
+                    memcpy(ly->W_v.packed, saved_v, attn_sizes[2] * 4);
+                    memcpy(ly->W_o.packed, saved_o, attn_sizes[3] * 4);
+                    memcpy(ly->ffn.gate.packed, saved_gate, ffn_sizes[0] * 4);
+                    memcpy(ly->ffn.up.packed, saved_up, ffn_sizes[1] * 4);
+                    memcpy(ly->ffn.down.packed, saved_down, ffn_sizes[2] * 4);
+                    ly->W_q.density = saved_densities[0];
+                    ly->W_k.density = saved_densities[1];
+                    ly->W_v.density = saved_densities[2];
+                    ly->W_o.density = saved_densities[3];
+                    ly->ffn.gate.density = saved_densities[4];
+                    ly->ffn.up.density = saved_densities[5];
+                    ly->ffn.down.density = saved_densities[6];
+#endif
                     tm.flip_K = tm.flip_K - 1;
                     if (tm.flip_K < 2) tm.flip_K = 2;
                 }
+
+#ifdef TWO3_BINARY
+                free(saved_q); free(saved_k); free(saved_v); free(saved_o);
+                free(saved_gate); free(saved_up); free(saved_down);
+#endif
                 tm.last_requant_loss = pre_loss;
             }
             
