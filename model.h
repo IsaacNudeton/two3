@@ -26,6 +26,9 @@
 #include "rope.h"
 #include "activation.h"
 #include "ffn.h"
+#ifdef TWO3_BINARY
+#include "binary.h"
+#endif
 #ifdef TWO3_IBC
 #include "ibc.h"
 #endif
@@ -469,12 +472,29 @@ static void model_init(Model *m, ModelConfig cfg) {
         /* Dense FFN — gate/up/down ternary */
         ly->ffn.dim = D;
         ly->ffn.intermediate = INTER;
-        float *wg = make_random_ternary(INTER, D);
-        ly->ffn.gate = two3_pack_weights(wg, INTER, D); free(wg);
-        float *wu = make_random_ternary(INTER, D);
-        ly->ffn.up = two3_pack_weights(wu, INTER, D); free(wu);
-        float *wd = make_random_ternary(D, INTER);
-        ly->ffn.down = two3_pack_weights(wd, D, INTER); free(wd);
+#ifdef TWO3_BINARY
+        {
+            /* Binary init: random float [0,1], pack to binary at threshold 0.5 */
+            float *wg = (float*)malloc(INTER * D * sizeof(float));
+            float *wu = (float*)malloc(INTER * D * sizeof(float));
+            float *wd = (float*)malloc(D * INTER * sizeof(float));
+            for (int i = 0; i < INTER * D; i++) wg[i] = (float)rand() / (float)RAND_MAX;
+            for (int i = 0; i < INTER * D; i++) wu[i] = (float)rand() / (float)RAND_MAX;
+            for (int i = 0; i < D * INTER; i++) wd[i] = (float)rand() / (float)RAND_MAX;
+            ly->ffn.gate = binary_pack_weights(wg, INTER, D); free(wg);
+            ly->ffn.up = binary_pack_weights(wu, INTER, D); free(wu);
+            ly->ffn.down = binary_pack_weights(wd, D, INTER); free(wd);
+        }
+#else
+        {
+            float *wg = make_random_ternary(INTER, D);
+            ly->ffn.gate = two3_pack_weights(wg, INTER, D); free(wg);
+            float *wu = make_random_ternary(INTER, D);
+            ly->ffn.up = two3_pack_weights(wu, INTER, D); free(wu);
+            float *wd = make_random_ternary(D, INTER);
+            ly->ffn.down = two3_pack_weights(wd, D, INTER); free(wd);
+        }
+#endif
         dense_ffn_init_buffers(&ly->ffn, cfg.max_seq);
     }
 
@@ -517,9 +537,15 @@ static void model_free(Model *m) {
         two3_free_weights(&ly->W_o);
         gain_free(&ly->gain_attn);
         gain_free(&ly->gain_ffn);
+#ifdef TWO3_BINARY
+        binary_free_weights(&ly->ffn.gate);
+        binary_free_weights(&ly->ffn.up);
+        binary_free_weights(&ly->ffn.down);
+#else
         two3_free_weights(&ly->ffn.gate);
         two3_free_weights(&ly->ffn.up);
         two3_free_weights(&ly->ffn.down);
+#endif
         dense_ffn_free_buffers(&ly->ffn);
     }
     free(m->layers);

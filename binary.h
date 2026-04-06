@@ -82,25 +82,13 @@ static BinaryWeights binary_pack_weights(const float *w_float, int rows, int col
 
     result.density = (float)count_ones / (float)total;
 
-#ifdef __CUDACC__
-    BCUDA_CHECK(cudaMalloc(&result.packed, packed_total));
-    BCUDA_CHECK(cudaMemcpy(result.packed, packed_host, packed_total,
-                            cudaMemcpyHostToDevice));
-#else
+    /* Always keep host copy for CPU matmul */
     result.packed = packed_host;
-    packed_host = NULL;
-#endif
-
-    if (packed_host) free(packed_host);
     return result;
 }
 
 static void binary_free_weights(BinaryWeights *w) {
-#ifdef __CUDACC__
-    if (w->packed) cudaFree(w->packed);
-#else
     if (w->packed) free(w->packed);
-#endif
     w->packed = NULL;
 }
 
@@ -225,6 +213,181 @@ static void binary_dequantize(
         for (int m = 0; m < M; m++) {
             y_float[s * M + m] = (float)acc[s * M + m] * combined;
         }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════
+ * High-level forward: float in, float out
+ * Handles quantization, matmul, and dequant internally.
+ * ═══════════════════════════════════════════════════════ */
+
+static void binary_project_cpu(
+    const BinaryWeights *W,
+    const float *input,     /* [K] */
+    float *output,          /* [M] */
+    int K
+) {
+    int M = W->rows;
+
+    /* Quantize input to int8 */
+    float absmax = 0.0f;
+    for (int k = 0; k < K; k++) {
+        float a = fabsf(input[k]);
+        if (a > absmax) absmax = a;
+    }
+    if (absmax < 1e-10f) absmax = 1e-10f;
+
+    int8_t *x_q = (int8_t*)malloc(K * sizeof(int8_t));
+    for (int k = 0; k < K; k++)
+        x_q[k] = (int8_t)(input[k] * 127.0f / absmax + (input[k] > 0 ? 0.5f : -0.5f));
+
+    /* Binary matmul */
+    int32_t *acc = (int32_t*)calloc(M, sizeof(int32_t));
+    binary_matmul_cpu(W->packed, x_q, acc, M, K);
+
+    /* Dequant */
+    float scale = (absmax / 127.0f) * W->density;
+    for (int m = 0; m < M; m++)
+        output[m] = (float)acc[m] * scale;
+
+    free(x_q);
+    free(acc);
+}
+
+/* Batched forward: S vectors */
+static void binary_project_batch_cpu(
+    const BinaryWeights *W,
+    const float *input,     /* [S × K] */
+    float *output,          /* [S × M] */
+    int S, int K
+) {
+    int M = W->rows;
+
+    for (int s = 0; s < S; s++) {
+        const float *xv = input + s * K;
+        float *yv = output + s * M;
+
+        float absmax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float a = fabsf(xv[k]);
+            if (a > absmax) absmax = a;
+        }
+        if (absmax < 1e-10f) absmax = 1e-10f;
+
+        int8_t *x_q = (int8_t*)malloc(K * sizeof(int8_t));
+        for (int k = 0; k < K; k++)
+            x_q[k] = (int8_t)(xv[k] * 127.0f / absmax + (xv[k] > 0 ? 0.5f : -0.5f));
+
+        int32_t *acc = (int32_t*)calloc(M, sizeof(int32_t));
+        binary_matmul_cpu(W->packed, x_q, acc, M, K);
+
+        float scale = (absmax / 127.0f) * W->density;
+        for (int m = 0; m < M; m++)
+            yv[m] = (float)acc[m] * scale;
+
+        free(x_q);
+        free(acc);
+    }
+}
+
+/* Multi-project: quantize input ONCE, project against N weight matrices */
+static void binary_project_multi_cpu(
+    const BinaryWeights **W_list,
+    float **output_list,
+    const float *input,     /* [S × K] */
+    int N, int S, int K
+) {
+    for (int s = 0; s < S; s++) {
+        const float *xv = input + s * K;
+
+        float absmax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float a = fabsf(xv[k]);
+            if (a > absmax) absmax = a;
+        }
+        if (absmax < 1e-10f) absmax = 1e-10f;
+
+        int8_t *x_q = (int8_t*)malloc(K * sizeof(int8_t));
+        for (int k = 0; k < K; k++)
+            x_q[k] = (int8_t)(xv[k] * 127.0f / absmax + (xv[k] > 0 ? 0.5f : -0.5f));
+
+        for (int n = 0; n < N; n++) {
+            int M = W_list[n]->rows;
+            int32_t *acc = (int32_t*)calloc(M, sizeof(int32_t));
+            binary_matmul_cpu(W_list[n]->packed, x_q, acc, M, K);
+
+            float scale = (absmax / 127.0f) * W_list[n]->density;
+            float *yv = output_list[n] + s * M;
+            for (int m = 0; m < M; m++)
+                yv[m] = (float)acc[m] * scale;
+
+            free(acc);
+        }
+        free(x_q);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Backward: STE through binary weights
+ *
+ * dX[k] = sum_{m where w[m,k]=1} dY[m]  (transpose masked sum)
+ * dW_latent[m,k] += dY[m] * X[k]         (outer product, STE-clipped)
+ *
+ * STE clip: zero gradient if latent weight too far from threshold.
+ * ═══════════════════════════════════════════════════════ */
+
+#define BINARY_STE_CLIP 1.5f
+
+static void binary_backward_cpu(
+    const float *dY,           /* [M] gradient from above */
+    const float *X,            /* [K] saved input (float, pre-quantize) */
+    const float *W_latent,     /* [M × K] latent float weights */
+    const BinaryWeights *W_packed,
+    float *dX,                 /* [K] gradient to pass back (ACCUMULATE) */
+    float *dW_latent,          /* [M × K] gradient for latent (ACCUMULATE) */
+    int M, int K
+) {
+    int packed_cols = (K + 31) / 32;
+
+    /* dX = W^T @ dY — transpose masked sum */
+    for (int k = 0; k < K; k++) {
+        float sum = 0.0f;
+        int word = k / 32;
+        uint32_t mask = 1u << (k % 32);
+        for (int m = 0; m < M; m++) {
+            if (W_packed->packed[m * packed_cols + word] & mask)
+                sum += dY[m];
+        }
+        dX[k] += sum;
+    }
+
+    /* dW_latent = dY @ X^T — outer product with STE clip */
+    for (int m = 0; m < M; m++) {
+        for (int k = 0; k < K; k++) {
+            float g = dY[m] * X[k];
+            /* STE clip: zero gradient if latent too far from any meaningful region */
+            float w = W_latent[m * K + k];
+            if (w < -BINARY_STE_CLIP || w > 1.0f + BINARY_STE_CLIP)
+                g = 0.0f;
+            dW_latent[m * K + k] += g;
+        }
+    }
+}
+
+/* Batched backward: S vectors */
+static void binary_backward_batch_cpu(
+    const float *dY,           /* [S × M] */
+    const float *X,            /* [S × K] */
+    const float *W_latent,     /* [M × K] */
+    const BinaryWeights *W_packed,
+    float *dX,                 /* [S × K] ACCUMULATE */
+    float *dW_latent,          /* [M × K] ACCUMULATE */
+    int S, int M, int K
+) {
+    for (int s = 0; s < S; s++) {
+        binary_backward_cpu(
+            dY + s * M, X + s * K, W_latent, W_packed,
+            dX + s * K, dW_latent, M, K);
     }
 }
 

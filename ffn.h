@@ -32,6 +32,9 @@
 
 #include "two3.h"
 #include "activation.h"
+#ifdef TWO3_BINARY
+#include "binary.h"
+#endif
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -42,9 +45,15 @@
  * ═══════════════════════════════════════════════════════ */
 
 typedef struct {
+#ifdef TWO3_BINARY
+    BinaryWeights gate;  /* [intermediate, dim] binary */
+    BinaryWeights up;    /* [intermediate, dim] binary */
+    BinaryWeights down;  /* [dim, intermediate] binary */
+#else
     Two3Weights gate;    /* [intermediate, dim] ternary */
     Two3Weights up;      /* [intermediate, dim] ternary */
     Two3Weights down;    /* [dim, intermediate] ternary */
+#endif
     int dim;
     int intermediate;
 
@@ -90,11 +99,17 @@ static void dense_ffn_forward(
     float *gate_h = ffn->buf_gate;  /* pre-allocated */
     float *up_h   = ffn->buf_up;
 
-    /* Gate + Up share input — quantize once, project 2x */
+    /* Gate + Up projections */
+#ifdef TWO3_BINARY
+    {
+        const BinaryWeights *W_gu[2] = { &ffn->gate, &ffn->up };
+        float *out_gu[2] = { gate_h, up_h };
+        binary_project_multi_cpu(W_gu, out_gu, x, 2, 1, dim);
+    }
+#else
     {
         const Two3Weights *W_gu[2] = { &ffn->gate, &ffn->up };
         float *out_gu[2] = { gate_h, up_h };
-        /* Quantize input ONCE, project against both weight matrices */
         Two3Activations X = two3_quantize_acts(x, 1, dim);
         for (int i = 0; i < 2; i++) {
             Two3Output Y = two3_forward(W_gu[i], &X);
@@ -103,6 +118,7 @@ static void dense_ffn_forward(
         }
         two3_free_acts(&X);
     }
+#endif
 
     /* Scale before squaring — prevents magnitude explosion */
     float scale = 1.0f / sqrtf((float)dim);
@@ -119,12 +135,18 @@ static void dense_ffn_forward(
         gate_h[i] *= up_h[i];
 
     /* Down projection + 1/sqrt(INTER) scale */
+#ifdef TWO3_BINARY
+    binary_project_cpu(&ffn->down, gate_h, output, intermediate);
+#else
     {
         Two3Activations X = two3_quantize_acts(gate_h, 1, intermediate);
         Two3Output Y = two3_forward(&ffn->down, &X);
         two3_dequantize_output(&Y, &ffn->down, &X, output);
         two3_free_output(&Y);
         two3_free_acts(&X);
+    }
+#endif
+    {
         float ds = 1.0f / sqrtf((float)intermediate);
         for (int i = 0; i < dim; i++) output[i] *= ds;
     }
@@ -153,7 +175,14 @@ static void dense_ffn_forward_batch(
     float *gate_b = ffn->buf_gate;  /* pre-allocated */
     float *up_b   = ffn->buf_up;
 
-    /* Quantize input ONCE, project gate and up */
+    /* Project gate and up */
+#ifdef TWO3_BINARY
+    {
+        const BinaryWeights *W_gu[2] = { &ffn->gate, &ffn->up };
+        float *out_gu[2] = { gate_b, up_b };
+        binary_project_multi_cpu(W_gu, out_gu, x, 2, S, dim);
+    }
+#else
     {
         Two3Activations X = two3_quantize_acts(x, S, dim);
         const Two3Weights *W_gu[2] = { &ffn->gate, &ffn->up };
@@ -165,6 +194,7 @@ static void dense_ffn_forward_batch(
         }
         two3_free_acts(&X);
     }
+#endif
 
     /* Scale + squared ReLU + hadamard */
     float scale = 1.0f / sqrtf((float)dim);
@@ -180,12 +210,18 @@ static void dense_ffn_forward_batch(
         gate_b[i] *= up_b[i];
 
     /* Down projection — batch + 1/sqrt(INTER) scale */
+#ifdef TWO3_BINARY
+    binary_project_batch_cpu(&ffn->down, gate_b, output, S, intermediate);
+#else
     {
         Two3Activations X = two3_quantize_acts(gate_b, S, intermediate);
         Two3Output Y = two3_forward(&ffn->down, &X);
         two3_dequantize_output(&Y, &ffn->down, &X, output);
         two3_free_output(&Y);
         two3_free_acts(&X);
+    }
+#endif
+    {
         float ds = 1.0f / sqrtf((float)intermediate);
         for (int i = 0; i < S * dim; i++) output[i] *= ds;
     }

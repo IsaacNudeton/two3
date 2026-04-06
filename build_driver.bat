@@ -25,6 +25,7 @@ if "%1"=="gpu-moon" goto gpu_moon
 if "%1"=="gpu-resident" goto gpu_resident
 if "%1"=="gpu-sixq" goto gpu_sixq
 if "%1"=="fp-embed" goto fp_embed
+if "%1"=="binary" goto binary
 if "%1"=="verify-moon" goto verify_moon
 if "%1"=="hadamard" goto hadamard
 if "%1"=="hadamard-ablation" goto hadamard
@@ -41,6 +42,11 @@ goto end_verify
 echo  Building hadamard_ablation.exe (host reference, no two3.cu)
 nvcc -O2 -o hadamard_ablation.exe hadamard_ablation.cu
 goto end_hadamard
+
+:binary
+echo  Building BINARY (binary weights, topology-only, gain kernel handles sign)
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -o train_driver.exe train_driver.cu two3.cu
+goto end
 
 :fp_embed
 echo  Building FP-EMBED (fingerprint embedding + four ternary projections)

@@ -873,18 +873,32 @@ static void trainable_requantize(TrainableModel *tm) {
         requantize_gpu(&tm->backward_ctx, NULL, &ly->W_k, KV, D, STE_THRESHOLD, d); d += KV*D;
         requantize_gpu(&tm->backward_ctx, NULL, &ly->W_v, KV, D, STE_THRESHOLD, d); d += KV*D;
         requantize_gpu(&tm->backward_ctx, NULL, &ly->W_o, D, D, STE_THRESHOLD, d); d += D*D;
+#ifdef TWO3_BINARY
+        /* GPU-resident binary: repack from device latent (TODO: implement device binary_pack) */
+        /* For now, fall through to legacy path */
+#else
         requantize_gpu(&tm->backward_ctx, NULL, &ly->ffn.gate, INTER, D, STE_THRESHOLD, d); d += INTER*D;
         requantize_gpu(&tm->backward_ctx, NULL, &ly->ffn.up, INTER, D, STE_THRESHOLD, d); d += INTER*D;
         requantize_gpu(&tm->backward_ctx, NULL, &ly->ffn.down, D, INTER, STE_THRESHOLD, d); d += D*INTER;
+#endif
 #else
         /* Legacy: upload from host */
         requantize_gpu(&tm->backward_ctx, tw->W_q, &ly->W_q, D, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_k, &ly->W_k, KV, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_v, &ly->W_v, KV, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_o, &ly->W_o, D, D, STE_THRESHOLD, NULL);
+#ifdef TWO3_BINARY
+        binary_free_weights(&ly->ffn.gate);
+        ly->ffn.gate = binary_pack_weights(tw->W_gate, INTER, D);
+        binary_free_weights(&ly->ffn.up);
+        ly->ffn.up = binary_pack_weights(tw->W_up, INTER, D);
+        binary_free_weights(&ly->ffn.down);
+        ly->ffn.down = binary_pack_weights(tw->W_down, D, INTER);
+#else
         requantize_gpu(&tm->backward_ctx, tw->W_gate, &ly->ffn.gate, INTER, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_up, &ly->ffn.up, INTER, D, STE_THRESHOLD, NULL);
         requantize_gpu(&tm->backward_ctx, tw->W_down, &ly->ffn.down, D, INTER, STE_THRESHOLD, NULL);
+#endif
 #endif
     }
 }
@@ -939,9 +953,18 @@ static void trainable_requantize_layer(TrainableModel *tm, int l) {
     requantize_gpu(&tm->backward_ctx, tw->W_k, &ly->W_k, KV, D, STE_THRESHOLD, NULL);
     requantize_gpu(&tm->backward_ctx, tw->W_v, &ly->W_v, KV, D, STE_THRESHOLD, NULL);
     requantize_gpu(&tm->backward_ctx, tw->W_o, &ly->W_o, D, D, STE_THRESHOLD, NULL);
+#ifdef TWO3_BINARY
+    binary_free_weights(&ly->ffn.gate);
+    ly->ffn.gate = binary_pack_weights(tw->W_gate, INTER, D);
+    binary_free_weights(&ly->ffn.up);
+    ly->ffn.up = binary_pack_weights(tw->W_up, INTER, D);
+    binary_free_weights(&ly->ffn.down);
+    ly->ffn.down = binary_pack_weights(tw->W_down, D, INTER);
+#else
     requantize_gpu(&tm->backward_ctx, tw->W_gate, &ly->ffn.gate, INTER, D, STE_THRESHOLD, NULL);
     requantize_gpu(&tm->backward_ctx, tw->W_up, &ly->ffn.up, INTER, D, STE_THRESHOLD, NULL);
     requantize_gpu(&tm->backward_ctx, tw->W_down, &ly->ffn.down, D, INTER, STE_THRESHOLD, NULL);
+#endif
 }
 
 /* Per-layer momentum reset */
@@ -1782,10 +1805,20 @@ static TrainResult trainable_forward_backward(
         /* Step 8-9: Dense FFN forward with saved activations for backward.
          * gate + up projections, save pre-activation, squared ReLU, hadamard, down. */
         {
-            /* Gate and Up projections — quantize once, project 2x */
-            const Two3Weights *W_gu[2] = { &ly->ffn.gate, &ly->ffn.up };
-            float *out_gu[2] = { sv->ffn_gate_pre, sv->ffn_up_out };
-            ternary_project_multi_cpu(W_gu, out_gu, sv->pre_ffn_normed, 2, seq_len, D);
+            /* Gate and Up projections */
+#ifdef TWO3_BINARY
+            {
+                const BinaryWeights *W_gu[2] = { &ly->ffn.gate, &ly->ffn.up };
+                float *out_gu[2] = { sv->ffn_gate_pre, sv->ffn_up_out };
+                binary_project_multi_cpu(W_gu, out_gu, sv->pre_ffn_normed, 2, seq_len, D);
+            }
+#else
+            {
+                const Two3Weights *W_gu[2] = { &ly->ffn.gate, &ly->ffn.up };
+                float *out_gu[2] = { sv->ffn_gate_pre, sv->ffn_up_out };
+                ternary_project_multi_cpu(W_gu, out_gu, sv->pre_ffn_normed, 2, seq_len, D);
+            }
+#endif
 
             /* Scale before squaring */
             float scale = 1.0f / sqrtf((float)D);
@@ -1802,7 +1835,11 @@ static TrainResult trainable_forward_backward(
             }
 
             /* Down projection + scale by 1/sqrt(INTER) */
+#ifdef TWO3_BINARY
+            binary_project_batch_cpu(&ly->ffn.down, sv->ffn_h, sv->ffn_out, seq_len, INTER);
+#else
             ternary_project_batch_cpu(&ly->ffn.down, sv->ffn_h, sv->ffn_out, seq_len, INTER);
+#endif
             {
                 float down_scale = 1.0f / sqrtf((float)INTER);
                 for (int i = 0; i < seq_len * D; i++)
@@ -2060,9 +2097,14 @@ static TrainResult trainable_forward_backward(
                 d_ffn_out[i] *= down_scale;
 
             float *d_h = (float*)calloc(seq_len * INTER, sizeof(float));
+#ifdef TWO3_BINARY
+            binary_backward_batch_cpu(d_ffn_out, sv->ffn_h, tw->W_down,
+                &ly->ffn.down, d_h, dW_down, seq_len, D, INTER);
+#else
             ternary_project_backward_gpu_batch(&tm->backward_ctx,
                 &ly->ffn.down, d_ffn_out, sv->ffn_h, tw->W_down,
                 d_h, dW_down, seq_len, D, INTER);
+#endif
 
             /* Step 2-3: backward through hadamard product + squared ReLU */
             float *d_gate_pre = (float*)malloc(seq_len * INTER * sizeof(float));
@@ -2084,16 +2126,26 @@ static TrainResult trainable_forward_backward(
 
             /* Step 4: backward through gate projection */
             float *d_normed_gate = (float*)calloc(seq_len * D, sizeof(float));
+#ifdef TWO3_BINARY
+            binary_backward_batch_cpu(d_gate_pre, sv->pre_ffn_normed, tw->W_gate,
+                &ly->ffn.gate, d_normed_gate, dW_gate, seq_len, INTER, D);
+#else
             ternary_project_backward_gpu_batch(&tm->backward_ctx,
                 &ly->ffn.gate, d_gate_pre, sv->pre_ffn_normed, tw->W_gate,
                 d_normed_gate, dW_gate, seq_len, INTER, D);
+#endif
             free(d_gate_pre);
 
             /* Step 5: backward through up projection */
             float *d_normed_up = (float*)calloc(seq_len * D, sizeof(float));
+#ifdef TWO3_BINARY
+            binary_backward_batch_cpu(d_up, sv->pre_ffn_normed, tw->W_up,
+                &ly->ffn.up, d_normed_up, dW_up, seq_len, INTER, D);
+#else
             ternary_project_backward_gpu_batch(&tm->backward_ctx,
                 &ly->ffn.up, d_up, sv->pre_ffn_normed, tw->W_up,
                 d_normed_up, dW_up, seq_len, INTER, D);
+#endif
             free(d_up);
 
             /* Step 6: combine gate + up gradients into d_normed */
