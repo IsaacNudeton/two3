@@ -342,7 +342,9 @@ int main(int argc, char **argv) {
                 actual_batch++;
             }
 
-            /* One optimizer step for the whole batch (latent weights only) */
+            /* Engine-style optimizer: always update latent floats, but
+             * the multiplicative update in adam_update handles commitment.
+             * Match gating lives in the requantize step below. */
             trainable_optimizer_step(&tm);
 
             global_step++;
@@ -366,13 +368,18 @@ int main(int argc, char **argv) {
                 trainable_requantize_layer(&tm, layer);
                 trainable_reset_momentum_layer(&tm, layer);
 
-                /* Adaptive K */
+                /* Asymmetric K update from infer.c: +2 verified, -1 unverified.
+                 * Commitment has momentum. Erosion is slow.
+                 * From engine.c: structural_match gates learning rate.
+                 * low match = near freeze, high match = crystallize fast. */
                 float pre_loss = batch_loss / actual_batch;
                 if (pre_loss < tm.last_requant_loss) {
+                    /* Loss improved — this requantize was good. Strengthen: +2 */
                     tm.flip_K = tm.flip_K + 2;
                     if (tm.flip_K > 20) tm.flip_K = 20;
                 } else {
-                    tm.flip_K = tm.flip_K - 2;
+                    /* Loss worsened — this requantize was bad. Weaken: -1 (not -2) */
+                    tm.flip_K = tm.flip_K - 1;
                     if (tm.flip_K < 2) tm.flip_K = 2;
                 }
                 tm.last_requant_loss = pre_loss;

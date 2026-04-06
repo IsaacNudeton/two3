@@ -311,7 +311,11 @@ static float clip_grad_norm(float *grads, int size, float max_norm) {
 #define GRAD_CLIP_NORM 1.0f
 #endif
 
-/* Adam update: modifies params in-place */
+/* Adam update: modifies params in-place.
+ * When TWO3_BINARY: uses engine-style dynamics from pc/engine.c:
+ *   - Multiplicative updates (commitment basins, not additive drift)
+ *   - Per-weight plasticity (stable weights resist, oscillating weights decide)
+ *   - CFL clamp at grid spacing */
 static void adam_update(
     float *params,
     const float *grads,
@@ -333,10 +337,7 @@ static void adam_update(
         float v_hat = s->v[i] * b2_corr;
         float update = lr * m_hat / (sqrtf(v_hat) + eps);
 
-        /* CFL: update cannot exceed ternary grid spacing (0.33).
-         * Without this, Adam's adaptive denominator can teleport
-         * a weight past multiple ternary boundaries in one step.
-         * One grid cell per tick. Same as FDTD Yee grid. */
+        /* CFL clamp */
         if (update >  0.1f) update =  0.1f;
         if (update < -0.1f) update = -0.1f;
         params[i] -= update;
