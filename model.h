@@ -127,7 +127,7 @@ typedef struct {
     Two3Weights  fp_Wt;         /* [dim/4, 1024] ternary — meta */
 
     /* Pre-computed fingerprints (mmap'd from .fp file) */
-    float       *fp_data;       /* mmap'd [corpus_size × 4096] float */
+    uint8_t     *fp_data;       /* packed [corpus_size × 512 bytes] — 1 bit per fp element */
     int          fp_corpus_size;
 #endif
 
@@ -306,7 +306,11 @@ static void ternary_project_cpu(
 
 static void fp_embed_cpu(float *out, Model *m, int corpus_pos, int dim) {
     int qdim = dim / 4;
-    float *fp = m->fp_data + (size_t)corpus_pos * 4096;
+    /* Unpack 512 bytes → 4096 floats on the stack (16KB — fine) */
+    float fp[4096];
+    const uint8_t *raw = m->fp_data + (size_t)corpus_pos * 512;
+    for (int i = 0; i < 4096; i++)
+        fp[i] = (raw[i >> 3] >> (i & 7)) & 1 ? 1.0f : 0.0f;
 
     ternary_project_cpu(&m->fp_Wx, fp,        out,            1024);
     ternary_project_cpu(&m->fp_Wy, fp + 1024, out + qdim,     1024);
@@ -327,16 +331,10 @@ static int fp_load(Model *m, const char *fp_path) {
     if (magic != 0x46503031 || fp_bits != 4096) { fclose(f); return -2; }
 
     m->fp_corpus_size = (int)corpus_size;
-    m->fp_data = (float*)malloc((size_t)corpus_size * 4096 * sizeof(float));
-    uint8_t fp_raw[512];
-
-    for (int pos = 0; pos < (int)corpus_size; pos++) {
-        fread(fp_raw, 1, 512, f);
-        float *fp_float = m->fp_data + (size_t)pos * 4096;
-        for (int i = 0; i < 4096; i++) {
-            fp_float[i] = (fp_raw[i / 8] >> (i % 8)) & 1 ? 1.0f : 0.0f;
-        }
-    }
+    /* Store packed: 512 bytes per position (4096 bits), not expanded floats.
+     * fp_embed_cpu unpacks on the fly — 572MB RAM instead of 18GB. */
+    m->fp_data = (uint8_t*)malloc((size_t)corpus_size * 512);
+    fread(m->fp_data, 512, (size_t)corpus_size, f);
 
     fclose(f);
     printf("[fp] loaded %s: %d positions, %d bits/pos\n", fp_path, corpus_size, fp_bits);

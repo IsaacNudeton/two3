@@ -1,0 +1,56 @@
+
+ {2,3} Training Driver — Build
+
+'vswhere.exe' is not recognized as an internal or external command,
+operable program or batch file.
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.0
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+ Building BINARY (binary weights, topology-only, gain kernel handles sign)
+E:\dev\tools\two3\binary.h(64): warning #177-D: variable "packed_total" was declared but never referenced
+      int packed_total = rows * packed_cols * sizeof(uint32_t);
+          ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+E:\dev\tools\two3\two3_tiled.h(511): warning #550-D: variable "d_src" was set but never used
+      float *d_src;
+             ^
+
+E:\dev\tools\two3\train.h(819): warning #177-D: variable "per_layer" was declared but never referenced
+          int per_layer = D*D + KV*D + KV*D + D*D
+              ^
+
+E:\dev\tools\two3\train.h(1364): warning #177-D: variable "ly" was declared but never referenced
+          ModelLayer *ly = &tm->model.layers[l];
+                      ^
+
+train_driver.cu
+tmpxft_000021f4_00000000-7_train_driver.cudafe1.cpp
+E:\dev\tools\two3\two3_tiled.h(511): warning #550-D: variable "d_src" was set but never used
+      float *d_src;
+             ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+two3.cu
+tmpxft_000021f4_00000000-11_two3.cudafe1.cpp
+BUILD OK
+
+ Run: muon_ns_verify.exe
+  (Compares CPU vs GPU Newton-Schulz; exit 0 if within tolerance)
+ Run: train_driver.exe data.txt --medium --seq-len 64 --batch 2 --log-every 10
+  (GPU Muon optimizer — Newton-Schulz on cuBLAS, ~2-5x SGD overhead)
+ Run: train_driver.exe data.txt --medium --seq-len 64 --batch 2 --log-every 10
+  (WARNING: CPU Muon optimizer is ~100x slower than SGD)
+ Run: train_driver.exe data.txt --medium --seq-len 64 --batch 2 --log-every 10
+  (Debug logging enabled: expert counts, reservoir levels, depletion)
+ Run: train_driver.exe data.txt --medium --seq-len 4 --batch 1 --log-every 5 --epochs 1
+  (Same as debug plus [exit_probe] lines each layer in train forward)
+ Run: test_model_exit.exe
+  (Test 7: argmax match rate and max L2 full vs early; edit nvcc line to add probe flags if needed)
+ Run: train_driver.exe data.txt --medium --seq-len 64 --batch 2 --log-every 10
+  (Normal training build, minimal logging)
+

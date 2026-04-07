@@ -86,8 +86,7 @@ static void dense_ffn_free_buffers(DenseFFN *ffn) {
  * h    = gate * up                        → [intermediate]
  * out  = ternary_project(h, W_down)       → [dim]
  *
- * Scale: 1/sqrt(dim) before squaring to prevent magnitude
- * explosion. Same pattern as the MoE expert forward.
+ * No pre/post scaling — gain norm at the next layer handles magnitude.
  * ═══════════════════════════════════════════════════════ */
 
 static void dense_ffn_forward(
@@ -120,13 +119,6 @@ static void dense_ffn_forward(
     }
 #endif
 
-    /* Scale before squaring — prevents magnitude explosion */
-    float scale = 1.0f / sqrtf((float)dim);
-    for (int i = 0; i < intermediate; i++) {
-        gate_h[i] *= scale;
-        up_h[i] *= scale;
-    }
-
     /* Squared ReLU on gate */
     squared_relu_cpu(gate_h, gate_h, intermediate);
 
@@ -134,7 +126,7 @@ static void dense_ffn_forward(
     for (int i = 0; i < intermediate; i++)
         gate_h[i] *= up_h[i];
 
-    /* Down projection + 1/sqrt(INTER) scale */
+    /* Down projection + 1/sqrt(INTER) post-scale */
 #ifdef TWO3_BINARY
     binary_project_cpu(&ffn->down, gate_h, output, intermediate);
 #else
@@ -196,12 +188,7 @@ static void dense_ffn_forward_batch(
     }
 #endif
 
-    /* Scale + squared ReLU + hadamard */
-    float scale = 1.0f / sqrtf((float)dim);
-    for (int i = 0; i < S * intermediate; i++) {
-        gate_b[i] *= scale;
-        up_b[i] *= scale;
-    }
+    /* Squared ReLU + hadamard */
     for (int i = 0; i < S * intermediate; i++) {
         float g = gate_b[i];
         gate_b[i] = (g > 0.0f) ? g * g : 0.0f;
@@ -209,7 +196,7 @@ static void dense_ffn_forward_batch(
     for (int i = 0; i < S * intermediate; i++)
         gate_b[i] *= up_b[i];
 
-    /* Down projection — batch + 1/sqrt(INTER) scale */
+    /* Down projection — batch + 1/sqrt(INTER) post-scale */
 #ifdef TWO3_BINARY
     binary_project_batch_cpu(&ffn->down, gate_b, output, S, intermediate);
 #else

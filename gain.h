@@ -118,20 +118,18 @@ __global__ void kernel_gain_forward(
     R[i] = R_new;
 }
 
-/* Gain backward: full RMS norm + modulation backward
+/* Gain backward: RMS-scaled modulation backward (no projection correction)
  * Forward was TWO ops:
  *   1. x_norm = x / rms(x),  rms = sqrt(mean(x²) + eps)
  *   2. y = x_norm * gain,    gain = 1 + α*R - β
  *
- * NOTE: this kernel requires dot = mean(dx_norm · x_norm) pre-computed
- * on the host (CPU reduction) and passed in — GPU reduction across dim
- * is a separate kernel call. For now the CPU path (gain_backward_cpu in
- * train.h) is used for all active training. This kernel is here for
- * completeness and future GPU-resident use.
+ * Backward: dx[i] = dy[i] * gain[i] * inv_rms
+ * Projection correction (- x_norm * mean_dot) omitted — with ternary
+ * weights the gradient is radially aligned with x_norm and the projection
+ * cancels nearly all signal. 1/rms scaling preserves correct magnitude.
  *
  * Caller must pass:
  *   inv_rms  = 1 / sqrt(mean(x²) + eps)
- *   mean_dot = mean_i(dy[i] * gain[i] * x[i] * inv_rms)
  */
 __global__ void kernel_gain_backward(
     float       *dx,       /* [dim] gradient w.r.t. input */
@@ -141,18 +139,14 @@ __global__ void kernel_gain_backward(
     float       *dC,       /* [dim] gradient w.r.t. capacity */
     int          dim,
     float        alpha, float beta, float gamma_r,
-    float        inv_rms,  /* precomputed: 1/rms(x) */
-    float        mean_dot  /* precomputed: mean(dx_norm · x_norm) */
+    float        inv_rms   /* precomputed: 1/rms(x) */
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= dim) return;
 
-    float x_norm    = x[i] * inv_rms;
-    float gain      = 1.0f + alpha * R[i] - beta;
-    float dx_norm_i = dy[i] * gain;
-
-    /* Full RMS norm backward with projection correction */
-    dx[i] = (dx_norm_i - x_norm * mean_dot) * inv_rms;
+    float x_norm = x[i] * inv_rms;
+    float gain   = 1.0f + alpha * R[i] - beta;
+    dx[i] = dy[i] * gain * inv_rms;
 
     /* dC: forward used x_norm (not x) in the gain/reservoir path */
     dC[i] += dy[i] * x_norm * alpha * gamma_r;

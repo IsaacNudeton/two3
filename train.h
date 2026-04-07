@@ -29,6 +29,7 @@
 
 #include "model.h"
 #include "two3_tiled.h"
+#include "jury.h"
 #include <math.h>
 #include <string.h>
 
@@ -344,6 +345,64 @@ static void adam_update(
     }
 }
 
+/* Headroom-modulated Adam for binary weights (engine theorem 68).
+ *
+ * Binary latent floats threshold at 0.5: w > 0.5 → 1, w ≤ 0.5 → 0.
+ * Headroom modulates the update rate based on distance from boundary:
+ *   - Near boundary (w ≈ 0.5): full update speed, flips allowed
+ *   - Committed (w near 0 or 1): near-zero update, resists flipping
+ *
+ * Directional headroom (from engine tline_strengthen / tline_weaken):
+ *   h_s(w) = 2 * clamp(w, 0, 1)      — pushing toward 1
+ *   h_w(w) = 2 * (1 - clamp(w, 0, 1)) — pushing toward 0
+ *
+ * Adam update < 0 → params increases → pushing toward 1 → use h_s
+ * Adam update > 0 → params decreases → pushing toward 0 → use h_w
+ *
+ * Floor of 0.1 ensures committed weights can reach the boundary
+ * under overwhelming gradient evidence. No external gate needed —
+ * the equilibrium L*(p) is unique, stable, and self-regulating. */
+static void adam_update_headroom(
+    float *params,
+    const float *grads,
+    AdamState *s,
+    int step,
+    float lr, float beta1, float beta2, float eps
+) {
+    float b1_corr = 1.0f / (1.0f - powf(beta1, (float)step));
+    float b2_corr = 1.0f / (1.0f - powf(beta2, (float)step));
+
+    for (int i = 0; i < s->size; i++) {
+        float g = grads[i];
+        s->m[i] = beta1 * s->m[i] + (1.0f - beta1) * g;
+        s->v[i] = beta2 * s->v[i] + (1.0f - beta2) * g * g;
+        float m_hat = s->m[i] * b1_corr;
+        float v_hat = s->v[i] * b2_corr;
+        float update = lr * m_hat / (sqrtf(v_hat) + eps);
+
+        /* CFL clamp */
+        if (update >  0.1f) update =  0.1f;
+        if (update < -0.1f) update = -0.1f;
+
+        /* Headroom modulation (MetabolicAge_v3.lean, Theorem 68) */
+        float w = params[i];
+        float wc = fmaxf(0.0f, fminf(1.0f, w));
+        float h;
+        if (update > 0.0f) {
+            /* Pushing toward 0 (weakening): h_w = 2(1-L) */
+            h = fmaxf(0.1f, 2.0f * (1.0f - wc));
+        } else {
+            /* Pushing toward 1 (strengthening): h_s = 2L */
+            h = fmaxf(0.1f, 2.0f * wc);
+        }
+        params[i] -= update * h;
+
+        /* Clamp to [0, 1] — L must stay in [L_MIN, L_MAX] */
+        if (params[i] < 0.0f) params[i] = 0.0f;
+        if (params[i] > 1.0f) params[i] = 1.0f;
+    }
+}
+
 /* ═══════════════════════════════════════════════════════
  * STE: ternary quantization + straight-through backward
  *
@@ -504,16 +563,33 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     for (int l = 0; l < L; l++) {
         TrainableLayerWeights *tw = &tm->layer_weights[l];
 
-        /* Initialize latent weights near ternary values {-1, 0, +1}.
-         * Same distribution as make_random_ternary() but with small noise
-         * so STE threshold (0.33) produces the right quantization. */
-        float noise = 0.05f;  /* small perturbation around ternary centers */
+        float noise = 0.05f;
 
         tw->W_q = (float*)malloc(D * D * sizeof(float));
         tw->W_k = (float*)malloc(KV * D * sizeof(float));
         tw->W_v = (float*)malloc(KV * D * sizeof(float));
         tw->W_o = (float*)malloc(D * D * sizeof(float));
 
+#ifdef TWO3_BINARY
+        /* Binary latent init in [0, 1] — matches headroom kernel domain.
+         * L_MIN=0, L_MAX=1, L_WIRE=0.5. Latents at 0.25 (binary 0) or
+         * 0.75 (binary 1), with headroom to flip in ~50-100 steps.
+         * From MetabolicAge_v3.lean: L must stay in [L_MIN, L_MAX]. */
+        #define INIT_BINARY_LATENT(arr, sz) do { \
+            for (int _i = 0; _i < (sz); _i++) { \
+                float r = (float)rand() / (float)RAND_MAX; \
+                float center = (r < 0.625f) ? 0.25f : 0.75f; \
+                (arr)[_i] = center + noise * (2.0f * (float)rand() / RAND_MAX - 1.0f); \
+            } \
+        } while(0)
+
+        INIT_BINARY_LATENT(tw->W_q, D * D);
+        INIT_BINARY_LATENT(tw->W_k, KV * D);
+        INIT_BINARY_LATENT(tw->W_v, KV * D);
+        INIT_BINARY_LATENT(tw->W_o, D * D);
+        #undef INIT_BINARY_LATENT
+#else
+        /* Ternary latent init near {-1, 0, +1}. */
         #define INIT_TERNARY_LATENT(arr, sz) do { \
             for (int _i = 0; _i < (sz); _i++) { \
                 float r = (float)rand() / (float)RAND_MAX; \
@@ -529,6 +605,7 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         INIT_TERNARY_LATENT(tw->W_k, KV * D);
         INIT_TERNARY_LATENT(tw->W_v, KV * D);
         INIT_TERNARY_LATENT(tw->W_o, D * D);
+#endif
 
 #if defined(TWO3_MUON_GPU) || defined(TWO3_USE_MUON_TERNARY)
         muon_init(&tw->muon_Wq, D, D);
@@ -552,9 +629,24 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         tw->W_gate = (float*)malloc(INTER * D * sizeof(float));
         tw->W_up   = (float*)malloc(INTER * D * sizeof(float));
         tw->W_down = (float*)malloc(D * INTER * sizeof(float));
+#ifdef TWO3_BINARY
+        /* Binary init in [0, 1] — same as attention weights */
+        #define INIT_BINARY_LATENT_FFN(arr, sz) do { \
+            for (int _i = 0; _i < (sz); _i++) { \
+                float r = (float)rand() / (float)RAND_MAX; \
+                float center = (r < 0.625f) ? 0.25f : 0.75f; \
+                (arr)[_i] = center + noise * (2.0f * (float)rand() / RAND_MAX - 1.0f); \
+            } \
+        } while(0)
+        INIT_BINARY_LATENT_FFN(tw->W_gate, INTER * D);
+        INIT_BINARY_LATENT_FFN(tw->W_up, INTER * D);
+        INIT_BINARY_LATENT_FFN(tw->W_down, D * INTER);
+        #undef INIT_BINARY_LATENT_FFN
+#else
         INIT_TERNARY_LATENT(tw->W_gate, INTER * D);
         INIT_TERNARY_LATENT(tw->W_up, INTER * D);
         INIT_TERNARY_LATENT(tw->W_down, D * INTER);
+#endif
         adam_init(&tw->adam_gate, INTER * D);
         adam_init(&tw->adam_up, INTER * D);
         adam_init(&tw->adam_down, D * INTER);
@@ -709,6 +801,23 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         printf("[init] fp embed: 4 × [%d × 1024] ternary projections\n", qdim);
     }
 #endif
+
+    /* Jury stability check — verify gain kernel parameters (GainKernel.lean).
+     * This is a runtime assertion, not a hope. If it fails, training
+     * will produce garbage. */
+    {
+        JuryResult jr = jury_gain_kernel(GAIN_ALPHA, GAIN_BETA, GAIN_GAMMA, 1.0f);
+        printf("[jury] gain kernel: stable=%d  margin=%.4f  spectral_r=%.4f\n",
+               jr.stable, jr.margin, jr.spectral_r);
+        printf("[jury] j1=%.4f  j2=%.4f  j3=%.4f\n", jr.j1, jr.j2, jr.j3);
+        float max_alpha = jury_max_gain(GAIN_BETA, GAIN_GAMMA, 1.0f);
+        printf("[jury] max safe alpha=%.4f  current=%.4f  safety=%.1fx\n",
+               max_alpha, GAIN_ALPHA, max_alpha / GAIN_ALPHA);
+        if (!jr.stable) {
+            printf("[jury] FATAL: gain kernel is UNSTABLE. Fix parameters.\n");
+            exit(1);
+        }
+    }
 
     printf("[init] trainable_model_init complete\n"); fflush(stdout);
 }
@@ -921,7 +1030,11 @@ static void trainable_requantize_layer(TrainableModel *tm, int l) {
     TrainableLayerWeights *tw = &tm->layer_weights[l];
     ModelLayer *ly = &tm->model.layers[l];
 
-    /* Meter flips for this layer */
+#ifndef TWO3_BINARY
+    /* Meter flips for ternary builds: limits flips to top-K by margin.
+     * Binary builds skip this — meter_flips uses ternary threshold 0.33
+     * which conflicts with binary threshold 0.5, and actively pushes
+     * latent values back from crossing the ternary boundary. */
     {
         int off = 0;
         float *tensors[] = { tw->W_q, tw->W_k, tw->W_v, tw->W_o };
@@ -955,6 +1068,7 @@ static void trainable_requantize_layer(TrainableModel *tm, int l) {
             }
         }
     }
+#endif
 
     /* Requantize this layer's weights */
 #ifdef TWO3_BINARY
@@ -1156,13 +1270,14 @@ static void ternary_project_backward_gpu(
  *   1. rms = sqrt(mean(x²) + eps),  x_norm = x / rms
  *   2. y = x_norm * gain,           gain = 1 + α*R - β
  *
- * Backward op2: dx_norm[i] = dy[i] * gain[i]
- * Backward op1 (RMS norm):
- *   dx[i] = (dx_norm[i] - x_norm[i] * mean(dx_norm · x_norm)) * inv_rms
+ * Backward: dx[i] = dy[i] * gain[i] * inv_rms
  *
- * The projection term (- x_norm * mean_dot) removes the gradient component
- * that would change the norm of x — the RMS norm would immediately undo it
- * on the next forward, so those gradient components are pure waste without it.
+ * The full RMS norm backward has a projection correction term
+ * (- x_norm * mean_dot) that removes the radial gradient component.
+ * With ternary weights the gradient is heavily radially aligned with
+ * x_norm, so the projection term cancels ~99% of the signal.
+ * We keep the 1/rms scaling (correct magnitude) and skip the projection
+ * (approximately correct direction, preserves signal).
  */
 static void gain_backward_cpu(
     float *dx,          /* [dim] gradient w.r.t. input (OUTPUT) */
@@ -1175,27 +1290,13 @@ static void gain_backward_cpu(
     /* Recompute rms from saved x — same as forward */
     float sum_sq = 0.0f;
     for (int i = 0; i < dim; i++) sum_sq += x[i] * x[i];
-    float rms     = sqrtf(sum_sq / (float)dim + 1e-8f);
-    float inv_rms = 1.0f / rms;
+    float inv_rms = 1.0f / sqrtf(sum_sq / (float)dim + 1e-8f);
 
-    /* Pass 1: dx_norm[i] = dy[i] * gain[i], accumulate dot and dC */
-    float dot = 0.0f;
     for (int i = 0; i < dim; i++) {
-        float x_norm    = x[i] * inv_rms;
-        float gain      = 1.0f + GAIN_ALPHA * R[i] - GAIN_BETA;
-        float dx_norm_i = dy[i] * gain;
-        dot += dx_norm_i * x_norm;
-        /* dC: forward used x_norm (not x) in gain path — fix vs old code */
+        float x_norm = x[i] * inv_rms;
+        float gain   = 1.0f + GAIN_ALPHA * R[i] - GAIN_BETA;
+        dx[i] = dy[i] * gain * inv_rms;
         dC[i] += dy[i] * x_norm * GAIN_ALPHA * GAIN_GAMMA;
-    }
-
-    /* Pass 2: apply RMS norm backward with projection correction */
-    float mean_dot = dot / (float)dim;
-    for (int i = 0; i < dim; i++) {
-        float x_norm    = x[i] * inv_rms;
-        float gain      = 1.0f + GAIN_ALPHA * R[i] - GAIN_BETA;
-        float dx_norm_i = dy[i] * gain;
-        dx[i] = (dx_norm_i - x_norm * mean_dot) * inv_rms;
     }
 }
 
@@ -1493,7 +1594,19 @@ static void trainable_optimizer_step(TrainableModel *tm) {
 
         /* Expert grads already clipped in pack loop above */
 #else
-        /* Adam on STE ternary weights (default/CPU path) */
+#ifdef TWO3_BINARY
+        /* Headroom-modulated Adam (MetabolicAge_v3, Theorem 68).
+         * h_s(L) = 2L, h_w(L) = 2(1-L) for L ∈ [0,1], L_WIRE = 0.5.
+         * Committed weights resist flipping, boundary weights move freely.
+         * No external gate — headroom IS the self-regulation mechanism. */
+        adam_update_headroom(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update_headroom(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update_headroom(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update_headroom(tw->W_o, tw->grad_Wo, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update_headroom(tw->W_gate, tw->grad_gate, &tw->adam_gate, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update_headroom(tw->W_up, tw->grad_up, &tw->adam_up, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update_headroom(tw->W_down, tw->grad_down, &tw->adam_down, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+#else
         adam_update(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
@@ -1502,7 +1615,8 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         adam_update(tw->W_gate, tw->grad_gate, &tw->adam_gate, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_up, tw->grad_up, &tw->adam_up, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_down, tw->grad_down, &tw->adam_down, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-#endif
+#endif /* TWO3_BINARY */
+#endif /* TWO3_GPU_RESIDENT */
 
         /* Gain C — frozen */
         clip_grad_norm(tm->grad_gain_C_attn[l], D, GRAD_CLIP_NORM);
@@ -1878,21 +1992,18 @@ static TrainResult trainable_forward_backward(
             }
 #endif
 
-            /* Scale before squaring */
-            float scale = 1.0f / sqrtf((float)D);
-            for (int i = 0; i < seq_len * INTER; i++) {
-                sv->ffn_gate_pre[i] *= scale;
-                sv->ffn_up_out[i] *= scale;
-            }
-
-            /* Squared ReLU on gate, then hadamard product → h */
+            /* Squared ReLU on gate, then hadamard product → h
+             * No pre-scaling: gain norm at the next layer normalizes magnitude.
+             * Old 1/sqrt(D) pre-scaling caused FFN to be 1000× weaker than attention. */
             for (int i = 0; i < seq_len * INTER; i++) {
                 float g = sv->ffn_gate_pre[i];
                 float ga = (g > 0.0f) ? g * g : 0.0f;
                 sv->ffn_h[i] = ga * sv->ffn_up_out[i];
             }
 
-            /* Down projection + scale by 1/sqrt(INTER) */
+            /* Down projection + 1/sqrt(INTER) post-scale.
+             * Compensates for the sum over INTER dims in the matmul.
+             * Single factor AFTER the nonlinearity — no chain rule compounding. */
 #ifdef TWO3_BINARY
             binary_project_batch_cpu(&ly->ffn.down, sv->ffn_h, sv->ffn_out, seq_len, INTER);
 #else
@@ -2130,8 +2241,6 @@ static TrainResult trainable_forward_backward(
         /* ── Backward through dense FFN block ── */
         T_START();
         {
-            float scale = 1.0f / sqrtf((float)D);
-
             /* Step 10 backward: d_ffn_out = res_scale * d_hidden */
             float *d_ffn_out = (float*)malloc(seq_len * D * sizeof(float));
             for (int i = 0; i < seq_len * D; i++)
@@ -2140,19 +2249,21 @@ static TrainResult trainable_forward_backward(
             /* d_normed_ffn_all accumulates gradient flowing back through FFN to gain */
             float *d_normed_ffn_all = (float*)calloc(seq_len * D, sizeof(float));
 
-            /* Dense FFN backward:
-             * 1. d_h = d_ffn_out @ W_down^T  (backward through down projection)
-             * 2. d_gate_activated = d_h * up_out, d_up = d_h * gate_activated
-             * 3. d_gate_pre = d_gate_activated * squared_relu_backward
-             * 4. d_normed_gate = d_gate_pre @ W_gate^T
-             * 5. d_normed_up = d_up @ W_up^T
-             * 6. d_normed = d_normed_gate + d_normed_up
+            /* Dense FFN backward (1/sqrt(INTER) post-scale only, no pre-scales):
+             * 1. d_ffn_out *= 1/sqrt(INTER)  (chain rule for post-scale)
+             * 2. d_h = d_ffn_out @ W_down^T
+             * 3. d_gate_activated = d_h * up_out, d_up = d_h * gate_activated
+             * 4. d_gate_pre = d_gate_activated * squared_relu_backward
+             * 5. d_normed_gate = d_gate_pre @ W_gate^T
+             * 6. d_normed_up = d_up @ W_up^T
              * Plus weight gradients: dW_down, dW_gate, dW_up */
 
-            /* Step 1: backward through down projection (include 1/sqrt(INTER) from forward) */
-            float down_scale = 1.0f / sqrtf((float)INTER);
-            for (int i = 0; i < seq_len * D; i++)
-                d_ffn_out[i] *= down_scale;
+            /* Chain rule through 1/sqrt(INTER) post-scale */
+            {
+                float down_scale = 1.0f / sqrtf((float)INTER);
+                for (int i = 0; i < seq_len * D; i++)
+                    d_ffn_out[i] *= down_scale;
+            }
 
             float *d_h = (float*)calloc(seq_len * INTER, sizeof(float));
 #ifdef TWO3_BINARY
@@ -2175,10 +2286,10 @@ static TrainResult trainable_forward_backward(
                 /* d_gate_activated = d_h * up_val */
                 float d_gate_act = d_h[i] * up_val;
                 /* d_up = d_h * gate_activated */
-                d_up[i] = d_h[i] * gate_act * scale;
+                d_up[i] = d_h[i] * gate_act;
 
                 /* squared ReLU backward: d_gate_pre = d_gate_act * 2*gate_pre (if > 0) */
-                d_gate_pre[i] = (gate_pre > 0.0f) ? d_gate_act * 2.0f * gate_pre * scale : 0.0f;
+                d_gate_pre[i] = (gate_pre > 0.0f) ? d_gate_act * 2.0f * gate_pre : 0.0f;
             }
             free(d_h);
 
