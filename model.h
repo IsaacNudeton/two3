@@ -629,7 +629,7 @@ static void model_forward_sequence_cpu(
     float *moe_out    = (float*)malloc(D * sizeof(float));
     float *normed_one = (float*)malloc(D * sizeof(float));
 
-    float res_scale = 1.0f / sqrtf(2.0f * (float)m->cfg.n_layers);
+    float res_scale = 1.0f;  /* Gap 1 fix: dequant is O(1), gain normalizes */
 
 #ifdef TWO3_EARLY_EXIT
     int layers_early_stop = 0;
@@ -843,7 +843,7 @@ static void model_forward_cached(
     /* Embed single byte */
     byte_embed_cpu(hidden, m->embed, byte_in, D);
 
-    float res_scale = 1.0f / sqrtf(2.0f * (float)m->cfg.n_layers);
+    float res_scale = 1.0f;  /* Gap 1 fix: dequant is O(1), gain normalizes */
 
     for (int l = 0; l < m->cfg.n_layers; l++) {
         ModelLayer *ly = &m->layers[l];

@@ -126,7 +126,7 @@ static void dense_ffn_forward(
     for (int i = 0; i < intermediate; i++)
         gate_h[i] *= up_h[i];
 
-    /* Down projection + 1/sqrt(INTER) post-scale */
+    /* Down projection — dequant scale is O(1) from Gap 1 fix */
 #ifdef TWO3_BINARY
     binary_project_cpu(&ffn->down, gate_h, output, intermediate);
 #else
@@ -138,10 +138,6 @@ static void dense_ffn_forward(
         two3_free_acts(&X);
     }
 #endif
-    {
-        float ds = 1.0f / sqrtf((float)intermediate);
-        for (int i = 0; i < dim; i++) output[i] *= ds;
-    }
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -196,7 +192,7 @@ static void dense_ffn_forward_batch(
     for (int i = 0; i < S * intermediate; i++)
         gate_b[i] *= up_b[i];
 
-    /* Down projection — batch + 1/sqrt(INTER) post-scale */
+    /* Down projection — batch, dequant scale is O(1) from Gap 1 fix */
 #ifdef TWO3_BINARY
     binary_project_batch_cpu(&ffn->down, gate_b, output, S, intermediate);
 #else
@@ -208,10 +204,6 @@ static void dense_ffn_forward_batch(
         two3_free_acts(&X);
     }
 #endif
-    {
-        float ds = 1.0f / sqrtf((float)intermediate);
-        for (int i = 0; i < S * dim; i++) output[i] *= ds;
-    }
 }
 
 #endif /* FFN_H */

@@ -1853,7 +1853,7 @@ static TrainResult trainable_forward_backward(
     /* Residual scaling for deep models: scale each residual add by 1/sqrt(2*L).
      * Prevents hidden state magnitude from growing with depth.
      * For 2 layers: scale = 0.5.  For 4 layers: scale = 0.354. */
-    float res_scale = 1.0f / sqrtf(2.0f * (float)L);
+    float res_scale = 1.0f;  /* Gap 1 fix: dequant is O(1), gain normalizes */
 
     /* Same token, consecutive layer outputs — mirrors model_forward_sequence_cpu.
      * Training never calls that path; log here when TWO3_DEBUG_EXIT_METRICS is set. */
@@ -2001,19 +2001,12 @@ static TrainResult trainable_forward_backward(
                 sv->ffn_h[i] = ga * sv->ffn_up_out[i];
             }
 
-            /* Down projection + 1/sqrt(INTER) post-scale.
-             * Compensates for the sum over INTER dims in the matmul.
-             * Single factor AFTER the nonlinearity — no chain rule compounding. */
+            /* Down projection — dequant scale is O(1) from Gap 1 fix */
 #ifdef TWO3_BINARY
             binary_project_batch_cpu(&ly->ffn.down, sv->ffn_h, sv->ffn_out, seq_len, INTER);
 #else
             ternary_project_batch_cpu(&ly->ffn.down, sv->ffn_h, sv->ffn_out, seq_len, INTER);
 #endif
-            {
-                float down_scale = 1.0f / sqrtf((float)INTER);
-                for (int i = 0; i < seq_len * D; i++)
-                    sv->ffn_out[i] *= down_scale;
-            }
         }
 
         /* Step 10: Residual add */
@@ -2249,21 +2242,13 @@ static TrainResult trainable_forward_backward(
             /* d_normed_ffn_all accumulates gradient flowing back through FFN to gain */
             float *d_normed_ffn_all = (float*)calloc(seq_len * D, sizeof(float));
 
-            /* Dense FFN backward (1/sqrt(INTER) post-scale only, no pre-scales):
-             * 1. d_ffn_out *= 1/sqrt(INTER)  (chain rule for post-scale)
-             * 2. d_h = d_ffn_out @ W_down^T
-             * 3. d_gate_activated = d_h * up_out, d_up = d_h * gate_activated
-             * 4. d_gate_pre = d_gate_activated * squared_relu_backward
-             * 5. d_normed_gate = d_gate_pre @ W_gate^T
-             * 6. d_normed_up = d_up @ W_up^T
+            /* Dense FFN backward (no post-scale — dequant is O(1)):
+             * 1. d_h = d_ffn_out @ W_down^T
+             * 2. d_gate_activated = d_h * up_out, d_up = d_h * gate_activated
+             * 3. d_gate_pre = d_gate_activated * squared_relu_backward
+             * 4. d_normed_gate = d_gate_pre @ W_gate^T
+             * 5. d_normed_up = d_up @ W_up^T
              * Plus weight gradients: dW_down, dW_gate, dW_up */
-
-            /* Chain rule through 1/sqrt(INTER) post-scale */
-            {
-                float down_scale = 1.0f / sqrtf((float)INTER);
-                for (int i = 0; i < seq_len * D; i++)
-                    d_ffn_out[i] *= down_scale;
-            }
 
             float *d_h = (float*)calloc(seq_len * INTER, sizeof(float));
 #ifdef TWO3_BINARY

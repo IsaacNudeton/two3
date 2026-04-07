@@ -209,7 +209,7 @@ static void binary_dequantize(
 ) {
     for (int s = 0; s < S; s++) {
         float a_scale = act_scales[s] / 127.0f;
-        float combined = a_scale * density;
+        float combined = a_scale / sqrtf(density * (float)K);
         for (int m = 0; m < M; m++) {
             y_float[s * M + m] = (float)acc[s * M + m] * combined;
         }
@@ -246,7 +246,7 @@ static void binary_project_cpu(
     binary_matmul_cpu(W->packed, x_q, acc, M, K);
 
     /* Dequant */
-    float scale = (absmax / 127.0f) * W->density;
+    float scale = (absmax / 127.0f) / sqrtf(W->density * (float)K);
     for (int m = 0; m < M; m++)
         output[m] = (float)acc[m] * scale;
 
@@ -281,7 +281,7 @@ static void binary_project_batch_cpu(
         int32_t *acc = (int32_t*)calloc(M, sizeof(int32_t));
         binary_matmul_cpu(W->packed, x_q, acc, M, K);
 
-        float scale = (absmax / 127.0f) * W->density;
+        float scale = (absmax / 127.0f) / sqrtf(W->density * (float)K);
         for (int m = 0; m < M; m++)
             yv[m] = (float)acc[m] * scale;
 
@@ -316,7 +316,7 @@ static void binary_project_multi_cpu(
             int32_t *acc = (int32_t*)calloc(M, sizeof(int32_t));
             binary_matmul_cpu(W_list[n]->packed, x_q, acc, M, K);
 
-            float scale = (absmax / 127.0f) * W_list[n]->density;
+            float scale = (absmax / 127.0f) / sqrtf(W_list[n]->density * (float)K);
             float *yv = output_list[n] + s * M;
             for (int m = 0; m < M; m++)
                 yv[m] = (float)acc[m] * scale;
