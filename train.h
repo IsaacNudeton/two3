@@ -397,12 +397,12 @@ static void adam_update_headroom(
         }
         params[i] -= update * h;
 
-        /* No hard clamp. Headroom floor (0.1) is the only rail protection.
-         * Hard clamp at 0/1 corrupts Adam state: momentum accumulates at
-         * the rail while the weight can't move, polluting m and v.
-         * Weights may drift slightly outside [0,1] — binary readout at
-         * threshold 0.5 is invariant to this (Theorem 69i). Soft boundary
-         * via headroom is the correct dynamics (Theorem 68). */
+        /* Hard clamp — needed while magnitudes are uncorrected.
+         * Clamp removal was premature: FFN outputs are O(3000), not O(1),
+         * and projection cos=0.70 means gradients are structured.
+         * TODO: revisit once magnitude chain is fixed end-to-end. */
+        if (params[i] < 0.0f) params[i] = 0.0f;
+        if (params[i] > 1.0f) params[i] = 1.0f;
     }
 }
 
@@ -1295,30 +1295,63 @@ static void gain_backward_cpu(
     float *dC,          /* [dim] gradient w.r.t. capacity (ACCUMULATE) */
     int dim
 ) {
-    /* Recompute rms from saved x — same as forward */
+    /* Recompute centered RMS from saved x — must match gain_forward_cpu.
+     * Forward: x_c = x - mean(x), x_norm = x_c / rms(x_c), y = x_norm * gain */
+    float mean_x = 0.0f;
+    for (int i = 0; i < dim; i++) mean_x += x[i];
+    mean_x /= (float)dim;
+
     float sum_sq = 0.0f;
-    for (int i = 0; i < dim; i++) sum_sq += x[i] * x[i];
+    for (int i = 0; i < dim; i++) {
+        float xc = x[i] - mean_x;
+        sum_sq += xc * xc;
+    }
     float inv_rms = 1.0f / sqrtf(sum_sq / (float)dim + 1e-8f);
 
-    /* Instrument #4: cos(dy*gain, x_norm) — projection alignment check */
+    /* Backward through center + RMS norm + gain:
+     * 1. dx_norm = dy * gain
+     * 2. mean_dot = mean(dx_norm * x_norm)  (RMS projection correction)
+     * 3. dx_c = (dx_norm - x_norm * mean_dot) * inv_rms
+     * 4. dx = dx_c - mean(dx_c)  (centering backward) */
+
+    /* Pass 1: compute mean_dot + instrument cosine */
+    float mean_dot = 0.0f;
     float dot_dg_xn = 0.0f, norm_dg = 0.0f, norm_xn = 0.0f;
 
     for (int i = 0; i < dim; i++) {
-        float x_norm = x[i] * inv_rms;
+        float x_norm = (x[i] - mean_x) * inv_rms;
         float gain   = 1.0f + GAIN_ALPHA * R[i] - GAIN_BETA;
         float dg     = dy[i] * gain;
-        dx[i] = dg * inv_rms;
-        dC[i] += dy[i] * x_norm * GAIN_ALPHA * GAIN_GAMMA;
+        mean_dot += dg * x_norm;
 
         dot_dg_xn += dg * x_norm;
         norm_dg   += dg * dg;
         norm_xn   += x_norm * x_norm;
     }
+    mean_dot /= (float)dim;
+
+    /* Instrument #4: track cosine for monitoring */
     float denom = sqrtf(norm_dg) * sqrtf(norm_xn);
     if (denom > 1e-10f) {
         _gain_cos_sum += fabsf(dot_dg_xn / denom);
         _gain_cos_count++;
     }
+
+    /* Pass 2: RMS backward → dx_c, accumulate dC */
+    float mean_dxc = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        float x_norm = (x[i] - mean_x) * inv_rms;
+        float gain   = 1.0f + GAIN_ALPHA * R[i] - GAIN_BETA;
+        float dx_norm = dy[i] * gain;
+        dx[i] = (dx_norm - x_norm * mean_dot) * inv_rms;
+        mean_dxc += dx[i];
+        dC[i] += dy[i] * x_norm * GAIN_ALPHA * GAIN_GAMMA;
+    }
+
+    /* Pass 3: centering backward — subtract mean of dx_c */
+    mean_dxc /= (float)dim;
+    for (int i = 0; i < dim; i++)
+        dx[i] -= mean_dxc;
 }
 
 /* Backward through squared ReLU */
@@ -2013,13 +2046,29 @@ static TrainResult trainable_forward_backward(
             }
 #endif
 
-            /* Squared ReLU on gate, then hadamard product → h
-             * No pre-scaling: gain norm at the next layer normalizes magnitude.
-             * Old 1/sqrt(D) pre-scaling caused FFN to be 1000× weaker than attention. */
+            /* Squared ReLU on gate, then hadamard product → h */
             for (int i = 0; i < seq_len * INTER; i++) {
                 float g = sv->ffn_gate_pre[i];
                 float ga = (g > 0.0f) ? g * g : 0.0f;
                 sv->ffn_h[i] = ga * sv->ffn_up_out[i];
+            }
+
+            /* Instrument: trace FFN magnitude chain */
+            if (tm->step % 50 == 0 && l == 0) {
+                float rms_normed = 0, rms_gate = 0, rms_up = 0, rms_h = 0;
+                for (int i = 0; i < seq_len * D; i++)
+                    rms_normed += sv->pre_ffn_normed[i] * sv->pre_ffn_normed[i];
+                for (int i = 0; i < seq_len * INTER; i++) {
+                    rms_gate += sv->ffn_gate_pre[i] * sv->ffn_gate_pre[i];
+                    rms_up   += sv->ffn_up_out[i] * sv->ffn_up_out[i];
+                    rms_h    += sv->ffn_h[i] * sv->ffn_h[i];
+                }
+                rms_normed = sqrtf(rms_normed / (float)(seq_len * D));
+                rms_gate   = sqrtf(rms_gate / (float)(seq_len * INTER));
+                rms_up     = sqrtf(rms_up / (float)(seq_len * INTER));
+                rms_h      = sqrtf(rms_h / (float)(seq_len * INTER));
+                printf("  [ffn-chain] L%d: normed=%.2f gate=%.2f up=%.2f h=%.2f\n",
+                       l, rms_normed, rms_gate, rms_up, rms_h);
             }
 
             /* Down projection — dequant scale is O(1) from Gap 1 fix */

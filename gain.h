@@ -94,7 +94,11 @@ __global__ void kernel_gain_forward(
 
     float xi = x[i];
 
-    /* Step 1: RMS normalization (shared memory reduction) */
+    /* TODO: GPU kernel needs centering to match CPU gain_forward_cpu.
+     * Binary weights require zero-mean input for correct CLT normalization.
+     * This kernel is stale — not used in active training path. */
+
+    /* Step 1: RMS normalization (shared memory reduction) — NEEDS CENTERING */
     sdata[i] = xi * xi;
     __syncthreads();
     /* Parallel reduction for sum of squares */
@@ -162,20 +166,29 @@ static void gain_forward_cpu(
     float *y, const float *x, float *R, const float *C,
     int dim
 ) {
-    /* Step 1: NORMALIZE — RMS normalization makes activations O(1).
-     * This is the impedance measurement. Forward stability regardless of dim.
-     * The backward gradient flows through 1/rms which is a SCALAR — same
-     * scale factor for all dimensions, so relative gradient structure preserved. */
+    /* Step 1: CENTER — subtract mean so binary projections have zero-mean
+     * accumulation. RMS norm preserves direction but not centering. Binary
+     * weights {0,1} have no sign cancellation, so uncentered input produces
+     * mean amplification of sqrt(density*K). Centering eliminates this.
+     * Ternary {-1,0,+1} cancels mean naturally; binary needs it explicitly.
+     * The centering belongs in the substrate (gain kernel), not signal path. */
+    float mean = 0.0f;
+    for (int i = 0; i < dim; i++) mean += x[i];
+    mean /= (float)dim;
+
+    /* Step 2: NORMALIZE — RMS of centered signal. Center + RMS = LayerNorm
+     * without learnable affine. The gain modulation replaces the affine. */
     float rms = 0.0f;
-    for (int i = 0; i < dim; i++) rms += x[i] * x[i];
+    for (int i = 0; i < dim; i++) {
+        float xc = x[i] - mean;
+        rms += xc * xc;
+    }
     rms = sqrtf(rms / (float)dim + 1e-8f);
     float inv_rms = 1.0f / rms;
 
-    /* Step 2: MODULATE — reservoir-dependent gain on normalized signal.
-     * This is the impedance transformation. Sets gradient magnitude
-     * independently of forward magnitude. */
+    /* Step 3: MODULATE — reservoir-dependent gain on centered+normalized signal. */
     for (int i = 0; i < dim; i++) {
-        float x_norm = x[i] * inv_rms;  /* O(1) regardless of dim */
+        float x_norm = (x[i] - mean) * inv_rms;  /* centered + O(1) */
         float E = fabsf(x_norm);
         float R_new = R[i] + GAIN_GAMMA * (C[i] - R[i]) - GAIN_KAPPA * R[i] * E;
         if (R_new < GAIN_R_MIN) R_new = GAIN_R_MIN;

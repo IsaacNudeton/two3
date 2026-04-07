@@ -422,7 +422,7 @@ int main(int argc, char **argv) {
                 if (_gain_cos_count > 0) {
                     float avg_cos = _gain_cos_sum / (float)_gain_cos_count;
                     printf("  [proj] avg |cos(dy*gain, x_norm)| = %.4f  (n=%d, expect ~%.4f = 1/sqrt(d))\n",
-                           avg_cos, _gain_cos_count, 1.0f / sqrtf((float)cfg.dim));
+                           avg_cos, _gain_cos_count, 1.0f / sqrtf((float)tm.cfg.dim));
                     _gain_cos_sum = 0.0f;
                     _gain_cos_count = 0;
                 }
