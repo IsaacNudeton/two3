@@ -417,6 +417,15 @@ int main(int argc, char **argv) {
                        epoch + 1, cfg.epochs, global_step,
                        r.loss, accuracy, r.max_grad,
                        flips, fc.total_flips, step_ms);
+
+                /* Instrument #4: gain projection alignment (Lévy check) */
+                if (_gain_cos_count > 0) {
+                    float avg_cos = _gain_cos_sum / (float)_gain_cos_count;
+                    printf("  [proj] avg |cos(dy*gain, x_norm)| = %.4f  (n=%d, expect ~%.4f = 1/sqrt(d))\n",
+                           avg_cos, _gain_cos_count, 1.0f / sqrtf((float)cfg.dim));
+                    _gain_cos_sum = 0.0f;
+                    _gain_cos_count = 0;
+                }
                 fflush(stdout);
 
                 if (logf) {

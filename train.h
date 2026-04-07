@@ -397,9 +397,12 @@ static void adam_update_headroom(
         }
         params[i] -= update * h;
 
-        /* Clamp to [0, 1] — L must stay in [L_MIN, L_MAX] */
-        if (params[i] < 0.0f) params[i] = 0.0f;
-        if (params[i] > 1.0f) params[i] = 1.0f;
+        /* No hard clamp. Headroom floor (0.1) is the only rail protection.
+         * Hard clamp at 0/1 corrupts Adam state: momentum accumulates at
+         * the rail while the weight can't move, polluting m and v.
+         * Weights may drift slightly outside [0,1] — binary readout at
+         * threshold 0.5 is invariant to this (Theorem 69i). Soft boundary
+         * via headroom is the correct dynamics (Theorem 68). */
     }
 }
 
@@ -1279,6 +1282,11 @@ static void ternary_project_backward_gpu(
  * We keep the 1/rms scaling (correct magnitude) and skip the projection
  * (approximately correct direction, preserves signal).
  */
+/* Diagnostic: tracks cos(dy*gain, x_norm) across calls.
+ * If consistently > 0.5, the dropped projection correction matters. */
+static float _gain_cos_sum = 0.0f;
+static int   _gain_cos_count = 0;
+
 static void gain_backward_cpu(
     float *dx,          /* [dim] gradient w.r.t. input (OUTPUT) */
     const float *dy,    /* [dim] gradient from above */
@@ -1292,11 +1300,24 @@ static void gain_backward_cpu(
     for (int i = 0; i < dim; i++) sum_sq += x[i] * x[i];
     float inv_rms = 1.0f / sqrtf(sum_sq / (float)dim + 1e-8f);
 
+    /* Instrument #4: cos(dy*gain, x_norm) — projection alignment check */
+    float dot_dg_xn = 0.0f, norm_dg = 0.0f, norm_xn = 0.0f;
+
     for (int i = 0; i < dim; i++) {
         float x_norm = x[i] * inv_rms;
         float gain   = 1.0f + GAIN_ALPHA * R[i] - GAIN_BETA;
-        dx[i] = dy[i] * gain * inv_rms;
+        float dg     = dy[i] * gain;
+        dx[i] = dg * inv_rms;
         dC[i] += dy[i] * x_norm * GAIN_ALPHA * GAIN_GAMMA;
+
+        dot_dg_xn += dg * x_norm;
+        norm_dg   += dg * dg;
+        norm_xn   += x_norm * x_norm;
+    }
+    float denom = sqrtf(norm_dg) * sqrtf(norm_xn);
+    if (denom > 1e-10f) {
+        _gain_cos_sum += fabsf(dot_dg_xn / denom);
+        _gain_cos_count++;
     }
 }
 
@@ -2043,6 +2064,30 @@ static TrainResult trainable_forward_backward(
                 printf("  !! LAYER %d: max_h=%.1f  NaN=%d  R=[%.4f,%.4f]\n",
                        l, max_h, nan_cnt, min_R, max_R);
             }
+        }
+
+        /* Instrument #2: empirical RMS of attn/FFN outputs vs CLT prediction.
+         * CLT says output RMS ≈ input_rms * 1/sqrt(density*K) * sqrt(density*K) = input_rms.
+         * After correct dequant, both should be O(1) if gain norm made input O(1).
+         * Log every 50 steps — cheap, just RMS over seq_len*D elements. */
+        if (tm->step % 50 == 0) {
+            float attn_ss = 0, ffn_ss = 0;
+            for (int i = 0; i < seq_len * D; i++) {
+                attn_ss += sv->o_proj[i] * sv->o_proj[i];
+                ffn_ss  += sv->ffn_out[i] * sv->ffn_out[i];
+            }
+            float attn_rms = sqrtf(attn_ss / (float)(seq_len * D));
+            float ffn_rms  = sqrtf(ffn_ss / (float)(seq_len * D));
+            float ratio = (ffn_rms > 1e-10f) ? attn_rms / ffn_rms : 0.0f;
+#ifdef TWO3_BINARY
+            printf("  [var] L%d: attn_rms=%.4f  ffn_rms=%.4f  ratio=%.2f"
+                   "  Wo_d=%.3f  down_d=%.3f\n",
+                   l, attn_rms, ffn_rms, ratio,
+                   ly->W_o.density, ly->ffn.down.density);
+#else
+            printf("  [var] L%d: attn_rms=%.4f  ffn_rms=%.4f  ratio=%.2f\n",
+                   l, attn_rms, ffn_rms, ratio);
+#endif
         }
 
 #ifdef TWO3_DEBUG_EXIT_METRICS
