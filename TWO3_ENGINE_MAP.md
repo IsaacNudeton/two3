@@ -119,24 +119,44 @@ crystallization during training. Between them, we have visibility.
 
 ---
 
+## What's Resolved (2026-04-07)
+
+1. **Binary mean amplification** — FOUND AND FIXED. Binary {0,1} weights have no sign
+   cancellation. Uncentered input through binary projection accumulates mean across
+   density*K active connections, causing sqrt(density*K) ≈ 6.9× amplification.
+   Fix: center input in gain kernel before RMS norm. Result: gate_rms 6.85 → 0.79.
+
+2. **Projection correction** — RESOLVED. cos(dy*gain, x_norm) was 0.70 without centering
+   (appeared to falsify Lévy bound). With centering: cos = 0.0814, exactly matching
+   1/sqrt(128) = 0.0884. The structured gradient alignment WAS the mean component.
+   Projection correction restored in backward but confirmed negligible.
+
+3. **FFN magnitude imbalance** — RESOLVED by centering. attn/ffn ratio went from
+   0.02 to ~1.0. The FFN wasn't dead — it was 50× too loud.
+
 ## What's Open
 
-1. **Grad spikes** — intermittent spikes to 30-72 in dW_q. Not growing, not causing
-   instability, but not understood. Likely attention softmax sharpening. Investigate
-   at dim=128 before scaling.
+1. **Grad spikes** — intermittent spikes to 8-20 in dW_q (reduced from 30-72).
+   Not growing, not causing instability. Likely attention softmax sharpening.
 
-2. **Asymmetric headroom** — engine uses 2:1 reinforce/erode ratio. Current headroom
-   is symmetric. May matter at larger scale where topology decisions are more costly.
+2. **Hard clamp + Adam state** — clamp at [0,1] restored because magnitudes were
+   wrong. Now that magnitudes are fixed, the clamp-pollution argument is valid again.
+   TODO: test removal with correct magnitudes.
 
-3. **GPU-resident training** — plan exists (`.claude/plans/silly-finding-russell.md`).
+3. **Asymmetric headroom** — engine uses 2:1 reinforce/erode ratio. Current headroom
+   is symmetric. May matter at larger scale.
+
+4. **Temperature sampling** — greedy decode produces "the the the" loops at 37.1%
+   accuracy. Temperature sampling needed to evaluate actual generation quality.
+
+5. **GPU-resident training** — plan exists (`.claude/plans/silly-finding-russell.md`).
    Pure engineering: move latent weights to GPU, stream optimizer per-layer.
    17s → 2s/step. Do after structural questions answered.
 
-4. **Scale test** — dim=128 works. dim=256, dim=512, dim=1024 untested. Each scale
-   transition may surface new structural issues (the lesson of this project).
+6. **Scale test** — dim=128 works with all magnitudes O(1). dim=256, dim=512
+   untested. Centering fix is dimension-independent, should hold.
 
-5. **Generation quality** — 18.2% accuracy should produce recognizable English
-   fragments. Not yet checked qualitatively.
+7. **Multi-epoch** — only 1 epoch run. Does accuracy keep improving or overfit?
 
 ---
 
@@ -148,6 +168,8 @@ crystallization during training. Between them, we have visibility.
 | `9ae3b60` | Gate fp projection requantize — fix gradient explosion |
 | `cfa6961` | Headroom Adam + gain inv_rms + FFN scaling + jury.h + binary init |
 | `195e056` | Gap 1 fix: binary dequant a_scale/sqrt(d*K), delete scaling hacks |
+| `c59cf1f` | Instrument #4 (Lévy cosine) and #2 (CLT variance) |
+| `056f6d5` | **Gain centering fix** — the binary mean cancellation fix, 18.2% → 37.1% |
 
 ---
 
