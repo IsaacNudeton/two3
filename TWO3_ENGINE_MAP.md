@@ -1,266 +1,155 @@
-# two3 × XYZT Engine: What Exists, What's Solved, What's Not Wired
+# two3 × XYZT Engine: What's Wired, What's Proven, What's Open
 
-**Purpose:** Stop rebuilding from scratch. Every pattern two3 needs already exists
-in the XYZT engine. This maps the solutions to the problems.
-
----
-
-## The Binary Weight Training Problem
-
-Binary weights {0,1} are topology — connected or not. Training decides which
-connections exist. The current approach (Adam on latent floats + requantize at
-threshold 0.5) causes flip churn: weights oscillate across the boundary, degrading
-accuracy from 15.5% back to 14% at step 4200.
-
-**Root cause:** Adam is additive. A 0.01 step at w=0.49 crosses the boundary.
-No basin structure, no commitment dynamics. The engine solved this.
+**Purpose:** Map between XYZT engine patterns and two3 implementation.
+Updated 2026-04-07 after Opus diagnostic session + Gap 1 fix.
 
 ---
 
 ## Pattern Map: Engine → two3
 
-### 1. MATCH-GATED LEARNING (Thermodynamic Clutch)
+### 1. MATCH-GATED LEARNING (Thermodynamic Clutch) — ✅ SUPERSEDED
 
 **Engine:** `pc/engine.c:612-656` — `graph_learn()`
-```
-structural_match controls learning rate.
-Low match (< 30) → freeze (0.1x). High match (> 150) → crystallize (2x).
-"Low match = slipping (don't lock bad topology)"
-```
+Structural match controls learning rate. Low match → freeze. High match → crystallize.
 
-**two3 equivalent:** Gate the requantize step by whether loss is improving.
-- Loss decreasing → allow flips (the topology is getting better)
-- Loss increasing → freeze topology (don't churn during a bad patch)
-- NOT a threshold. A continuous multiplier: `match_gate = clamp(loss_ratio, 0.1, 2.0)`
+**two3 history:** Was implemented as loss-ring match gate in train_driver.cu.
+Gate opened only when loss trending down, froze topology otherwise.
 
-**Commit:** `85df552` — "ONETWO feedback[0] → Hebbian gating"
+**Status:** **REMOVED.** Headroom Adam (Theorem 68) replaces the match gate entirely.
+Committed weights resist flipping by construction — no external gate needed.
+The gate was a hack compensating for Adam's lack of basin structure.
+Removed in commit cfa6961.
 
-### 2. MULTIPLICATIVE STRENGTHEN/WEAKEN
+### 2. MULTIPLICATIVE STRENGTHEN/WEAKEN — ✅ WIRED (as Headroom)
 
-**Engine:** `pc/tline.c:126-137`
-```c
-void tline_strengthen(TLine *tl, double rate) {
-    for (int i = 0; i < tl->n_cells; i++) {
-        tl->Lc[i] *= (1.0 - rate);    // impedance drops → connection strengthens
-        if (tl->Lc[i] < 0.1) tl->Lc[i] = 0.1;
-    }
-}
-void tline_weaken(TLine *tl, double rate) {
-    for (int i = 0; i < tl->n_cells; i++) {
-        tl->Lc[i] *= (1.0 + rate);    // impedance rises → connection weakens
-        if (tl->Lc[i] > 50.0) tl->Lc[i] = 50.0;
-    }
-}
-```
+**Engine:** `pc/tline.c:126-137` — multiplicative updates on impedance (Lc).
+High Lc → disconnected. Low Lc → connected. Exponential divergence from boundary.
 
-**Key insight:** Multiplicative updates on IMPEDANCE (Lc), not on learning rate.
-The weight is a READOUT: `tline_weight()` = product of per-cell attenuation.
-High Lc → high impedance → low weight → disconnected.
-Low Lc → low impedance → high weight → connected.
-Weights commit naturally because multiplicative updates create exponential
-divergence from any boundary.
+**two3 equivalent:** Headroom-modulated Adam (`train.h:adam_update_headroom`).
+- h_s(w) = 2*clamp(w, 0, 1) — strengthening headroom
+- h_w(w) = 2*(1 - clamp(w, 0, 1)) — weakening headroom
+- Floor 0.1 — committed weights can still flip under overwhelming evidence
+- CFL clamp ±0.1 per step
 
-**two3 equivalent:** The latent float IS Lc. Don't threshold at 0.5.
-Instead: `latent *= (1 - rate)` to strengthen, `latent *= (1 + rate)` to weaken.
-The binary readout is: `latent < threshold → connected`. The threshold doesn't
-need to be 0.5 — it's wherever the impedance naturally separates into two basins.
+Not literally multiplicative on the weight, but achieves the same effect:
+weights near 0 or 1 have near-zero effective learning rate, weights near 0.5
+have full learning rate. Same basin dynamics as the engine's Lc field.
 
-**WARNING:** CC tried this and got it backwards (commit in session — applied
-commitment factor to learning rate instead of to the weight itself). The
-multiplication goes on the WEIGHT, the rate stays additive. Don't repeat this.
+**Proven:** MetabolicAge_v3.lean Theorem 68. Equilibrium L*(p) is unique and stable.
 
-### 3. ASYMMETRIC REINFORCE/ERODE
+### 3. ASYMMETRIC REINFORCE/ERODE — ⚠️ PARTIAL
 
-**Engine:** `pc/engine.h:410-411`
-```c
-g->learn_strengthen = 65;
-g->learn_weaken = 40;
-```
+**Engine:** `pc/engine.h:410-411` — learn_strengthen=65, learn_weaken=40.
+`pc/infer.c:260-267` — +2 strengthen, -1 weaken.
 
-**Engine:** `pc/infer.c:260-267` — verification loop
-```c
-if (verified) {
-    int nw = (int)ed->weight + 2;     // +2 strengthen
-    ed->weight = nw > 255 ? 255 : (uint8_t)nw;
-} else {
-    int nw = (int)ed->weight - 1;     // -1 weaken
-    ed->weight = nw < 1 ? 1 : (uint8_t)nw;
-}
-```
+**two3 status:** The headroom function is symmetric (h_s and h_w are mirror images).
+The asymmetry from the engine (reinforce faster than erode) is NOT currently
+wired. The adaptive K (+2/-1) from commit 6d291e0 was on flip caps, not weight
+updates, and is now irrelevant since flips are controlled by headroom.
 
-**Key insight:** Strengthening is faster than weakening (65 vs 40, or +2 vs -1).
-Commitment has momentum. Erosion is slow. This is the 2:1 asymmetry from the
-metabolic diagnostic — Hebbian sharpens boundaries because reinforcement > erosion.
+**Open question:** Should headroom have asymmetric floors? E.g., floor=0.15 for
+strengthening, floor=0.05 for weakening? The engine says reinforcement should
+dominate erosion. Currently symmetric at floor=0.1.
 
-**two3 equivalent:** Adaptive K already uses +2/-1 (commit `6d291e0`). This piece
-is wired in. But it's on K (flip cap), not on the actual weight update magnitude.
+### 4. HEBBIAN CO-ACTIVATION — ⚠️ IMPLICIT
 
-### 4. HEBBIAN CO-ACTIVATION
+**Engine:** `pc/engine.c:895-914` — both sources active → strengthen, one silent → weaken.
 
-**Engine:** `pc/engine.c:895-914`
-```c
-// Both sources active → strengthen
-if (na->val != 0 && nb->val != 0) {
-    tline_strengthen(&e->tl, 0.01);
-}
-// One active, one silent → weaken
-else if ((na->val != 0) != (nb->val != 0)) {
-    tline_weaken(&e->tl, 0.01);
-}
-```
+**two3 status:** The STE gradient `dW = dY[m] * X[k]` IS Hebbian co-activation
+interpreted through the gradient lens. Large input AND large gradient → strengthen.
+But it goes through Adam's momentum averaging, losing the immediacy of the engine's
+local Hebbian signal.
 
-**Key insight:** The learning signal is CO-ACTIVATION, not gradient. Two neurons
-fire together → strengthen their connection. One fires without the other → weaken.
-No backprop. No chain rule. Local signal only.
+**Open question:** Would a direct Hebbian term (bypass Adam, small magnitude)
+accelerate topology discovery? The engine uses it for initial structure; Adam
+refines within the structure. Currently, Adam does both jobs.
 
-**two3 equivalent:** For binary weight w connecting input k to output m:
-- Forward: if w=1, input[k] contributes to output[m]
-- If both input[k] and the gradient dY[m] are large → the connection is useful → strengthen
-- If input[k] is large but dY[m] is small (or vice versa) → connection isn't contributing → weaken
-- This IS the STE gradient, but interpreted as Hebbian co-activation instead of as
-  a continuous gradient to be fed into Adam.
+### 5. HYPOTHESIS TESTING (0.3x Injection / Sponge) — ✅ SUPERSEDED
 
-### 5. HYPOTHESIS TESTING (0.3x Injection)
+**Engine:** `pc/infer.c:210-230` — re-inject predictions at 0.3x amplitude.
+Only predictions matching carved topology resonate. Sponge filters bad predictions.
 
-**Engine:** `pc/infer.c:210-230` — cortex prediction loop
-```
-Re-inject predictions at 0.3x amplitude (hypothesis, not statement).
-Only predictions matching carved topology resonate.
-Full amplitude would always resonate = hallucination.
-The sponge is the bullshit detector.
-```
+**two3 history:** Implemented as propose-test-commit in train_driver.cu.
+Save weights → requantize → forward pass → compare loss → commit or revert.
 
-**two3 equivalent:** Before committing a batch of flips:
-1. Apply proposed flips
-2. Run a forward pass on a validation batch
-3. If loss improves → commit (the flips resonated with the topology)
-4. If loss worsens → revert (the sponge absorbed them)
+**Status:** **REMOVED.** Headroom Adam makes this unnecessary. Committed weights
+(near 0 or 1) resist flipping — only well-supported flips happen. The headroom
+IS the sponge. No explicit hypothesis test needed.
+Removed in commit cfa6961.
 
-CC attempted this (propose-test-commit in train.h) but used a 10% loss threshold
-which is too loose. The engine doesn't use a threshold — it uses the sponge
-(physics filtering). The gain kernel IS the sponge. Depletion absorbs non-resonant
-signal. The test should be: do the flipped weights produce LOWER depletion (more
-efficient use of reservoir capacity)?
+### 6. PER-WEIGHT PLASTICITY — ⚠️ IMPLICIT
 
-### 6. PER-WEIGHT PLASTICITY
+**Engine:** `pc/engine.h:91-95` — plasticity field per node.
+Frustrated weights heat up (more plastic), stable weights cool down (more rigid).
 
-**Engine:** `pc/engine.h:91-95`
-```c
-#define PLASTICITY_DEFAULT  1.0f
-#define PLASTICITY_MIN      0.5f
-#define PLASTICITY_MAX      2.0f
-#define PLASTICITY_HEAT     0.01f   // frustration increment
-#define PLASTICITY_COOL     0.005f  // boredom decrement
-```
+**two3 status:** Adam's second moment v IS a plasticity proxy. High v = oscillating
+gradient = hot = high plasticity. Low v = stable = cold = low plasticity.
+But Adam recomputes v each step as exponential moving average. The engine's
+plasticity is a persistent STATE that decays independently.
 
-**Engine:** `pc/infer.c:274-281`
-```c
-if (verified) {
-    pn->plasticity -= PLASTICITY_COOL;    // stable → harder to move
-} else {
-    pn->plasticity += PLASTICITY_HEAT;    // frustrated → easier to move
-}
-```
+The headroom function adds another plasticity layer: weights near 0.5 are
+inherently more plastic (higher effective learning rate) than committed weights.
+This is closer to the engine's behavior than Adam's v alone.
 
-**two3 equivalent:** Adam's v (second moment) IS a plasticity signal.
-High v = oscillating gradient = hot weight = high plasticity.
-Low v = stable gradient = cold weight = low plasticity.
-`sqrt(v_hat)` in the Adam denominator already does this implicitly —
-large v → smaller effective step. But Adam uses it as normalization,
-not as commitment. The engine treats plasticity as a STATE that
-persists and decays. Adam recomputes it fresh each step.
+**Assessment:** Likely sufficient. The combination of Adam's v + headroom gives
+two plasticity signals. Adding a third explicit plasticity field is probably
+over-engineering at this stage.
 
-### 7. CRYSTAL UPDATE (Commitment Measurement)
+### 7. CRYSTAL UPDATE (Commitment Measurement) — ✅ WIRED (as diagnostics)
 
-**Engine:** `pc/engine.c:579-590` — `crystal_update()`
-```c
-void crystal_update(Node *n, Edge *edges, int n_edges, int node_id) {
-    memset(n->crystal_hist, 0, 8);
-    for (int e = 0; e < n_edges; e++) {
-        if (edges[e].dst == (uint16_t)node_id && edges[e].weight > 0) {
-            int bin = edges[e].weight / 32;
-            if (bin > 7) bin = 7;
-            n->crystal_hist[bin]++;
-        }
-    }
-}
-```
+**Engine:** `pc/engine.c:579-590` — histogram edge weights per node.
+Bimodal = crystallized. Uniform = liquid.
 
-**Key insight:** The engine tracks the DISTRIBUTION of edge weights per node.
-Bimodal distribution (most weights near 0 or 255) = crystallized.
-Uniform distribution = still liquid. This IS the metabolic diagnostic —
-`metabolic_diagnostic.h` measures the same thing for the L-field.
+**two3 status:** Weight entropy logged per layer at diagnostic intervals:
+`L0 W_q entropy: 0.9563 (max=1.5850)  [-1]=0.0% [0]=62.2% [+1]=37.8%`
+Flip counting tracks topology changes over time.
 
-**two3 equivalent:** Histogram the latent weights per layer.
-Bimodal (clustered near 0 and 1) = committed topology, stop flipping.
-Uniform (clustered near 0.5) = still deciding, allow flips.
-This directly replaces the K cap with a structural signal.
+The jury (`jury.h`) checks stability at init. The diagnostic logging tracks
+crystallization during training. Between them, we have visibility.
 
 ---
 
-## Files That Already Exist and Are Not Used
+## What's Proven (Lean theorems)
 
-### In two3 repo:
-- `nibble.h` — DEAD, not included anywhere. Delete.
-- `moe.h` — DEAD, only used by test_moe.cu. Delete.
-- `ibc.h` — guarded by TWO3_IBC, never defined. Dead in practice.
-- `binary.h` lines 85-94 — cudaMalloc path was removed (segfault fix),
-  needs dual storage (host+device) to re-enable GPU kernels.
-- KV cache in `model.h` — fully implemented, not wired into generation.
-
-### In XYZT repo (applicable to two3):
-- `pc/engine.c:612` — `graph_learn()` with match gating
-- `pc/tline.c:126` — multiplicative strengthen/weaken
-- `pc/infer.c:195` — full inference with sponge + hypothesis testing
-- `pc/engine.c:895` — Hebbian co-activation learning
-- `metabolic_diagnostic.h` — boundary commitment measurement
-
-### Uploaded but not referenced:
-- `metabolic_diagnostic.h` — L-field Laplacian diagnostic for boundary sharpening
-- `two3_tiled.h` (uploaded version) — has `TrainBuffers`, `requantize_gpu`,
-  `kernel_fused_requantize`, persistent GPU allocation. More complete than
-  the repo version.
+| Theorem | What | Status |
+|---------|------|--------|
+| 68 | Headroom Adam equilibrium L*(p) unique, stable | **Proven** (MetabolicAge_v3.lean) |
+| 69a | Dequant scale 1/sqrt(d*K) makes output O(1) | **Proven** (Two3Gaps.lean) |
+| 69b-69j | Full signal chain T1 | **Proven** (Two3Gaps.lean) |
 
 ---
 
-## What's Proven
+## What's Open
 
-| Result | Status | Evidence |
-|--------|--------|----------|
-| Binary weights train stably | **T1** | 15.5% acc, flat grads, 27K+ flips absorbed |
-| No polarity reversal cascade | **T1** | Ternary cascaded at step 1200, binary never |
-| Past trivial baseline (15.2%) | **T1** | Peak 15.5% at step 2300 |
-| Gradient √M scaling fix | **T1** | Three independent derivations converged |
-| Binary discriminates inputs | **T1** | Gemini test: cosine sim -0.005 (orthogonal) |
-| Flip churn degrades accuracy | **T1** | 15.5% → 14.0% during churn phase |
-| Engine dynamics prevent churn | **T2** | Code exists, not tested in two3 context |
+1. **Grad spikes** — intermittent spikes to 30-72 in dW_q. Not growing, not causing
+   instability, but not understood. Likely attention softmax sharpening. Investigate
+   at dim=128 before scaling.
 
----
+2. **Asymmetric headroom** — engine uses 2:1 reinforce/erode ratio. Current headroom
+   is symmetric. May matter at larger scale where topology decisions are more costly.
 
-## What's Not Solved
+3. **GPU-resident training** — plan exists (`.claude/plans/silly-finding-russell.md`).
+   Pure engineering: move latent weights to GPU, stream optimizer per-layer.
+   17s → 2s/step. Do after structural questions answered.
 
-1. **Flip churn** — weights oscillate across 0.5 under Adam. Engine solution
-   (match gating + multiplicative + plasticity) not correctly ported.
-2. **GPU path** — binary matmul runs on CPU (820ms/step). GPU kernel written
-   (`binary_gpu.h`) but needs dual storage and wiring.
-3. **Generation** — outputs spaces. Model predicts non-space bytes correctly
-   (15.5%) but greedy decode always picks space. Temperature sampling needed.
-4. **Scale** — dim=128, 4 layers, 1.1MB Shakespeare. Architecture proven but
-   not tested at meaningful scale.
+4. **Scale test** — dim=128 works. dim=256, dim=512, dim=1024 untested. Each scale
+   transition may surface new structural issues (the lesson of this project).
+
+5. **Generation quality** — 18.2% accuracy should produce recognizable English
+   fragments. Not yet checked qualitatively.
 
 ---
 
-## Strategic Sequence
+## Key Commits
 
-The question Isaac asked and hasn't answered: what is two3 FOR?
+| Commit | What |
+|--------|------|
+| `6d73ceb` | Fix gain_backward_cpu: missing RMS norm backward |
+| `9ae3b60` | Gate fp projection requantize — fix gradient explosion |
+| `cfa6961` | Headroom Adam + gain inv_rms + FFN scaling + jury.h + binary init |
+| `195e056` | Gap 1 fix: binary dequant a_scale/sqrt(d*K), delete scaling hacks |
 
-Options on the table:
-- **Inference engine:** Binarize pretrained weights, fast inference on consumer GPU
-- **Training from scratch:** Prove binary can learn competitive models end-to-end
-- **XYZT substrate:** two3 weights as the topology, gain kernel as the dynamics,
-  wave substrate (Yee FDTD) as the compute medium
-- **Hardware target:** Zynq 7020 unified memory, no PCIe boundary, binary weights
-  as FPGA LUT configuration
+---
 
-The architecture works at small scale. The next step depends on which of these
-Isaac wants to build toward.
+*The engine already solved every problem two3 encountered. The work is porting
+the solutions correctly — with mathematical proof, not hand-tuning.*
