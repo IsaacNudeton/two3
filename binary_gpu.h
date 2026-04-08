@@ -396,7 +396,8 @@ static void binary_project_batch_gpu(
 
     for (int s = 0; s < S; s++) {
         float a_scale = h_scales[s] / 127.0f;
-        float combined = a_scale * W->density;
+        /* Theorem 69a: CLT variance of masked sum → scale by 1/sqrt(density*K) */
+        float combined = a_scale / sqrtf(W->density * (float)K);
         for (int m = 0; m < M; m++) {
             output[s * M + m] = (float)h_acc[s * M + m] * combined;
         }

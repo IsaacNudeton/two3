@@ -95,19 +95,19 @@ nvcc -O3 -arch=sm_75 -o train_driver.exe train_driver.cu two3.cu
 goto end
 
 :end
-if exist train_driver.exe (echo BUILD OK) else (echo BUILD FAILED)
+if exist train_driver.exe (echo BUILD OK & set BUILDRC=0) else (echo BUILD FAILED & set BUILDRC=1)
 goto print_help
 
 :end_verify
-if exist muon_ns_verify.exe (echo BUILD OK — run muon_ns_verify.exe) else (echo BUILD FAILED)
+if exist muon_ns_verify.exe (echo BUILD OK — run muon_ns_verify.exe & set BUILDRC=0) else (echo BUILD FAILED & set BUILDRC=1)
 goto print_help
 
 :end_hadamard
-if exist hadamard_ablation.exe (echo BUILD OK — run hadamard_ablation.exe) else (echo BUILD FAILED)
+if exist hadamard_ablation.exe (echo BUILD OK — run hadamard_ablation.exe & set BUILDRC=0) else (echo BUILD FAILED & set BUILDRC=1)
 goto print_help
 
 :end_test_model_exit
-if exist test_model_exit.exe (echo BUILD OK — run test_model_exit.exe) else (echo BUILD FAILED)
+if exist test_model_exit.exe (echo BUILD OK — run test_model_exit.exe & set BUILDRC=0) else (echo BUILD FAILED & set BUILDRC=1)
 goto print_help
 
 :print_help
@@ -138,3 +138,4 @@ if "%1"=="hadamard" (
     echo   (Normal training build, minimal logging)
 )
 echo.
+exit /b %BUILDRC%

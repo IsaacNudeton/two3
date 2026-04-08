@@ -94,20 +94,27 @@ __global__ void kernel_gain_forward(
 
     float xi = x[i];
 
-    /* TODO: GPU kernel needs centering to match CPU gain_forward_cpu.
-     * Binary weights require zero-mean input for correct CLT normalization.
-     * This kernel is stale — not used in active training path. */
-
-    /* Step 1: RMS normalization (shared memory reduction) — NEEDS CENTERING */
-    sdata[i] = xi * xi;
+    /* Step 1: CENTER — mean subtraction in shared memory.
+     * Binary {0,1} has no sign cancellation. Without centering, mean
+     * accumulates sqrt(density*K) amplification (measured: 6.85 vs 0.79). */
+    sdata[i] = xi;
     __syncthreads();
-    /* Parallel reduction for sum of squares */
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (i < s && i + s < dim) sdata[i] += sdata[i + s];
+        __syncthreads();
+    }
+    float mean = sdata[0] / (float)dim;
+    float xc = xi - mean;
+
+    /* Step 2: RMS normalization on centered signal */
+    sdata[i] = xc * xc;
+    __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (i < s && i + s < dim) sdata[i] += sdata[i + s];
         __syncthreads();
     }
     float rms = sqrtf(sdata[0] / (float)dim + 1e-8f);
-    float x_norm = xi / rms;
+    float x_norm = xc / rms;
 
     /* Step 2: Reservoir update on normalized signal */
     float E = fabsf(x_norm);
@@ -122,18 +129,20 @@ __global__ void kernel_gain_forward(
     R[i] = R_new;
 }
 
-/* Gain backward: RMS-scaled modulation backward (no projection correction)
- * Forward was TWO ops:
- *   1. x_norm = x / rms(x),  rms = sqrt(mean(x²) + eps)
- *   2. y = x_norm * gain,    gain = 1 + α*R - β
+/* Gain backward: centered-RMS-scaled modulation backward (no projection correction)
+ * Forward was THREE ops:
+ *   1. xc = x - mean(x)           (centering)
+ *   2. x_norm = xc / rms(xc)      (RMS on centered signal)
+ *   3. y = x_norm * gain           (gain = 1 + α*R - β)
  *
  * Backward: dx[i] = dy[i] * gain[i] * inv_rms
- * Projection correction (- x_norm * mean_dot) omitted — with ternary
- * weights the gradient is radially aligned with x_norm and the projection
- * cancels nearly all signal. 1/rms scaling preserves correct magnitude.
- *
  * Caller must pass:
- *   inv_rms  = 1 / sqrt(mean(x²) + eps)
+ *   inv_rms  = 1 / sqrt(mean((x - mean(x))²) + eps)  ← from CENTERED signal
+ *   x[i]     = raw input (pre-centering). Kernel recenters: x_norm = (x[i]-mean)*inv_rms
+ *
+ * NOTE: caller must also pass mean so kernel can compute x_norm correctly.
+ *       Current interface passes inv_rms only. For GPU path activation,
+ *       add mean parameter or precompute x_norm on host.
  */
 __global__ void kernel_gain_backward(
     float       *dx,       /* [dim] gradient w.r.t. input */
