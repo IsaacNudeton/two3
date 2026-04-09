@@ -471,11 +471,49 @@ int main(int argc, char **argv) {
                         float *logits_g = (float*)malloc((g + 1) * 256 * sizeof(float));
                         model_forward_sequence_cpu(&tm.model, gen_buf, g + 1, logits_g,
                                                    MODEL_FWD_FLAGS_DEFAULT);
-                        /* Greedy argmax from last position's logits */
+                        /* Nucleus (top-p) sampling from last position's logits */
                         float *last_logits = logits_g + g * 256;
-                        int best = 0;
+                        float temperature = 0.8f;
+                        float top_p = 0.9f;
+
+                        /* Apply temperature */
+                        float max_l = last_logits[0];
                         for (int b = 1; b < 256; b++)
-                            if (last_logits[b] > last_logits[best]) best = b;
+                            if (last_logits[b] > max_l) max_l = last_logits[b];
+                        float sum_exp = 0.0f;
+                        float probs[256];
+                        for (int b = 0; b < 256; b++) {
+                            probs[b] = expf((last_logits[b] - max_l) / temperature);
+                            sum_exp += probs[b];
+                        }
+                        for (int b = 0; b < 256; b++) probs[b] /= sum_exp;
+
+                        /* Sort indices by probability (descending) */
+                        int idx[256];
+                        for (int b = 0; b < 256; b++) idx[b] = b;
+                        for (int i = 0; i < 255; i++)
+                            for (int j = i + 1; j < 256; j++)
+                                if (probs[idx[j]] > probs[idx[i]]) {
+                                    int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+                                }
+
+                        /* Accumulate until top-p mass reached */
+                        float cumsum = 0.0f;
+                        int nucleus_size = 0;
+                        for (int b = 0; b < 256; b++) {
+                            cumsum += probs[idx[b]];
+                            nucleus_size++;
+                            if (cumsum >= top_p) break;
+                        }
+
+                        /* Sample from nucleus */
+                        float r_sample = (float)rand() / (float)RAND_MAX * cumsum;
+                        float running = 0.0f;
+                        int best = idx[0];
+                        for (int b = 0; b < nucleus_size; b++) {
+                            running += probs[idx[b]];
+                            if (running >= r_sample) { best = idx[b]; break; }
+                        }
                         free(logits_g);
                         gen_buf[g + 1] = (uint8_t)best;
                         char c = (best >= 32 && best < 127) ? (char)best : '.';

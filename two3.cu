@@ -504,10 +504,14 @@ void two3_dequantize_output(const Two3Output* Y,
      * So w_float ≈ w_t * absmean
      * Therefore: y_float ≈ acc * (absmax/127) * absmean */
     float w_scale = W->scale;
+    int K = W->cols;
 
     for (int s = 0; s < S; s++) {
         float a_scale = scales_host[s] / 127.0f;
-        float combined = a_scale * w_scale;
+        /* CLT normalization: acc is sum of ~density*K ternary×int8 products.
+         * With ±1 signs, expected magnitude is O(sqrt(density*K)).
+         * Scale by w_scale/sqrt(K) to get O(w_scale*sqrt(density)) ≈ O(1). */
+        float combined = a_scale * w_scale / sqrtf((float)K);
         for (int m = 0; m < M; m++) {
             y_float[s * M + m] = (float)acc_host[s * M + m] * combined;
         }
