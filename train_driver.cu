@@ -35,6 +35,7 @@ typedef struct {
     /* Model */
     int use_medium;        /* use small config for testing */
     int use_large;         /* use large config (dim=256, 8 layers) */
+    int use_wide;          /* use wide config (dim=512, 4 layers) */
     int seq_len;          /* bytes per sequence */
 
     /* Training */
@@ -53,6 +54,7 @@ static TrainConfig default_config(void) {
     TrainConfig c;
     c.use_medium = 0;
     c.use_large = 0;
+    c.use_wide = 0;
     c.seq_len = 128;
     c.lr = 3e-3f;        /* base LR — width-scaled by 128/dim at init */
     c.epochs = 1;
@@ -90,12 +92,27 @@ static ModelConfig model_config_large(void) {
     return c;
 }
 
+static ModelConfig model_config_wide(void) {
+    ModelConfig c;
+    c.dim = 512;
+    c.n_heads = 16;
+    c.n_kv_heads = 4;
+    c.head_dim = 32;
+    c.intermediate = 2048;  /* 4× dim, dense FFN */
+    c.n_layers = 4;
+    c.max_seq = 512;
+    c.rope_theta = 1000000.0f;
+    return c;
+}
+
 static void parse_args(TrainConfig *cfg, int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--medium") == 0) {
             cfg->use_medium = 1;
         } else if (strcmp(argv[i], "--large") == 0) {
             cfg->use_large = 1;
+        } else if (strcmp(argv[i], "--wide") == 0) {
+            cfg->use_wide = 1;
         } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
             cfg->lr = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
@@ -213,7 +230,8 @@ int main(int argc, char **argv) {
     }
 
     /* Init model */
-    ModelConfig mcfg = cfg.use_large ? model_config_large()
+    ModelConfig mcfg = cfg.use_wide  ? model_config_wide()
+                     : cfg.use_large ? model_config_large()
                      : cfg.use_medium ? model_config_medium()
                      : model_config_default();
     /* Clamp max_seq to training seq_len — no need to allocate scratch for
