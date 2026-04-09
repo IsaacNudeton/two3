@@ -354,20 +354,19 @@ static void binary_backward_cpu(
      * sign cancellation (all positive connections). Ternary had natural
      * cancellation from ±1 weights → O(sqrt(M)). Binary needs explicit
      * sqrt normalization to match. */
-    /* SIGNED BACKWARD: decorrelate gradient via deterministic sign hash(m,k).
-     * Binary {0,1} without signs causes converging gradients across depth.
-     * Sign provides directional diversity that ternary ±1 gets for free. */
+    /* dX = W^T @ dY — transpose masked sum, scaled by 1/sqrt(density*M).
+     * Without scaling, binary backward sums O(density*M) terms without
+     * sign cancellation (all positive connections). Ternary had natural
+     * cancellation from ±1 weights → O(sqrt(M)). Binary needs explicit
+     * sqrt normalization to match. */
     float bwd_scale = 1.0f / sqrtf(W_packed->density * (float)M + 1e-6f);
     for (int k = 0; k < K; k++) {
         float sum = 0.0f;
         int word = k / 32;
         uint32_t mask = 1u << (k % 32);
         for (int m = 0; m < M; m++) {
-            if (W_packed->packed[m * packed_cols + word] & mask) {
-                uint32_t h = (uint32_t)(m * 2654435761u ^ k * 2246822519u);
-                float sign = (h & 1u) ? 1.0f : -1.0f;
-                sum += sign * dY[m];
-            }
+            if (W_packed->packed[m * packed_cols + word] & mask)
+                sum += dY[m];
         }
         dX[k] += sum * bwd_scale;
     }

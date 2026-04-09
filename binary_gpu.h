@@ -239,12 +239,7 @@ static __global__ void binary_backward_dx_tiled(
 
         __syncthreads();
 
-        /* For this k, check which m's are connected and sum their dY.
-         * SIGNED BACKWARD: multiply by deterministic sign hash(m,k) to
-         * decorrelate gradient components. Binary {0,1} without signs
-         * causes all dX components to be pushed the same direction,
-         * compounding across depth ("converging gradients"). The sign
-         * provides the directional diversity that ternary gets for free. */
+        /* For this k, check which m's are connected and sum their dY */
         if (k < K && s < S) {
             int word = k / 32;
             uint32_t mask = 1u << (k % 32);
@@ -254,13 +249,8 @@ static __global__ void binary_backward_dx_tiled(
                 int global_m = m_base + mi;
                 if (global_m < M) {
                     uint32_t w_word = W[global_m * packed_cols + word];
-                    if (w_word & mask) {
-                        /* Deterministic sign from (m,k) — consistent across calls,
-                         * zero extra memory. XOR hash gives ~50/50 ±1 distribution. */
-                        uint32_t h = (uint32_t)(global_m * 2654435761u ^ k * 2246822519u);
-                        float sign = (h & 1u) ? 1.0f : -1.0f;
-                        sum += sign * sdY[ty][mi];
-                    }
+                    if (w_word & mask)
+                        sum += sdY[ty][mi];
                 }
             }
         }
