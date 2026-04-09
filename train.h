@@ -30,6 +30,9 @@
 #include "model.h"
 #include "two3_tiled.h"
 #include "jury.h"
+#ifdef TWO3_BINARY
+#include "binary_gpu.h"
+#endif
 #include <math.h>
 #include <string.h>
 
@@ -498,6 +501,14 @@ typedef struct {
     int    max_layer_params;
 #endif
 
+#ifdef TWO3_BINARY
+    /* GPU copies of binary weights — mirrors model.layers[l].W_* */
+    struct {
+        BinaryWeightsGPU W_q, W_k, W_v, W_o;
+        BinaryWeightsGPU gate, up, down;
+    } *gpu_weights;  /* [n_layers] */
+#endif
+
     /* Training hyperparams */
     float lr;
     float beta1, beta2, eps;
@@ -686,6 +697,15 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         int max_K = D > INTER ? D : INTER;
         printf("[init] muon_gpu_init max_M=%d max_K=%d\n", max_M, max_K); fflush(stdout);
         two3_muon_gpu_init(&tm->backward_ctx, max_M, max_K);
+    }
+#endif
+
+#ifdef TWO3_BINARY
+    /* Allocate GPU weight mirrors — actual upload happens in first requantize */
+    {
+        size_t sz = (size_t)L * sizeof(tm->gpu_weights[0]);
+        tm->gpu_weights = (decltype(tm->gpu_weights))malloc(sz);
+        memset(tm->gpu_weights, 0, sz);
     }
 #endif
 
@@ -917,6 +937,42 @@ static void meter_flips(float *latent, const int8_t *old_ternary, int size, int 
     free(allowed); free(heap_idx); free(heap_margin);
 }
 
+#ifdef TWO3_BINARY
+/* Sync a single BinaryWeightsGPU from its CPU BinaryWeights counterpart.
+ * First call: allocates device memory. Subsequent: just re-uploads packed data. */
+static void binary_gpu_sync(BinaryWeightsGPU *gpu, const BinaryWeights *cpu) {
+    int packed_cols = (cpu->cols + 31) / 32;
+    size_t packed_bytes = (size_t)cpu->rows * packed_cols * sizeof(uint32_t);
+
+    if (gpu->d_packed == NULL) {
+        /* First time: full init */
+        gpu->rows = cpu->rows;
+        gpu->cols = cpu->cols;
+        gpu->density = cpu->density;
+        gpu->h_packed = cpu->packed;  /* point to same host data */
+        BGPU_CHECK(cudaMalloc(&gpu->d_packed, packed_bytes));
+    } else {
+        gpu->density = cpu->density;
+        gpu->h_packed = cpu->packed;
+    }
+    BGPU_CHECK(cudaMemcpy(gpu->d_packed, cpu->packed, packed_bytes,
+                           cudaMemcpyHostToDevice));
+}
+
+static void binary_gpu_sync_all(TrainableModel *tm) {
+    for (int l = 0; l < tm->cfg.n_layers; l++) {
+        ModelLayer *ly = &tm->model.layers[l];
+        binary_gpu_sync(&tm->gpu_weights[l].W_q, &ly->W_q);
+        binary_gpu_sync(&tm->gpu_weights[l].W_k, &ly->W_k);
+        binary_gpu_sync(&tm->gpu_weights[l].W_v, &ly->W_v);
+        binary_gpu_sync(&tm->gpu_weights[l].W_o, &ly->W_o);
+        binary_gpu_sync(&tm->gpu_weights[l].gate, &ly->ffn.gate);
+        binary_gpu_sync(&tm->gpu_weights[l].up, &ly->ffn.up);
+        binary_gpu_sync(&tm->gpu_weights[l].down, &ly->ffn.down);
+    }
+}
+#endif
+
 static void trainable_requantize(TrainableModel *tm) {
     int D = tm->cfg.dim;
     int KV = tm->cfg.n_kv_heads * tm->cfg.head_dim;
@@ -1021,6 +1077,10 @@ static void trainable_requantize(TrainableModel *tm) {
 #endif
 #endif
     }
+
+#ifdef TWO3_BINARY
+    binary_gpu_sync_all(tm);
+#endif
 }
 
 /* Per-layer requantize — only update one layer's ternary weights.
@@ -1162,6 +1222,19 @@ static void trainable_model_free(TrainableModel *tm) {
 
 #ifdef TWO3_LAYER_SKIP
     layer_skip_free(&tm->layer_skip);
+#endif
+
+#ifdef TWO3_BINARY
+    for (int l = 0; l < L; l++) {
+        binary_free_weights_gpu(&tm->gpu_weights[l].W_q);
+        binary_free_weights_gpu(&tm->gpu_weights[l].W_k);
+        binary_free_weights_gpu(&tm->gpu_weights[l].W_v);
+        binary_free_weights_gpu(&tm->gpu_weights[l].W_o);
+        binary_free_weights_gpu(&tm->gpu_weights[l].gate);
+        binary_free_weights_gpu(&tm->gpu_weights[l].up);
+        binary_free_weights_gpu(&tm->gpu_weights[l].down);
+    }
+    free(tm->gpu_weights);
 #endif
 
 #ifdef TWO3_GPU_RESIDENT
@@ -1969,9 +2042,10 @@ static TrainResult trainable_forward_backward(
         T_START();
 #ifdef TWO3_BINARY
         {
-            const BinaryWeights *W_qkv[3] = { &ly->W_q, &ly->W_k, &ly->W_v };
+            const BinaryWeightsGPU *W_qkv[3] = {
+                &tm->gpu_weights[l].W_q, &tm->gpu_weights[l].W_k, &tm->gpu_weights[l].W_v };
             float *out_qkv[3] = { sv->q_all, sv->k_store, sv->v_store };
-            binary_project_multi_cpu(W_qkv, out_qkv, sv->pre_attn_normed, 3, seq_len, D);
+            binary_project_multi_gpu(W_qkv, out_qkv, sv->pre_attn_normed, 3, seq_len, D);
         }
 #else
         {
@@ -1999,7 +2073,8 @@ static TrainResult trainable_forward_backward(
         /* Phase 5: batch O projection — 1 GPU call instead of seq_len */
         T_START();
 #ifdef TWO3_BINARY
-        binary_project_batch_cpu(&ly->W_o, sv->attn_out, sv->o_proj, seq_len, D);
+        binary_project_batch_gpu(&tm->gpu_weights[l].W_o,
+            sv->attn_out, sv->o_proj, seq_len, D);
 #else
         ternary_project_batch_cpu(&ly->W_o, sv->attn_out, sv->o_proj, seq_len, D);
 #endif
@@ -2034,9 +2109,10 @@ static TrainResult trainable_forward_backward(
             /* Gate and Up projections */
 #ifdef TWO3_BINARY
             {
-                const BinaryWeights *W_gu[2] = { &ly->ffn.gate, &ly->ffn.up };
+                const BinaryWeightsGPU *W_gu[2] = {
+                    &tm->gpu_weights[l].gate, &tm->gpu_weights[l].up };
                 float *out_gu[2] = { sv->ffn_gate_pre, sv->ffn_up_out };
-                binary_project_multi_cpu(W_gu, out_gu, sv->pre_ffn_normed, 2, seq_len, D);
+                binary_project_multi_gpu(W_gu, out_gu, sv->pre_ffn_normed, 2, seq_len, D);
             }
 #else
             {
@@ -2073,7 +2149,8 @@ static TrainResult trainable_forward_backward(
 
             /* Down projection — dequant scale is O(1) from Gap 1 fix */
 #ifdef TWO3_BINARY
-            binary_project_batch_cpu(&ly->ffn.down, sv->ffn_h, sv->ffn_out, seq_len, INTER);
+            binary_project_batch_gpu(&tm->gpu_weights[l].down,
+                sv->ffn_h, sv->ffn_out, seq_len, INTER);
 #else
             ternary_project_batch_cpu(&ly->ffn.down, sv->ffn_h, sv->ffn_out, seq_len, INTER);
 #endif
@@ -2346,8 +2423,8 @@ static TrainResult trainable_forward_backward(
 
             float *d_h = (float*)calloc(seq_len * INTER, sizeof(float));
 #ifdef TWO3_BINARY
-            binary_backward_batch_cpu(d_ffn_out, sv->ffn_h, tw->W_down,
-                &ly->ffn.down, d_h, dW_down, seq_len, D, INTER);
+            binary_backward_batch_gpu(d_ffn_out, sv->ffn_h, tw->W_down,
+                &tm->gpu_weights[l].down, d_h, dW_down, seq_len, D, INTER);
 #else
             ternary_project_backward_gpu_batch(&tm->backward_ctx,
                 &ly->ffn.down, d_ffn_out, sv->ffn_h, tw->W_down,
@@ -2375,8 +2452,8 @@ static TrainResult trainable_forward_backward(
             /* Step 4: backward through gate projection */
             float *d_normed_gate = (float*)calloc(seq_len * D, sizeof(float));
 #ifdef TWO3_BINARY
-            binary_backward_batch_cpu(d_gate_pre, sv->pre_ffn_normed, tw->W_gate,
-                &ly->ffn.gate, d_normed_gate, dW_gate, seq_len, INTER, D);
+            binary_backward_batch_gpu(d_gate_pre, sv->pre_ffn_normed, tw->W_gate,
+                &tm->gpu_weights[l].gate, d_normed_gate, dW_gate, seq_len, INTER, D);
 #else
             ternary_project_backward_gpu_batch(&tm->backward_ctx,
                 &ly->ffn.gate, d_gate_pre, sv->pre_ffn_normed, tw->W_gate,
@@ -2387,8 +2464,8 @@ static TrainResult trainable_forward_backward(
             /* Step 5: backward through up projection */
             float *d_normed_up = (float*)calloc(seq_len * D, sizeof(float));
 #ifdef TWO3_BINARY
-            binary_backward_batch_cpu(d_up, sv->pre_ffn_normed, tw->W_up,
-                &ly->ffn.up, d_normed_up, dW_up, seq_len, INTER, D);
+            binary_backward_batch_gpu(d_up, sv->pre_ffn_normed, tw->W_up,
+                &tm->gpu_weights[l].up, d_normed_up, dW_up, seq_len, INTER, D);
 #else
             ternary_project_backward_gpu_batch(&tm->backward_ctx,
                 &ly->ffn.up, d_up, sv->pre_ffn_normed, tw->W_up,
@@ -2432,8 +2509,8 @@ static TrainResult trainable_forward_backward(
                 d_o_proj_all[i] = s * d_hidden[i];
         }
 #ifdef TWO3_BINARY
-        binary_backward_batch_cpu(d_o_proj_all, sv->attn_out, tw->W_o,
-            &ly->W_o, d_attn_out_all, dW_o, seq_len, D, D);
+        binary_backward_batch_gpu(d_o_proj_all, sv->attn_out, tw->W_o,
+            &tm->gpu_weights[l].W_o, d_attn_out_all, dW_o, seq_len, D, D);
 #else
         ternary_project_backward_gpu_batch(&tm->backward_ctx,
             &ly->W_o, d_o_proj_all, sv->attn_out,
@@ -2467,12 +2544,12 @@ static TrainResult trainable_forward_backward(
         float *d_normed_attn_all = (float*)calloc(seq_len * D, sizeof(float));
 
 #ifdef TWO3_BINARY
-        binary_backward_batch_cpu(dq_all, sv->pre_attn_normed, tw->W_q,
-            &ly->W_q, d_normed_attn_all, dW_q, seq_len, D, D);
-        binary_backward_batch_cpu(dk_store, sv->pre_attn_normed, tw->W_k,
-            &ly->W_k, d_normed_attn_all, dW_k, seq_len, KV, D);
-        binary_backward_batch_cpu(dv_store, sv->pre_attn_normed, tw->W_v,
-            &ly->W_v, d_normed_attn_all, dW_v, seq_len, KV, D);
+        binary_backward_batch_gpu(dq_all, sv->pre_attn_normed, tw->W_q,
+            &tm->gpu_weights[l].W_q, d_normed_attn_all, dW_q, seq_len, D, D);
+        binary_backward_batch_gpu(dk_store, sv->pre_attn_normed, tw->W_k,
+            &tm->gpu_weights[l].W_k, d_normed_attn_all, dW_k, seq_len, KV, D);
+        binary_backward_batch_gpu(dv_store, sv->pre_attn_normed, tw->W_v,
+            &tm->gpu_weights[l].W_v, d_normed_attn_all, dW_v, seq_len, KV, D);
 #else
         ternary_project_backward_gpu_batch(&tm->backward_ctx,
             &ly->W_q, dq_all, sv->pre_attn_normed,
