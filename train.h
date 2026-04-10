@@ -516,6 +516,7 @@ typedef struct {
     BinaryGPUWorkspace binary_ws;
 #ifdef TWO3_RESIDENT_FFN
     ResidentFFNState *resident_ffn;  /* [n_layers] — device-resident gate+up */
+    ResidentAttnState *resident_attn; /* [n_layers] — device-resident QKV */
 #endif
 #endif
 
@@ -728,8 +729,11 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
 #ifdef TWO3_RESIDENT_FFN
     {
         tm->resident_ffn = (ResidentFFNState*)calloc(L, sizeof(ResidentFFNState));
-        for (int l = 0; l < L; l++)
+        tm->resident_attn = (ResidentAttnState*)calloc(L, sizeof(ResidentAttnState));
+        for (int l = 0; l < L; l++) {
             resident_ffn_init(&tm->resident_ffn[l], cfg.max_seq, D, INTER);
+            resident_attn_init(&tm->resident_attn[l], cfg.max_seq, D, KV);
+        }
     }
 #endif
 #endif
@@ -1286,9 +1290,12 @@ static void trainable_model_free(TrainableModel *tm) {
     free(tm->gpu_weights);
     binary_workspace_free(&tm->binary_ws);
 #ifdef TWO3_RESIDENT_FFN
-    for (int l = 0; l < tm->cfg.n_layers; l++)
+    for (int l = 0; l < tm->cfg.n_layers; l++) {
         resident_ffn_free(&tm->resident_ffn[l]);
+        resident_attn_free(&tm->resident_attn[l]);
+    }
     free(tm->resident_ffn);
+    free(tm->resident_attn);
 #endif
 #endif
 
@@ -1647,9 +1654,11 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         ModelLayer *ly = &tm->model.layers[l];
 
         /* Clip gradients */
+#ifndef TWO3_RESIDENT_FFN
         clip_grad_norm(tw->grad_Wq, D * D, GRAD_CLIP_NORM);
         clip_grad_norm(tw->grad_Wk, KV * D, GRAD_CLIP_NORM);
         clip_grad_norm(tw->grad_Wv, KV * D, GRAD_CLIP_NORM);
+#endif
         clip_grad_norm(tw->grad_Wo, D * D, GRAD_CLIP_NORM);
 
         /* Adam on all ternary weights */
@@ -1783,9 +1792,40 @@ static void trainable_optimizer_step(TrainableModel *tm) {
          * h_s(L) = 2L, h_w(L) = 2(1-L) for L ∈ [0,1], L_WIRE = 0.5.
          * Committed weights resist flipping, boundary weights move freely.
          * No external gate — headroom IS the self-regulation mechanism. */
+#ifdef TWO3_RESIDENT_FFN
+        /* QKV: optimizer on device */
+        resident_grad_clip_adam(tm->gpu_weights[l].W_q.d_W_latent,
+            tm->resident_attn[l].q.d_grad, tm->resident_attn[l].q.d_adam_m,
+            tm->resident_attn[l].q.d_adam_v,
+            D * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
+            tm->step, tm->resident_attn[l].d_norm);
+        resident_grad_clip_adam(tm->gpu_weights[l].W_k.d_W_latent,
+            tm->resident_attn[l].k.d_grad, tm->resident_attn[l].k.d_adam_m,
+            tm->resident_attn[l].k.d_adam_v,
+            KV * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
+            tm->step, tm->resident_attn[l].d_norm);
+        resident_grad_clip_adam(tm->gpu_weights[l].W_v.d_W_latent,
+            tm->resident_attn[l].v.d_grad, tm->resident_attn[l].v.d_adam_m,
+            tm->resident_attn[l].v.d_adam_v,
+            KV * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
+            tm->step, tm->resident_attn[l].d_norm);
+        BGPU_CHECK(cudaDeviceSynchronize());
+        /* D2H: latent weights */
+        BGPU_CHECK(cudaMemcpy(tw->W_q, tm->gpu_weights[l].W_q.d_W_latent,
+                   (size_t)D * D * sizeof(float), cudaMemcpyDeviceToHost));
+        BGPU_CHECK(cudaMemcpy(tw->W_k, tm->gpu_weights[l].W_k.d_W_latent,
+                   (size_t)KV * D * sizeof(float), cudaMemcpyDeviceToHost));
+        BGPU_CHECK(cudaMemcpy(tw->W_v, tm->gpu_weights[l].W_v.d_W_latent,
+                   (size_t)KV * D * sizeof(float), cudaMemcpyDeviceToHost));
+        /* D2H: Adam moments */
+        resident_attn_sync_adam_d2h(&tm->resident_attn[l],
+            tw->adam_Wq.m, tw->adam_Wq.v, tw->adam_Wk.m, tw->adam_Wk.v,
+            tw->adam_Wv.m, tw->adam_Wv.v);
+#else
         adam_update_headroom(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update_headroom(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update_headroom(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+#endif
         adam_update_headroom(tw->W_o, tw->grad_Wo, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
 #ifdef TWO3_RESIDENT_FFN
         /* gate+up: optimizer on device, then sync latent weights back to host */
@@ -2627,7 +2667,11 @@ static TrainResult trainable_forward_backward(
         T_START();
         float *d_normed_attn_all = (float*)calloc(seq_len * D, sizeof(float));
 
-#ifdef TWO3_BINARY
+#if defined(TWO3_BINARY) && defined(TWO3_RESIDENT_FFN)
+        resident_backward_qkv(dq_all, dk_store, dv_store, sv->pre_attn_normed,
+            &tm->gpu_weights[l].W_q, &tm->gpu_weights[l].W_k, &tm->gpu_weights[l].W_v,
+            &tm->resident_attn[l], d_normed_attn_all, seq_len, D, KV);
+#elif defined(TWO3_BINARY)
         {
             const float *dY_qkv[3] = { dq_all, dk_store, dv_store };
             const BinaryWeightsGPU *Wg_qkv[3] = {
@@ -2668,9 +2712,21 @@ static TrainResult trainable_forward_backward(
         T_ACC(_ms_bwd_gain);
 
         /* Track max gradient for monitoring */
+#if defined(TWO3_BINARY) && defined(TWO3_RESIDENT_FFN)
+        /* dW_q is on device — download for monitoring */
+        {
+            float *h_tmp = (float*)malloc(D * D * sizeof(float));
+            BGPU_CHECK(cudaMemcpy(h_tmp, tm->resident_attn[l].q.d_grad,
+                       (size_t)D * D * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < D * D; i++)
+                if (fabsf(h_tmp[i]) > result.max_grad) result.max_grad = fabsf(h_tmp[i]);
+            free(h_tmp);
+        }
+#else
         for (int i = 0; i < D * D; i++) {
             if (fabsf(dW_q[i]) > result.max_grad) result.max_grad = fabsf(dW_q[i]);
         }
+#endif
 
         /* Gradients accumulated in tw->grad_* — no Adam here.
          * Caller invokes trainable_optimizer_step after batch. */
