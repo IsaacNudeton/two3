@@ -2462,35 +2462,35 @@ static TrainResult trainable_forward_backward(
             }
             free(d_h);
 
-            /* Step 4: backward through gate projection */
-            float *d_normed_gate = (float*)calloc(seq_len * D, sizeof(float));
+            /* Steps 4+5: backward through gate + up (shared input, single dX) */
 #ifdef TWO3_BINARY
-            binary_backward_batch_gpu_ws(d_gate_pre, sv->pre_ffn_normed, tw->W_gate,
-                &tm->gpu_weights[l].gate, &tm->binary_ws, d_normed_gate, dW_gate, seq_len, INTER, D);
+            {
+                const float *dY_gu[2] = { d_gate_pre, d_up };
+                const float *Wl_gu[2] = { tw->W_gate, tw->W_up };
+                const BinaryWeightsGPU *Wg_gu[2] = {
+                    &tm->gpu_weights[l].gate, &tm->gpu_weights[l].up };
+                float *dW_gu[2] = { dW_gate, dW_up };
+                binary_backward_multi_gpu_ws(dY_gu, sv->pre_ffn_normed, Wl_gu, Wg_gu,
+                    &tm->binary_ws, d_normed_ffn_all, dW_gu, 2, seq_len, D);
+            }
 #else
-            ternary_project_backward_gpu_batch(&tm->backward_ctx,
-                &ly->ffn.gate, d_gate_pre, sv->pre_ffn_normed, tw->W_gate,
-                d_normed_gate, dW_gate, seq_len, INTER, D);
+            {
+                float *d_normed_gate = (float*)calloc(seq_len * D, sizeof(float));
+                ternary_project_backward_gpu_batch(&tm->backward_ctx,
+                    &ly->ffn.gate, d_gate_pre, sv->pre_ffn_normed, tw->W_gate,
+                    d_normed_gate, dW_gate, seq_len, INTER, D);
+                float *d_normed_up = (float*)calloc(seq_len * D, sizeof(float));
+                ternary_project_backward_gpu_batch(&tm->backward_ctx,
+                    &ly->ffn.up, d_up, sv->pre_ffn_normed, tw->W_up,
+                    d_normed_up, dW_up, seq_len, INTER, D);
+                for (int i = 0; i < seq_len * D; i++)
+                    d_normed_ffn_all[i] = d_normed_gate[i] + d_normed_up[i];
+                free(d_normed_gate);
+                free(d_normed_up);
+            }
 #endif
             free(d_gate_pre);
-
-            /* Step 5: backward through up projection */
-            float *d_normed_up = (float*)calloc(seq_len * D, sizeof(float));
-#ifdef TWO3_BINARY
-            binary_backward_batch_gpu_ws(d_up, sv->pre_ffn_normed, tw->W_up,
-                &tm->gpu_weights[l].up, &tm->binary_ws, d_normed_up, dW_up, seq_len, INTER, D);
-#else
-            ternary_project_backward_gpu_batch(&tm->backward_ctx,
-                &ly->ffn.up, d_up, sv->pre_ffn_normed, tw->W_up,
-                d_normed_up, dW_up, seq_len, INTER, D);
-#endif
             free(d_up);
-
-            /* Step 6: combine gate + up gradients into d_normed */
-            for (int i = 0; i < seq_len * D; i++)
-                d_normed_ffn_all[i] = d_normed_gate[i] + d_normed_up[i];
-            free(d_normed_gate);
-            free(d_normed_up);
             /* (Old MoE backward deleted — replaced with dense FFN above) */
             /* Gain backward per position */
             for (int t = 0; t < seq_len; t++) {
@@ -2557,12 +2557,15 @@ static TrainResult trainable_forward_backward(
         float *d_normed_attn_all = (float*)calloc(seq_len * D, sizeof(float));
 
 #ifdef TWO3_BINARY
-        binary_backward_batch_gpu_ws(dq_all, sv->pre_attn_normed, tw->W_q,
-            &tm->gpu_weights[l].W_q, &tm->binary_ws, d_normed_attn_all, dW_q, seq_len, D, D);
-        binary_backward_batch_gpu_ws(dk_store, sv->pre_attn_normed, tw->W_k,
-            &tm->gpu_weights[l].W_k, &tm->binary_ws, d_normed_attn_all, dW_k, seq_len, KV, D);
-        binary_backward_batch_gpu_ws(dv_store, sv->pre_attn_normed, tw->W_v,
-            &tm->gpu_weights[l].W_v, &tm->binary_ws, d_normed_attn_all, dW_v, seq_len, KV, D);
+        {
+            const float *dY_qkv[3] = { dq_all, dk_store, dv_store };
+            const float *Wl_qkv[3] = { tw->W_q, tw->W_k, tw->W_v };
+            const BinaryWeightsGPU *Wg_qkv[3] = {
+                &tm->gpu_weights[l].W_q, &tm->gpu_weights[l].W_k, &tm->gpu_weights[l].W_v };
+            float *dW_qkv[3] = { dW_q, dW_k, dW_v };
+            binary_backward_multi_gpu_ws(dY_qkv, sv->pre_attn_normed, Wl_qkv, Wg_qkv,
+                &tm->binary_ws, d_normed_attn_all, dW_qkv, 3, seq_len, D);
+        }
 #else
         ternary_project_backward_gpu_batch(&tm->backward_ctx,
             &ly->W_q, dq_all, sv->pre_attn_normed,

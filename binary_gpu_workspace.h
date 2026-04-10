@@ -451,7 +451,8 @@ static void binary_backward_batch_gpu_ws(
     BGPU_CHECK(cudaMemcpy(ws->d_X_bw, X, (size_t)S * K * sizeof(float), cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemset(ws->d_dX_bw, 0, (size_t)S * K * sizeof(float)));
     BGPU_CHECK(cudaMemcpy(ws->d_W_latent_bw, W_latent, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
-    BGPU_CHECK(cudaMemcpy(ws->d_dW_bw, dW_latent, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
+    /* dW starts at zero — kernel accumulates, host overwrites (line 483) */
+    BGPU_CHECK(cudaMemset(ws->d_dW_bw, 0, (size_t)M * K * sizeof(float)));
 
     /* Kernel 1: dX = W^T @ dY (tiled, with backward scale) */
     {
@@ -481,6 +482,77 @@ static void binary_backward_batch_gpu_ws(
     BGPU_CHECK(cudaMemcpy(ws->h_dW_bw, ws->d_dW_bw, (size_t)M * K * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < S * K; i++) dX[i] += ws->h_dX_bw[i];
     for (int i = 0; i < M * K; i++) dW_latent[i] = ws->h_dW_bw[i];
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Multi-backward: N projections sharing the same input X
+ *
+ * Uploads X once, accumulates dX on device across all N
+ * projections, downloads dX once. Saves (N-1) X uploads,
+ * (N-1) dX downloads, and (N-1) host accumulation loops.
+ * ═══════════════════════════════════════════════════════ */
+
+static void binary_backward_multi_gpu_ws(
+    const float *dY_list[],           /* [N] each [S × M_i] host */
+    const float *X,                   /* [S × K] host — shared input */
+    const float *W_latent_list[],     /* [N] each [M_i × K] host */
+    const BinaryWeightsGPU *W_list[], /* [N] packed binary (device) */
+    BinaryGPUWorkspace *ws,
+    float *dX,                        /* [S × K] host, ACCUMULATE */
+    float *dW_latent_list[],          /* [N] each [M_i × K] host, OVERWRITE */
+    int N, int S, int K
+) {
+    /* Find max output dimension across all projections */
+    int max_M = 0;
+    for (int i = 0; i < N; i++) {
+        if (W_list[i]->rows > max_M) max_M = W_list[i]->rows;
+    }
+
+    binary_workspace_ensure(ws, S, K, max_M);
+
+    /* Upload X once */
+    BGPU_CHECK(cudaMemcpy(ws->d_X_bw, X, (size_t)S * K * sizeof(float), cudaMemcpyHostToDevice));
+
+    /* Zero dX once — accumulates across all N projections on device */
+    BGPU_CHECK(cudaMemset(ws->d_dX_bw, 0, (size_t)S * K * sizeof(float)));
+
+    for (int i = 0; i < N; i++) {
+        int M = W_list[i]->rows;
+        float bwd_scale = 1.0f / sqrtf(W_list[i]->density * (float)M + 1e-6f);
+
+        /* Upload per-projection data */
+        BGPU_CHECK(cudaMemcpy(ws->d_dY_bw, dY_list[i], (size_t)S * M * sizeof(float), cudaMemcpyHostToDevice));
+        BGPU_CHECK(cudaMemcpy(ws->d_W_latent_bw, W_latent_list[i], (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
+        BGPU_CHECK(cudaMemset(ws->d_dW_bw, 0, (size_t)M * K * sizeof(float)));
+
+        /* Kernel 1: dX += W^T @ dY (accumulates across projections) */
+        {
+            dim3 block(BTILE_M, BTILE_N);
+            dim3 grid((K + BTILE_M - 1) / BTILE_M,
+                      (S + BTILE_N - 1) / BTILE_N);
+            binary_backward_dx_tiled<<<grid, block>>>(
+                ws->d_dY_bw, W_list[i]->d_packed, ws->d_dX_bw, S, M, K, bwd_scale);
+            BGPU_CHECK(cudaGetLastError());
+        }
+
+        /* Kernel 2: dW = dY^T @ X with STE clip */
+        {
+            dim3 block(BDWK_BLOCK, BDWK_BLOCK);
+            dim3 grid((K + BDWK_BLOCK - 1) / BDWK_BLOCK,
+                      (M + BDWK_BLOCK - 1) / BDWK_BLOCK);
+            binary_backward_dw_tiled<<<grid, block>>>(
+                ws->d_dY_bw, ws->d_X_bw, ws->d_W_latent_bw, ws->d_dW_bw, S, M, K, BINARY_STE_CLIP);
+            BGPU_CHECK(cudaGetLastError());
+        }
+
+        /* Sync + download dW for this projection (buffer reused next iteration) */
+        BGPU_CHECK(cudaDeviceSynchronize());
+        BGPU_CHECK(cudaMemcpy(dW_latent_list[i], ws->d_dW_bw, (size_t)M * K * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+
+    /* Download accumulated dX once */
+    BGPU_CHECK(cudaMemcpy(ws->h_dX_bw, ws->d_dX_bw, (size_t)S * K * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < S * K; i++) dX[i] += ws->h_dX_bw[i];
 }
 
 #endif /* BINARY_GPU_WORKSPACE_H */
