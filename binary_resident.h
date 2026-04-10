@@ -115,24 +115,28 @@ static void resident_attn_sync_adam_d2h(ResidentAttnState *s,
 
 typedef struct {
     /* Gradient accumulators — written by backward, consumed by optimizer */
-    float *d_grad_gate;     /* [M × K] = [INTER × D] */
-    float *d_grad_up;       /* [M × K] */
+    /* gate+up: M=INTER, K=D */
+    float *d_grad_gate;     /* [INTER × D] */
+    float *d_grad_up;       /* [INTER × D] */
+    float *d_adam_m_gate, *d_adam_v_gate;  /* [INTER × D] each */
+    float *d_adam_m_up, *d_adam_v_up;      /* [INTER × D] each */
+    float *d_dY_gate;       /* [max_S × INTER] */
+    float *d_dY_up;         /* [max_S × INTER] */
+    float *d_X;             /* [max_S × D] shared input (pre_ffn_normed) */
+    float *d_dX;            /* [max_S × D] backward output */
 
-    /* Adam moments — persistent on device */
-    float *d_adam_m_gate, *d_adam_v_gate;  /* [M × K] each */
-    float *d_adam_m_up, *d_adam_v_up;      /* [M × K] each */
-
-    /* Backward staging — input data uploaded per call */
-    float *d_dY_gate;       /* [max_S × M] */
-    float *d_dY_up;         /* [max_S × M] */
-    float *d_X;             /* [max_S × K] shared input (pre_ffn_normed) */
-    float *d_dX;            /* [max_S × K] backward output */
+    /* down: M=D, K=INTER */
+    float *d_grad_down;     /* [D × INTER] */
+    float *d_adam_m_down, *d_adam_v_down;  /* [D × INTER] each */
+    float *d_dY_down;       /* [max_S × D] */
+    float *d_X_down;        /* [max_S × INTER] input (ffn_h) */
+    float *d_dX_down;       /* [max_S × INTER] backward output */
 
     /* Scratch */
     float *d_norm;          /* [1] for grad norm reduction */
 
     /* Capacity */
-    int max_S, K, M;
+    int max_S, K, M;       /* K=D, M=INTER for gate+up */
 } ResidentFFNState;
 
 /* ═══════════════════════════════════════════════════════
@@ -160,11 +164,24 @@ static void resident_ffn_init(ResidentFFNState *s, int max_S, int K, int M) {
     BGPU_CHECK(cudaMalloc(&s->d_dX, sk));
     BGPU_CHECK(cudaMalloc(&s->d_norm, sizeof(float)));
 
+    /* Down projection: M=K(D), K=M(INTER) — reversed dimensions */
+    size_t dk = (size_t)K * M * sizeof(float);  /* D × INTER = K × M */
+    size_t s_down_dy = (size_t)max_S * K * sizeof(float);  /* S × D */
+    size_t s_down_x = (size_t)max_S * M * sizeof(float);   /* S × INTER */
+    BGPU_CHECK(cudaMalloc(&s->d_grad_down, dk));
+    BGPU_CHECK(cudaMalloc(&s->d_adam_m_down, dk));
+    BGPU_CHECK(cudaMalloc(&s->d_adam_v_down, dk));
+    BGPU_CHECK(cudaMalloc(&s->d_dY_down, s_down_dy));
+    BGPU_CHECK(cudaMalloc(&s->d_X_down, s_down_x));
+    BGPU_CHECK(cudaMalloc(&s->d_dX_down, s_down_x));
+
     /* Zero Adam moments */
     BGPU_CHECK(cudaMemset(s->d_adam_m_gate, 0, mk));
     BGPU_CHECK(cudaMemset(s->d_adam_v_gate, 0, mk));
     BGPU_CHECK(cudaMemset(s->d_adam_m_up, 0, mk));
     BGPU_CHECK(cudaMemset(s->d_adam_v_up, 0, mk));
+    BGPU_CHECK(cudaMemset(s->d_adam_m_down, 0, dk));
+    BGPU_CHECK(cudaMemset(s->d_adam_v_down, 0, dk));
 }
 
 static void resident_ffn_free(ResidentFFNState *s) {
@@ -178,6 +195,12 @@ static void resident_ffn_free(ResidentFFNState *s) {
     if (s->d_dY_up) cudaFree(s->d_dY_up);
     if (s->d_X) cudaFree(s->d_X);
     if (s->d_dX) cudaFree(s->d_dX);
+    if (s->d_grad_down) cudaFree(s->d_grad_down);
+    if (s->d_adam_m_down) cudaFree(s->d_adam_m_down);
+    if (s->d_adam_v_down) cudaFree(s->d_adam_v_down);
+    if (s->d_dY_down) cudaFree(s->d_dY_down);
+    if (s->d_X_down) cudaFree(s->d_X_down);
+    if (s->d_dX_down) cudaFree(s->d_dX_down);
     if (s->d_norm) cudaFree(s->d_norm);
     memset(s, 0, sizeof(*s));
 }
@@ -185,25 +208,33 @@ static void resident_ffn_free(ResidentFFNState *s) {
 /* Upload Adam state from host (init / checkpoint resume) */
 static void resident_ffn_sync_adam_h2d(ResidentFFNState *s,
     const float *h_m_gate, const float *h_v_gate,
-    const float *h_m_up, const float *h_v_up
+    const float *h_m_up, const float *h_v_up,
+    const float *h_m_down, const float *h_v_down
 ) {
     size_t mk = (size_t)s->M * s->K * sizeof(float);
+    size_t dk = (size_t)s->K * s->M * sizeof(float);  /* D × INTER for down */
     BGPU_CHECK(cudaMemcpy(s->d_adam_m_gate, h_m_gate, mk, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(s->d_adam_v_gate, h_v_gate, mk, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(s->d_adam_m_up, h_m_up, mk, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(s->d_adam_v_up, h_v_up, mk, cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(s->d_adam_m_down, h_m_down, dk, cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(s->d_adam_v_down, h_v_down, dk, cudaMemcpyHostToDevice));
 }
 
 /* Download Adam state to host (checkpointing) */
 static void resident_ffn_sync_adam_d2h(ResidentFFNState *s,
     float *h_m_gate, float *h_v_gate,
-    float *h_m_up, float *h_v_up
+    float *h_m_up, float *h_v_up,
+    float *h_m_down, float *h_v_down
 ) {
     size_t mk = (size_t)s->M * s->K * sizeof(float);
+    size_t dk = (size_t)s->K * s->M * sizeof(float);
     BGPU_CHECK(cudaMemcpy(h_m_gate, s->d_adam_m_gate, mk, cudaMemcpyDeviceToHost));
     BGPU_CHECK(cudaMemcpy(h_v_gate, s->d_adam_v_gate, mk, cudaMemcpyDeviceToHost));
     BGPU_CHECK(cudaMemcpy(h_m_up, s->d_adam_m_up, mk, cudaMemcpyDeviceToHost));
     BGPU_CHECK(cudaMemcpy(h_v_up, s->d_adam_v_up, mk, cudaMemcpyDeviceToHost));
+    BGPU_CHECK(cudaMemcpy(h_m_down, s->d_adam_m_down, dk, cudaMemcpyDeviceToHost));
+    BGPU_CHECK(cudaMemcpy(h_v_down, s->d_adam_v_down, dk, cudaMemcpyDeviceToHost));
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -418,6 +449,55 @@ static void resident_backward_qkv(
         float *h_buf = (float*)malloc((size_t)S * D * sizeof(float));
         BGPU_CHECK(cudaMemcpy(h_buf, rs->d_dX, (size_t)S * D * sizeof(float), cudaMemcpyDeviceToHost));
         for (int i = 0; i < S * D; i++) h_dX[i] += h_buf[i];
+        free(h_buf);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════
+ * Resident backward for down projection (single)
+ *
+ * dY=d_ffn_out [S×D], X=ffn_h [S×INTER]
+ * dW stays on device. dX (d_h) downloaded for SwiGLU backward.
+ * ═══════════════════════════════════════════════════════ */
+
+static void resident_backward_down(
+    const float *h_dY,              /* [S × D] host — d_ffn_out */
+    const float *h_X,               /* [S × INTER] host — ffn_h */
+    const BinaryWeightsGPU *W_down,
+    ResidentFFNState *rs,
+    float *h_dX,                    /* [S × INTER] host — ACCUMULATE d_h */
+    int S, int D, int INTER
+) {
+    int M = D, K = INTER;  /* down: D rows, INTER cols */
+
+    /* Upload inputs */
+    BGPU_CHECK(cudaMemcpy(rs->d_dY_down, h_dY, (size_t)S * M * sizeof(float), cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(rs->d_X_down, h_X, (size_t)S * K * sizeof(float), cudaMemcpyHostToDevice));
+
+    /* Zero outputs */
+    BGPU_CHECK(cudaMemset(rs->d_dX_down, 0, (size_t)S * K * sizeof(float)));
+    BGPU_CHECK(cudaMemset(rs->d_grad_down, 0, (size_t)M * K * sizeof(float)));
+
+    /* Kernel 1: dX = W^T @ dY */
+    float bwd_scale = 1.0f / sqrtf(W_down->density * (float)M + 1e-6f);
+    dim3 b1(BTILE_M, BTILE_N);
+    dim3 g1((K + BTILE_M - 1) / BTILE_M, (S + BTILE_N - 1) / BTILE_N);
+    binary_backward_dx_tiled<<<g1, b1>>>(
+        rs->d_dY_down, W_down->d_packed, rs->d_dX_down, S, M, K, bwd_scale);
+
+    /* Kernel 2: dW = dY^T @ X with STE clip */
+    dim3 b2(BDWK_BLOCK, BDWK_BLOCK);
+    dim3 g2((K + BDWK_BLOCK - 1) / BDWK_BLOCK, (M + BDWK_BLOCK - 1) / BDWK_BLOCK);
+    binary_backward_dw_tiled<<<g2, b2>>>(
+        rs->d_dY_down, rs->d_X_down, W_down->d_W_latent, rs->d_grad_down, S, M, K, BINARY_STE_CLIP);
+
+    BGPU_CHECK(cudaDeviceSynchronize());
+
+    /* Download dX — needed by SwiGLU backward on host */
+    {
+        float *h_buf = (float*)malloc((size_t)S * K * sizeof(float));
+        BGPU_CHECK(cudaMemcpy(h_buf, rs->d_dX_down, (size_t)S * K * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < S * K; i++) h_dX[i] += h_buf[i];
         free(h_buf);
     }
 }

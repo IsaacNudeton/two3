@@ -1666,7 +1666,9 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         clip_grad_norm(tw->grad_gate, INTER * D, GRAD_CLIP_NORM);
         clip_grad_norm(tw->grad_up, INTER * D, GRAD_CLIP_NORM);
 #endif
+#ifndef TWO3_RESIDENT_FFN
         clip_grad_norm(tw->grad_down, D * INTER, GRAD_CLIP_NORM);
+#endif
 
 #if defined(TWO3_GPU_RESIDENT)
 #elif defined(TWO3_GPU_RESIDENT)
@@ -1840,20 +1842,30 @@ static void trainable_optimizer_step(TrainableModel *tm) {
             INTER * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
             tm->step, tm->resident_ffn[l].d_norm);
         BGPU_CHECK(cudaDeviceSynchronize());
+        /* down: optimizer on device */
+        resident_grad_clip_adam(tm->gpu_weights[l].down.d_W_latent,
+            tm->resident_ffn[l].d_grad_down, tm->resident_ffn[l].d_adam_m_down,
+            tm->resident_ffn[l].d_adam_v_down,
+            D * INTER, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
+            tm->step, tm->resident_ffn[l].d_norm);
+        BGPU_CHECK(cudaDeviceSynchronize());
         /* D2H: latent weights for checkpointing/requantize */
         BGPU_CHECK(cudaMemcpy(tw->W_gate, tm->gpu_weights[l].gate.d_W_latent,
                    (size_t)INTER * D * sizeof(float), cudaMemcpyDeviceToHost));
         BGPU_CHECK(cudaMemcpy(tw->W_up, tm->gpu_weights[l].up.d_W_latent,
                    (size_t)INTER * D * sizeof(float), cudaMemcpyDeviceToHost));
+        BGPU_CHECK(cudaMemcpy(tw->W_down, tm->gpu_weights[l].down.d_W_latent,
+                   (size_t)D * INTER * sizeof(float), cudaMemcpyDeviceToHost));
         /* D2H: Adam moments for checkpointing */
         resident_ffn_sync_adam_d2h(&tm->resident_ffn[l],
             tw->adam_gate.m, tw->adam_gate.v,
-            tw->adam_up.m, tw->adam_up.v);
+            tw->adam_up.m, tw->adam_up.v,
+            tw->adam_down.m, tw->adam_down.v);
 #else
         adam_update_headroom(tw->W_gate, tw->grad_gate, &tw->adam_gate, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update_headroom(tw->W_up, tw->grad_up, &tw->adam_up, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-#endif
         adam_update_headroom(tw->W_down, tw->grad_down, &tw->adam_down, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+#endif
 #else
         adam_update(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
@@ -2543,7 +2555,11 @@ static TrainResult trainable_forward_backward(
              * Plus weight gradients: dW_down, dW_gate, dW_up */
 
             float *d_h = (float*)calloc(seq_len * INTER, sizeof(float));
-#ifdef TWO3_BINARY
+#if defined(TWO3_BINARY) && defined(TWO3_RESIDENT_FFN)
+            resident_backward_down(d_ffn_out, sv->ffn_h,
+                &tm->gpu_weights[l].down, &tm->resident_ffn[l],
+                d_h, seq_len, D, INTER);
+#elif defined(TWO3_BINARY)
             binary_backward_batch_gpu_ws(d_ffn_out, sv->ffn_h,
                 &tm->gpu_weights[l].down, &tm->binary_ws, d_h, dW_down, seq_len, D, INTER);
 #else
