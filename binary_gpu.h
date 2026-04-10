@@ -61,6 +61,7 @@
 typedef struct {
     uint32_t *d_packed;   /* device copy */
     uint32_t *h_packed;   /* host copy */
+    float    *d_W_latent; /* device copy of float latent weights (for backward STE) */
     float     density;
     int       rows;
     int       cols;
@@ -418,8 +419,10 @@ static BinaryWeightsGPU binary_pack_weights_gpu(const float *w_float, int rows, 
 static void binary_free_weights_gpu(BinaryWeightsGPU *w) {
     if (w->d_packed) cudaFree(w->d_packed);
     if (w->h_packed) free(w->h_packed);
+    if (w->d_W_latent) cudaFree(w->d_W_latent);
     w->d_packed = NULL;
     w->h_packed = NULL;
+    w->d_W_latent = NULL;
 }
 
 /* Update device copy after requantize (host weights changed) */

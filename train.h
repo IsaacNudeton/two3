@@ -33,6 +33,9 @@
 #ifdef TWO3_BINARY
 #include "binary_gpu.h"
 #include "binary_gpu_workspace.h"
+#ifdef TWO3_RESIDENT_FFN
+#include "binary_resident.h"
+#endif
 #endif
 #include <math.h>
 #include <string.h>
@@ -511,6 +514,9 @@ typedef struct {
 
     /* GPU workspace for binary projection — persistent buffers */
     BinaryGPUWorkspace binary_ws;
+#ifdef TWO3_RESIDENT_FFN
+    ResidentFFNState *resident_ffn;  /* [n_layers] — device-resident gate+up */
+#endif
 #endif
 
     /* Training hyperparams */
@@ -719,6 +725,13 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         int max_M = max_K;  /* same for output */
         binary_workspace_init(&tm->binary_ws, max_S, max_K, max_M);
     }
+#ifdef TWO3_RESIDENT_FFN
+    {
+        tm->resident_ffn = (ResidentFFNState*)calloc(L, sizeof(ResidentFFNState));
+        for (int l = 0; l < L; l++)
+            resident_ffn_init(&tm->resident_ffn[l], cfg.max_seq, D, INTER);
+    }
+#endif
 #endif
 
 #ifdef TWO3_GPU_RESIDENT
@@ -983,6 +996,29 @@ static void binary_gpu_sync_all(TrainableModel *tm) {
         binary_gpu_sync(&tm->gpu_weights[l].down, &ly->ffn.down);
     }
 }
+
+/* Upload latent float weights to device for backward STE.
+ * Allocates d_W_latent on first call, then just re-uploads. */
+static void binary_gpu_sync_latent(BinaryWeightsGPU *gpu, const float *latent) {
+    size_t bytes = (size_t)gpu->rows * gpu->cols * sizeof(float);
+    if (gpu->d_W_latent == NULL) {
+        BGPU_CHECK(cudaMalloc(&gpu->d_W_latent, bytes));
+    }
+    BGPU_CHECK(cudaMemcpy(gpu->d_W_latent, latent, bytes, cudaMemcpyHostToDevice));
+}
+
+static void binary_gpu_sync_latent_all(TrainableModel *tm) {
+    for (int l = 0; l < tm->cfg.n_layers; l++) {
+        TrainableLayerWeights *tw = &tm->layer_weights[l];
+        binary_gpu_sync_latent(&tm->gpu_weights[l].W_q, tw->W_q);
+        binary_gpu_sync_latent(&tm->gpu_weights[l].W_k, tw->W_k);
+        binary_gpu_sync_latent(&tm->gpu_weights[l].W_v, tw->W_v);
+        binary_gpu_sync_latent(&tm->gpu_weights[l].W_o, tw->W_o);
+        binary_gpu_sync_latent(&tm->gpu_weights[l].gate, tw->W_gate);
+        binary_gpu_sync_latent(&tm->gpu_weights[l].up, tw->W_up);
+        binary_gpu_sync_latent(&tm->gpu_weights[l].down, tw->W_down);
+    }
+}
 #endif
 
 static void trainable_requantize(TrainableModel *tm) {
@@ -1092,6 +1128,7 @@ static void trainable_requantize(TrainableModel *tm) {
 
 #ifdef TWO3_BINARY
     binary_gpu_sync_all(tm);
+    binary_gpu_sync_latent_all(tm);
 #endif
 }
 
@@ -1248,6 +1285,11 @@ static void trainable_model_free(TrainableModel *tm) {
     }
     free(tm->gpu_weights);
     binary_workspace_free(&tm->binary_ws);
+#ifdef TWO3_RESIDENT_FFN
+    for (int l = 0; l < tm->cfg.n_layers; l++)
+        resident_ffn_free(&tm->resident_ffn[l]);
+    free(tm->resident_ffn);
+#endif
 #endif
 
 #ifdef TWO3_GPU_RESIDENT
@@ -1611,8 +1653,10 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         clip_grad_norm(tw->grad_Wo, D * D, GRAD_CLIP_NORM);
 
         /* Adam on all ternary weights */
+#ifndef TWO3_RESIDENT_FFN
         clip_grad_norm(tw->grad_gate, INTER * D, GRAD_CLIP_NORM);
         clip_grad_norm(tw->grad_up, INTER * D, GRAD_CLIP_NORM);
+#endif
         clip_grad_norm(tw->grad_down, D * INTER, GRAD_CLIP_NORM);
 
 #if defined(TWO3_GPU_RESIDENT)
@@ -1743,8 +1787,32 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         adam_update_headroom(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update_headroom(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update_headroom(tw->W_o, tw->grad_Wo, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+#ifdef TWO3_RESIDENT_FFN
+        /* gate+up: optimizer on device, then sync latent weights back to host */
+        resident_grad_clip_adam(tm->gpu_weights[l].gate.d_W_latent,
+            tm->resident_ffn[l].d_grad_gate, tm->resident_ffn[l].d_adam_m_gate,
+            tm->resident_ffn[l].d_adam_v_gate,
+            INTER * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
+            tm->step, tm->resident_ffn[l].d_norm);
+        resident_grad_clip_adam(tm->gpu_weights[l].up.d_W_latent,
+            tm->resident_ffn[l].d_grad_up, tm->resident_ffn[l].d_adam_m_up,
+            tm->resident_ffn[l].d_adam_v_up,
+            INTER * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
+            tm->step, tm->resident_ffn[l].d_norm);
+        BGPU_CHECK(cudaDeviceSynchronize());
+        /* D2H: latent weights for checkpointing/requantize */
+        BGPU_CHECK(cudaMemcpy(tw->W_gate, tm->gpu_weights[l].gate.d_W_latent,
+                   (size_t)INTER * D * sizeof(float), cudaMemcpyDeviceToHost));
+        BGPU_CHECK(cudaMemcpy(tw->W_up, tm->gpu_weights[l].up.d_W_latent,
+                   (size_t)INTER * D * sizeof(float), cudaMemcpyDeviceToHost));
+        /* D2H: Adam moments for checkpointing */
+        resident_ffn_sync_adam_d2h(&tm->resident_ffn[l],
+            tw->adam_gate.m, tw->adam_gate.v,
+            tw->adam_up.m, tw->adam_up.v);
+#else
         adam_update_headroom(tw->W_gate, tw->grad_gate, &tw->adam_gate, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update_headroom(tw->W_up, tw->grad_up, &tw->adam_up, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+#endif
         adam_update_headroom(tw->W_down, tw->grad_down, &tw->adam_down, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
 #else
         adam_update(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
@@ -2436,7 +2504,7 @@ static TrainResult trainable_forward_backward(
 
             float *d_h = (float*)calloc(seq_len * INTER, sizeof(float));
 #ifdef TWO3_BINARY
-            binary_backward_batch_gpu_ws(d_ffn_out, sv->ffn_h, tw->W_down,
+            binary_backward_batch_gpu_ws(d_ffn_out, sv->ffn_h,
                 &tm->gpu_weights[l].down, &tm->binary_ws, d_h, dW_down, seq_len, D, INTER);
 #else
             ternary_project_backward_gpu_batch(&tm->backward_ctx,
@@ -2463,14 +2531,17 @@ static TrainResult trainable_forward_backward(
             free(d_h);
 
             /* Steps 4+5: backward through gate + up (shared input, single dX) */
-#ifdef TWO3_BINARY
+#if defined(TWO3_BINARY) && defined(TWO3_RESIDENT_FFN)
+            resident_backward_gate_up(d_gate_pre, d_up, sv->pre_ffn_normed,
+                &tm->gpu_weights[l].gate, &tm->gpu_weights[l].up,
+                &tm->resident_ffn[l], d_normed_ffn_all, seq_len, D, INTER);
+#elif defined(TWO3_BINARY)
             {
                 const float *dY_gu[2] = { d_gate_pre, d_up };
-                const float *Wl_gu[2] = { tw->W_gate, tw->W_up };
                 const BinaryWeightsGPU *Wg_gu[2] = {
                     &tm->gpu_weights[l].gate, &tm->gpu_weights[l].up };
                 float *dW_gu[2] = { dW_gate, dW_up };
-                binary_backward_multi_gpu_ws(dY_gu, sv->pre_ffn_normed, Wl_gu, Wg_gu,
+                binary_backward_multi_gpu_ws(dY_gu, sv->pre_ffn_normed, Wg_gu,
                     &tm->binary_ws, d_normed_ffn_all, dW_gu, 2, seq_len, D);
             }
 #else
@@ -2522,7 +2593,7 @@ static TrainResult trainable_forward_backward(
                 d_o_proj_all[i] = s * d_hidden[i];
         }
 #ifdef TWO3_BINARY
-        binary_backward_batch_gpu_ws(d_o_proj_all, sv->attn_out, tw->W_o,
+        binary_backward_batch_gpu_ws(d_o_proj_all, sv->attn_out,
             &tm->gpu_weights[l].W_o, &tm->binary_ws, d_attn_out_all, dW_o, seq_len, D, D);
 #else
         ternary_project_backward_gpu_batch(&tm->backward_ctx,
@@ -2559,11 +2630,10 @@ static TrainResult trainable_forward_backward(
 #ifdef TWO3_BINARY
         {
             const float *dY_qkv[3] = { dq_all, dk_store, dv_store };
-            const float *Wl_qkv[3] = { tw->W_q, tw->W_k, tw->W_v };
             const BinaryWeightsGPU *Wg_qkv[3] = {
                 &tm->gpu_weights[l].W_q, &tm->gpu_weights[l].W_k, &tm->gpu_weights[l].W_v };
             float *dW_qkv[3] = { dW_q, dW_k, dW_v };
-            binary_backward_multi_gpu_ws(dY_qkv, sv->pre_attn_normed, Wl_qkv, Wg_qkv,
+            binary_backward_multi_gpu_ws(dY_qkv, sv->pre_attn_normed, Wg_qkv,
                 &tm->binary_ws, d_normed_attn_all, dW_qkv, 3, seq_len, D);
         }
 #else

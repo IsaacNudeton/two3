@@ -83,17 +83,22 @@ int main(void) {
         
         /* Pack weights for GPU */
         BinaryWeightsGPU gpu_weights = binary_pack_weights_gpu(h_weights, sh.M, sh.K);
-        
-        /* Original GPU backward */
+
+        /* Upload latent weights to device (required by workspace backward) */
+        gpu_weights.d_W_latent = NULL;
+        CHECK_CUDA(cudaMalloc(&gpu_weights.d_W_latent, (size_t)sh.M * sh.K * sizeof(float)));
+        CHECK_CUDA(cudaMemcpy(gpu_weights.d_W_latent, h_weights, (size_t)sh.M * sh.K * sizeof(float), cudaMemcpyHostToDevice));
+
+        /* Original GPU backward (reference — takes host W_latent) */
         binary_backward_batch_gpu(h_dY, h_input, h_weights, &gpu_weights,
                                    h_dX_gpu, h_dW_gpu, sh.S, sh.M, sh.K);
-        
+
         /* Workspace setup */
         BinaryGPUWorkspace ws;
         binary_workspace_init(&ws, sh.S, sh.K, sh.M);
-        
-        /* Workspace backward */
-        binary_backward_batch_gpu_ws(h_dY, h_input, h_weights, &gpu_weights,
+
+        /* Workspace backward (reads W_latent from device) */
+        binary_backward_batch_gpu_ws(h_dY, h_input, &gpu_weights,
                                       &ws, h_dX_ws, h_dW_ws, sh.S, sh.M, sh.K);
         
         /* Compare */
@@ -155,6 +160,10 @@ int main(void) {
             init_grad(dY[i], S, Ms[i]);
             init_weights(W_lat[i], Ms[i], K);
             Wgpu[i] = binary_pack_weights_gpu(W_lat[i], Ms[i], K);
+            /* Upload latent to device */
+            Wgpu[i].d_W_latent = NULL;
+            CHECK_CUDA(cudaMalloc(&Wgpu[i].d_W_latent, (size_t)Ms[i] * K * sizeof(float)));
+            CHECK_CUDA(cudaMemcpy(Wgpu[i].d_W_latent, W_lat[i], (size_t)Ms[i] * K * sizeof(float), cudaMemcpyHostToDevice));
         }
 
         float *dX_single = (float*)calloc(S * K, sizeof(float));
@@ -164,17 +173,16 @@ int main(void) {
         int max_M = 256;
         binary_workspace_init(&ws, S, K, max_M);
 
-        /* Reference: 3 × single backward */
+        /* Reference: 3 × single backward (reads d_W_latent from device) */
         for (int i = 0; i < N; i++) {
-            binary_backward_batch_gpu_ws(dY[i], X, W_lat[i], &Wgpu[i],
+            binary_backward_batch_gpu_ws(dY[i], X, &Wgpu[i],
                 &ws, dX_single, dW_single[i], S, Ms[i], K);
         }
 
         /* Test: multi backward */
         const float *dY_c[3] = { dY[0], dY[1], dY[2] };
-        const float *Wl_c[3] = { W_lat[0], W_lat[1], W_lat[2] };
         const BinaryWeightsGPU *Wg_c[3] = { &Wgpu[0], &Wgpu[1], &Wgpu[2] };
-        binary_backward_multi_gpu_ws(dY_c, X, Wl_c, Wg_c,
+        binary_backward_multi_gpu_ws(dY_c, X, Wg_c,
             &ws, dX_multi, dW_multi, N, S, K);
 
         float err_dX = max_error(dX_single, dX_multi, S * K);
@@ -223,6 +231,9 @@ int main(void) {
             init_grad(dY[i], S, Ms[i]);
             init_weights(W_lat[i], Ms[i], K);
             Wgpu[i] = binary_pack_weights_gpu(W_lat[i], Ms[i], K);
+            Wgpu[i].d_W_latent = NULL;
+            CHECK_CUDA(cudaMalloc(&Wgpu[i].d_W_latent, (size_t)Ms[i] * K * sizeof(float)));
+            CHECK_CUDA(cudaMemcpy(Wgpu[i].d_W_latent, W_lat[i], (size_t)Ms[i] * K * sizeof(float), cudaMemcpyHostToDevice));
         }
 
         float *dX_single = (float*)calloc(S * K, sizeof(float));
@@ -233,15 +244,14 @@ int main(void) {
 
         /* Reference: 2 × single backward */
         for (int i = 0; i < N; i++) {
-            binary_backward_batch_gpu_ws(dY[i], X, W_lat[i], &Wgpu[i],
+            binary_backward_batch_gpu_ws(dY[i], X, &Wgpu[i],
                 &ws, dX_single, dW_single[i], S, Ms[i], K);
         }
 
         /* Test: multi backward */
         const float *dY_c[2] = { dY[0], dY[1] };
-        const float *Wl_c[2] = { W_lat[0], W_lat[1] };
         const BinaryWeightsGPU *Wg_c[2] = { &Wgpu[0], &Wgpu[1] };
-        binary_backward_multi_gpu_ws(dY_c, X, Wl_c, Wg_c,
+        binary_backward_multi_gpu_ws(dY_c, X, Wg_c,
             &ws, dX_multi, dW_multi, N, S, K);
 
         float err_dX = max_error(dX_single, dX_multi, S * K);

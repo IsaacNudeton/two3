@@ -378,6 +378,9 @@ int main(int argc, char **argv) {
              * the multiplicative update in adam_update handles commitment.
              * Headroom-modulated Adam replaces match gating (theorem 68). */
             trainable_optimizer_step(&tm);
+#ifdef TWO3_BINARY
+            binary_gpu_sync_latent_all(&tm);
+#endif
 
             global_step++;
 

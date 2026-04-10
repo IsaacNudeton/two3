@@ -436,22 +436,19 @@ static void binary_project_multi_gpu_resident(
 static void binary_backward_batch_gpu_ws(
     const float *dY,             /* [S × M] host */
     const float *X,              /* [S × K] host */
-    const float *W_latent,       /* [M × K] host, float latent weights */
-    const BinaryWeightsGPU *W,   /* packed binary (device) */
+    const BinaryWeightsGPU *W,   /* packed binary + d_W_latent (device) */
     BinaryGPUWorkspace *ws,
     float *dX,                   /* [S × K] host, ACCUMULATE */
-    float *dW_latent,            /* [M × K] host, ACCUMULATE */
+    float *dW_latent,            /* [M × K] host, OVERWRITE */
     int S, int M, int K
 ) {
     /* Ensure capacity BEFORE any work */
     binary_workspace_ensure(ws, S, K, M);
 
-    /* H2D transfer */
+    /* H2D transfer — W_latent already on device via binary_gpu_sync_latent */
     BGPU_CHECK(cudaMemcpy(ws->d_dY_bw, dY, (size_t)S * M * sizeof(float), cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(ws->d_X_bw, X, (size_t)S * K * sizeof(float), cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemset(ws->d_dX_bw, 0, (size_t)S * K * sizeof(float)));
-    BGPU_CHECK(cudaMemcpy(ws->d_W_latent_bw, W_latent, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
-    /* dW starts at zero — kernel accumulates, host overwrites (line 483) */
     BGPU_CHECK(cudaMemset(ws->d_dW_bw, 0, (size_t)M * K * sizeof(float)));
 
     /* Kernel 1: dX = W^T @ dY (tiled, with backward scale) */
@@ -465,13 +462,13 @@ static void binary_backward_batch_gpu_ws(
         BGPU_CHECK(cudaGetLastError());
     }
 
-    /* Kernel 2: dW = dY^T @ X with STE clip */
+    /* Kernel 2: dW = dY^T @ X with STE clip — reads W_latent from device */
     {
         dim3 block(BDWK_BLOCK, BDWK_BLOCK);
         dim3 grid((K + BDWK_BLOCK - 1) / BDWK_BLOCK,
                   (M + BDWK_BLOCK - 1) / BDWK_BLOCK);
         binary_backward_dw_tiled<<<grid, block>>>(
-            ws->d_dY_bw, ws->d_X_bw, ws->d_W_latent_bw, ws->d_dW_bw, S, M, K, BINARY_STE_CLIP);
+            ws->d_dY_bw, ws->d_X_bw, W->d_W_latent, ws->d_dW_bw, S, M, K, BINARY_STE_CLIP);
         BGPU_CHECK(cudaGetLastError());
     }
 
@@ -495,8 +492,7 @@ static void binary_backward_batch_gpu_ws(
 static void binary_backward_multi_gpu_ws(
     const float *dY_list[],           /* [N] each [S × M_i] host */
     const float *X,                   /* [S × K] host — shared input */
-    const float *W_latent_list[],     /* [N] each [M_i × K] host */
-    const BinaryWeightsGPU *W_list[], /* [N] packed binary (device) */
+    const BinaryWeightsGPU *W_list[], /* [N] packed binary + d_W_latent (device) */
     BinaryGPUWorkspace *ws,
     float *dX,                        /* [S × K] host, ACCUMULATE */
     float *dW_latent_list[],          /* [N] each [M_i × K] host, OVERWRITE */
@@ -520,9 +516,8 @@ static void binary_backward_multi_gpu_ws(
         int M = W_list[i]->rows;
         float bwd_scale = 1.0f / sqrtf(W_list[i]->density * (float)M + 1e-6f);
 
-        /* Upload per-projection data */
+        /* Upload per-projection: only dY (W_latent already on device) */
         BGPU_CHECK(cudaMemcpy(ws->d_dY_bw, dY_list[i], (size_t)S * M * sizeof(float), cudaMemcpyHostToDevice));
-        BGPU_CHECK(cudaMemcpy(ws->d_W_latent_bw, W_latent_list[i], (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
         BGPU_CHECK(cudaMemset(ws->d_dW_bw, 0, (size_t)M * K * sizeof(float)));
 
         /* Kernel 1: dX += W^T @ dY (accumulates across projections) */
@@ -535,13 +530,13 @@ static void binary_backward_multi_gpu_ws(
             BGPU_CHECK(cudaGetLastError());
         }
 
-        /* Kernel 2: dW = dY^T @ X with STE clip */
+        /* Kernel 2: dW = dY^T @ X with STE clip — reads W_latent from device */
         {
             dim3 block(BDWK_BLOCK, BDWK_BLOCK);
             dim3 grid((K + BDWK_BLOCK - 1) / BDWK_BLOCK,
                       (M + BDWK_BLOCK - 1) / BDWK_BLOCK);
             binary_backward_dw_tiled<<<grid, block>>>(
-                ws->d_dY_bw, ws->d_X_bw, ws->d_W_latent_bw, ws->d_dW_bw, S, M, K, BINARY_STE_CLIP);
+                ws->d_dY_bw, ws->d_X_bw, W_list[i]->d_W_latent, ws->d_dW_bw, S, M, K, BINARY_STE_CLIP);
             BGPU_CHECK(cudaGetLastError());
         }
 
