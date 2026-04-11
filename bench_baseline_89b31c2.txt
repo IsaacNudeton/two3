@@ -106,3 +106,32 @@ Progression (step 10, workspace baseline = 338ms):
   f10eba9  +resident QKV            215ms (-36%)
   5e43b8f  +resident down           159ms (-53%)
   ea7f416  +resident O              139ms (-59%)
+
+════════════════════════════════════════════
+Final validation: all configs (commit 5f516f6)
+GPU: NVIDIA GeForce RTX 2080 SUPER
+Data: Shakespeare 7KB, Batch: 2, Seq: 64
+════════════════════════════════════════════
+
+                  Workspace    Resident    Speedup   Acc parity
+dim=128 (4L)
+  step 10:         73ms         55ms       -25%      17.6% = 17.6%
+  step 100:        70ms         44ms       -37%
+
+dim=256 (8L)
+  step 10:        338ms        139ms       -59%      19.0% ~ 18.9%
+  step 100:       341ms        143ms       -58%
+
+dim=512 (4L)
+  step 10:        547ms        161ms       -71%      22.6% = 22.6%
+  step 100:       551ms        188ms       -66%
+
+Build targets:
+  build_driver.bat binary          — workspace-backed binary path
+  build_driver.bat binary-resident — fully device-resident (TWO3_BINARY_RESIDENT)
+
+Notes:
+  - grad=n/a is expected on resident path (grads are device-only)
+  - speedup scales with model size (more optimizer work moved to GPU)
+  - training parity checked through 100 steps on all configs
+  - loss/accuracy within float32 noise across paths
