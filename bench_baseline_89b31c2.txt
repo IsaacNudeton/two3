@@ -1,0 +1,108 @@
+Workspace-Path Baseline Timings
+================================
+Commit: 89b31c2 (binary: workspace-backed GPU path)
+Date: 2026-04-10
+GPU: NVIDIA GeForce RTX 2080 SUPER
+Data: Shakespeare 7KB (bench_data.txt)
+Batch: 2, Seq: 64, Epochs: 1, Steps: 109
+
+dim=256 (8 layers, 8 heads, kv=4, inter=1024)
+  Step 1:          364 ms
+  Step 2 (warm):   350 ms
+  Avg steps 20-100: ~321 ms
+  Overall avg:     366.1 ms/step
+  Total:           39.9s
+  Profile (step 1): fwd=38ms (29%) bwd=91ms (68%) loss=4ms
+    FWD: gain=1 QKV=10 rope+attn=8 O=3 FFN=16
+    BWD: logits=0 FFN=45 attn=32 QKV=13 gain=1
+
+dim=512 (4 layers, 16 heads, kv=4, inter=2048)
+  Step 1:          505 ms
+  Step 2 (warm):   388 ms
+  Avg steps 20-100: ~385 ms
+  Overall avg:     426.7 ms/step
+  Total:           46.5s
+
+────────────────────────────────────────────
+Commit: 329e4cc (shared-input backward optimization)
+Date: 2026-04-10
+Changes: multi-backward for QKV (3→1 X upload), gate+up (2→1),
+         dW memset instead of upload. Parity: 7/7.
+
+dim=256 (8 layers, 8 heads, kv=4, inter=1024)
+  Overall avg:     332.6 ms/step  (was 366.1, -9.1%)
+  Total:           36.3s
+  Profile (step 1): fwd=30ms (29%) bwd=69ms (67%) loss=~4ms
+  Backward:        69ms (was 91ms, -24.2%)
+
+dim=512 (4 layers, 16 heads, kv=4, inter=2048)
+  Run 1 (non-learning init, 0 flips):
+    Overall avg:     398.5 ms/step  (was 426.7, -6.6%)
+    Total:           43.4s
+    Profile (step 1): fwd=29ms (29%) bwd=62ms (63%)
+  Run 2 (learning init, 3621 flips, 22.9% acc):
+    Overall avg:     ~680 ms/step  (requantize overhead dominates)
+    Profile (step 1): fwd=21ms (21%) bwd=73ms (72%)
+  NOTE: step-time comparison requires fixed seed — learning runs
+  incur requantize/flip overhead that inflates warm averages.
+  Step-1 profile is the fair backward comparison point.
+
+────────────────────────────────────────────
+Commit: bc0ed6b (resident gate/up backward+optimizer)
+Date: 2026-04-10
+Changes: gate+up backward+optimizer runs entirely on device behind
+         TWO3_RESIDENT_FFN flag. dW never round-trips to host.
+         Adam headroom kernel on GPU (was 15.6× faster in spike).
+         Parity: 7/7 backward, training aligned through 100 steps.
+
+dim=256, same deterministic init (step 1 loss=5.4882):
+  Workspace path:
+    Step 1: 342ms   Step 10: 331ms   Overall: 1243.2 ms/step
+    Profile: fwd=18ms bwd=39ms
+    Step 100: loss=2.6476, acc=18.9%, flips=1097
+  Resident FFN path:
+    Step 1: 245ms   Step 10: 236ms   Overall: 1150.2 ms/step
+    Profile: fwd=16ms bwd=34ms
+    Step 100: loss=2.6314, acc=18.9%, flips=1088
+  Step 1 speedup: -28%
+  Step 10 speedup: -29%
+
+────────────────────────────────────────────
+Commit: f10eba9 (resident QKV extension)
+  Step 1: 225ms (-35% from workspace)
+  Step 10: 215ms (-36%)
+  Acc@100: 19.0%
+
+────────────────────────────────────────────
+Commit: 5e43b8f (resident down projection)
+  Step 1: 172ms (-52% from workspace)
+  Step 10: 159ms (-54%)
+  Acc@100: 19.0%
+
+────────────────────────────────────────────
+Commit: ea7f416 → renamed flag in next commit
+  (all 7 projections resident, TWO3_BINARY_RESIDENT)
+
+  Workspace baseline (same init, step 1 loss=5.4882):
+    Step 1: 350ms   Step 10: 338ms   Step 100: 341ms
+    Profile: fwd=18ms bwd=42ms
+    Overall: 1244 ms/step
+    Acc@100: 19.0%, Loss@100: 2.650
+
+  Full resident:
+    Step 1: 155ms   Step 10: 139ms   Step 100: 143ms
+    Profile: fwd=17ms bwd=31ms
+    Overall: 1050 ms/step
+    Acc@100: 18.8-19.0%, Loss@100: 2.652
+
+  Step time: -56% step 1, -59% step 10, -58% step 100
+  Backward: 42ms → 31ms (-26%)
+  Training parity: confirmed through 100 steps
+
+Progression (step 10, workspace baseline = 338ms):
+  89b31c2  workspace path           338ms (baseline)
+  329e4cc  shared-input backward    ~320ms (-5%)
+  bc0ed6b  +resident gate+up        236ms (-30%)
+  f10eba9  +resident QKV            215ms (-36%)
+  5e43b8f  +resident down           159ms (-53%)
+  ea7f416  +resident O              139ms (-59%)

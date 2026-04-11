@@ -51,7 +51,7 @@ goto end
 
 :binary-resident
 echo  Building BINARY-RESIDENT (binary + device-resident gate/up backward+optimizer)
-nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_RESIDENT_FFN -o train_driver.exe train_driver.cu two3.cu
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -o train_driver.exe train_driver.cu two3.cu
 goto end
 
 :fp_embed

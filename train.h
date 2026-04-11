@@ -33,7 +33,7 @@
 #ifdef TWO3_BINARY
 #include "binary_gpu.h"
 #include "binary_gpu_workspace.h"
-#ifdef TWO3_RESIDENT_FFN
+#ifdef TWO3_BINARY_RESIDENT
 #include "binary_resident.h"
 #endif
 #endif
@@ -514,7 +514,7 @@ typedef struct {
 
     /* GPU workspace for binary projection — persistent buffers */
     BinaryGPUWorkspace binary_ws;
-#ifdef TWO3_RESIDENT_FFN
+#ifdef TWO3_BINARY_RESIDENT
     ResidentFFNState *resident_ffn;  /* [n_layers] — device-resident gate+up */
     ResidentAttnState *resident_attn; /* [n_layers] — device-resident QKV */
 #endif
@@ -726,7 +726,7 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         int max_M = max_K;  /* same for output */
         binary_workspace_init(&tm->binary_ws, max_S, max_K, max_M);
     }
-#ifdef TWO3_RESIDENT_FFN
+#ifdef TWO3_BINARY_RESIDENT
     {
         tm->resident_ffn = (ResidentFFNState*)calloc(L, sizeof(ResidentFFNState));
         tm->resident_attn = (ResidentAttnState*)calloc(L, sizeof(ResidentAttnState));
@@ -1289,7 +1289,7 @@ static void trainable_model_free(TrainableModel *tm) {
     }
     free(tm->gpu_weights);
     binary_workspace_free(&tm->binary_ws);
-#ifdef TWO3_RESIDENT_FFN
+#ifdef TWO3_BINARY_RESIDENT
     for (int l = 0; l < tm->cfg.n_layers; l++) {
         resident_ffn_free(&tm->resident_ffn[l]);
         resident_attn_free(&tm->resident_attn[l]);
@@ -1654,7 +1654,7 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         ModelLayer *ly = &tm->model.layers[l];
 
         /* Clip gradients */
-#ifndef TWO3_RESIDENT_FFN
+#ifndef TWO3_BINARY_RESIDENT
         clip_grad_norm(tw->grad_Wq, D * D, GRAD_CLIP_NORM);
         clip_grad_norm(tw->grad_Wk, KV * D, GRAD_CLIP_NORM);
         clip_grad_norm(tw->grad_Wv, KV * D, GRAD_CLIP_NORM);
@@ -1662,11 +1662,11 @@ static void trainable_optimizer_step(TrainableModel *tm) {
 #endif
 
         /* Adam on all ternary weights */
-#ifndef TWO3_RESIDENT_FFN
+#ifndef TWO3_BINARY_RESIDENT
         clip_grad_norm(tw->grad_gate, INTER * D, GRAD_CLIP_NORM);
         clip_grad_norm(tw->grad_up, INTER * D, GRAD_CLIP_NORM);
 #endif
-#ifndef TWO3_RESIDENT_FFN
+#ifndef TWO3_BINARY_RESIDENT
         clip_grad_norm(tw->grad_down, D * INTER, GRAD_CLIP_NORM);
 #endif
 
@@ -1794,7 +1794,7 @@ static void trainable_optimizer_step(TrainableModel *tm) {
          * h_s(L) = 2L, h_w(L) = 2(1-L) for L ∈ [0,1], L_WIRE = 0.5.
          * Committed weights resist flipping, boundary weights move freely.
          * No external gate — headroom IS the self-regulation mechanism. */
-#ifdef TWO3_RESIDENT_FFN
+#ifdef TWO3_BINARY_RESIDENT
         /* QKV: optimizer on device */
         resident_grad_clip_adam(tm->gpu_weights[l].W_q.d_W_latent,
             tm->resident_attn[l].q.d_grad, tm->resident_attn[l].q.d_adam_m,
@@ -1830,7 +1830,7 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         adam_update_headroom(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
         adam_update_headroom(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
 #endif
-#ifdef TWO3_RESIDENT_FFN
+#ifdef TWO3_BINARY_RESIDENT
         /* O: optimizer on device */
         resident_grad_clip_adam(tm->gpu_weights[l].W_o.d_W_latent,
             tm->resident_attn[l].o.d_grad, tm->resident_attn[l].o.d_adam_m,
@@ -1840,7 +1840,7 @@ static void trainable_optimizer_step(TrainableModel *tm) {
 #else
         adam_update_headroom(tw->W_o, tw->grad_Wo, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
 #endif
-#ifdef TWO3_RESIDENT_FFN
+#ifdef TWO3_BINARY_RESIDENT
         /* gate+up: optimizer on device, then sync latent weights back to host */
         resident_grad_clip_adam(tm->gpu_weights[l].gate.d_W_latent,
             tm->resident_ffn[l].d_grad_gate, tm->resident_ffn[l].d_adam_m_gate,
@@ -2566,7 +2566,7 @@ static TrainResult trainable_forward_backward(
              * Plus weight gradients: dW_down, dW_gate, dW_up */
 
             float *d_h = (float*)calloc(seq_len * INTER, sizeof(float));
-#if defined(TWO3_BINARY) && defined(TWO3_RESIDENT_FFN)
+#if defined(TWO3_BINARY) && defined(TWO3_BINARY_RESIDENT)
             resident_backward_down(d_ffn_out, sv->ffn_h,
                 &tm->gpu_weights[l].down, &tm->resident_ffn[l],
                 d_h, seq_len, D, INTER);
@@ -2598,7 +2598,7 @@ static TrainResult trainable_forward_backward(
             free(d_h);
 
             /* Steps 4+5: backward through gate + up (shared input, single dX) */
-#if defined(TWO3_BINARY) && defined(TWO3_RESIDENT_FFN)
+#if defined(TWO3_BINARY) && defined(TWO3_BINARY_RESIDENT)
             resident_backward_gate_up(d_gate_pre, d_up, sv->pre_ffn_normed,
                 &tm->gpu_weights[l].gate, &tm->gpu_weights[l].up,
                 &tm->resident_ffn[l], d_normed_ffn_all, seq_len, D, INTER);
@@ -2659,7 +2659,7 @@ static TrainResult trainable_forward_backward(
             for (int i = 0; i < seq_len * D; i++)
                 d_o_proj_all[i] = s * d_hidden[i];
         }
-#if defined(TWO3_BINARY) && defined(TWO3_RESIDENT_FFN)
+#if defined(TWO3_BINARY) && defined(TWO3_BINARY_RESIDENT)
         resident_backward_o(d_o_proj_all, sv->attn_out,
             &tm->gpu_weights[l].W_o, &tm->resident_attn[l],
             d_attn_out_all, seq_len, D);
@@ -2698,7 +2698,7 @@ static TrainResult trainable_forward_backward(
         T_START();
         float *d_normed_attn_all = (float*)calloc(seq_len * D, sizeof(float));
 
-#if defined(TWO3_BINARY) && defined(TWO3_RESIDENT_FFN)
+#if defined(TWO3_BINARY) && defined(TWO3_BINARY_RESIDENT)
         resident_backward_qkv(dq_all, dk_store, dv_store, sv->pre_attn_normed,
             &tm->gpu_weights[l].W_q, &tm->gpu_weights[l].W_k, &tm->gpu_weights[l].W_v,
             &tm->resident_attn[l], d_normed_attn_all, seq_len, D, KV);
@@ -2743,7 +2743,7 @@ static TrainResult trainable_forward_backward(
         T_ACC(_ms_bwd_gain);
 
         /* Track max gradient for monitoring (skip D2H on resident fast path) */
-#if defined(TWO3_BINARY) && defined(TWO3_RESIDENT_FFN)
+#if defined(TWO3_BINARY) && defined(TWO3_BINARY_RESIDENT)
         /* All grads are device-resident — grad monitoring via loss/acc only.
          * Avoids per-step D2H that would tax the fast path. */
         (void)dW_q;
