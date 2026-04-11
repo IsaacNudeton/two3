@@ -26,7 +26,7 @@ if "%1"=="gpu-resident" goto gpu_resident
 if "%1"=="gpu-sixq" goto gpu_sixq
 if "%1"=="fp-embed" goto fp_embed
 if "%1"=="binary" goto binary
-if "%1"=="binary-resident" goto binary-resident
+if "%1"=="binary-workspace" goto binary_workspace
 if "%1"=="verify-moon" goto verify_moon
 if "%1"=="hadamard" goto hadamard
 if "%1"=="hadamard-ablation" goto hadamard
@@ -45,13 +45,13 @@ nvcc -O2 -o hadamard_ablation.exe hadamard_ablation.cu
 goto end_hadamard
 
 :binary
-echo  Building BINARY (binary weights, topology-only, gain kernel handles sign)
-nvcc -O3 -arch=sm_75 -DTWO3_BINARY -o train_driver.exe train_driver.cu two3.cu
+echo  Building BINARY (device-resident backward+optimizer, default fast path)
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -o train_driver.exe train_driver.cu two3.cu
 goto end
 
-:binary-resident
-echo  Building BINARY-RESIDENT (binary + device-resident gate/up backward+optimizer)
-nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -o train_driver.exe train_driver.cu two3.cu
+:binary_workspace
+echo  Building BINARY-WORKSPACE (legacy workspace-backed path, no device-resident optimizer)
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -o train_driver.exe train_driver.cu two3.cu
 goto end
 
 :fp_embed

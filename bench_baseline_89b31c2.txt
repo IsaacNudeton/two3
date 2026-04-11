@@ -127,8 +127,8 @@ dim=512 (4L)
   step 100:       551ms        188ms       -66%
 
 Build targets:
-  build_driver.bat binary          — workspace-backed binary path
-  build_driver.bat binary-resident — fully device-resident (TWO3_BINARY_RESIDENT)
+  build_driver.bat binary          — device-resident (default, TWO3_BINARY_RESIDENT)
+  build_driver.bat binary-workspace — legacy workspace-backed fallback
 
 Notes:
   - grad=n/a is expected on resident path (grads are device-only)
