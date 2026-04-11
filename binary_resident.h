@@ -53,8 +53,8 @@ static void resident_weight_free(ResidentWeightBufs *w) {
  * ═══════════════════════════════════════════════════════ */
 
 typedef struct {
-    ResidentWeightBufs q, k, v;
-    float *d_X;         /* [max_S × D] shared input (pre_attn_normed) */
+    ResidentWeightBufs q, k, v, o;
+    float *d_X;         /* [max_S × D] shared input staging */
     float *d_dX;        /* [max_S × D] backward output */
     float *d_norm;      /* [1] scratch for norm reduction */
     int max_S, D;
@@ -65,6 +65,7 @@ static void resident_attn_init(ResidentAttnState *s, int max_S, int D, int KV) {
     resident_weight_init(&s->q, max_S, D, D);
     resident_weight_init(&s->k, max_S, KV, D);
     resident_weight_init(&s->v, max_S, KV, D);
+    resident_weight_init(&s->o, max_S, D, D);
     BGPU_CHECK(cudaMalloc(&s->d_X, (size_t)max_S * D * sizeof(float)));
     BGPU_CHECK(cudaMalloc(&s->d_dX, (size_t)max_S * D * sizeof(float)));
     BGPU_CHECK(cudaMalloc(&s->d_norm, sizeof(float)));
@@ -74,6 +75,7 @@ static void resident_attn_free(ResidentAttnState *s) {
     resident_weight_free(&s->q);
     resident_weight_free(&s->k);
     resident_weight_free(&s->v);
+    resident_weight_free(&s->o);
     if (s->d_X) cudaFree(s->d_X);
     if (s->d_dX) cudaFree(s->d_dX);
     if (s->d_norm) cudaFree(s->d_norm);
@@ -83,30 +85,37 @@ static void resident_attn_free(ResidentAttnState *s) {
 /* Upload Adam state from host (init / checkpoint resume) */
 static void resident_attn_sync_adam_h2d(ResidentAttnState *s,
     const float *mq, const float *vq, const float *mk, const float *vk,
-    const float *mv, const float *vv
+    const float *mv, const float *vv, const float *mo, const float *vo
 ) {
     size_t sq = (size_t)s->q.M * s->q.K * sizeof(float);
     size_t sk = (size_t)s->k.M * s->k.K * sizeof(float);
+    size_t so = (size_t)s->o.M * s->o.K * sizeof(float);
     BGPU_CHECK(cudaMemcpy(s->q.d_adam_m, mq, sq, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(s->q.d_adam_v, vq, sq, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(s->k.d_adam_m, mk, sk, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(s->k.d_adam_v, vk, sk, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(s->v.d_adam_m, mv, sk, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(s->v.d_adam_v, vv, sk, cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(s->o.d_adam_m, mo, so, cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(s->o.d_adam_v, vo, so, cudaMemcpyHostToDevice));
 }
 
 /* Download Adam state to host (checkpointing) */
 static void resident_attn_sync_adam_d2h(ResidentAttnState *s,
-    float *mq, float *vq, float *mk, float *vk, float *mv, float *vv
+    float *mq, float *vq, float *mk, float *vk,
+    float *mv, float *vv, float *mo, float *vo
 ) {
     size_t sq = (size_t)s->q.M * s->q.K * sizeof(float);
     size_t sk = (size_t)s->k.M * s->k.K * sizeof(float);
+    size_t so = (size_t)s->o.M * s->o.K * sizeof(float);
     BGPU_CHECK(cudaMemcpy(mq, s->q.d_adam_m, sq, cudaMemcpyDeviceToHost));
     BGPU_CHECK(cudaMemcpy(vq, s->q.d_adam_v, sq, cudaMemcpyDeviceToHost));
     BGPU_CHECK(cudaMemcpy(mk, s->k.d_adam_m, sk, cudaMemcpyDeviceToHost));
     BGPU_CHECK(cudaMemcpy(vk, s->k.d_adam_v, sk, cudaMemcpyDeviceToHost));
     BGPU_CHECK(cudaMemcpy(mv, s->v.d_adam_m, sk, cudaMemcpyDeviceToHost));
     BGPU_CHECK(cudaMemcpy(vv, s->v.d_adam_v, sk, cudaMemcpyDeviceToHost));
+    BGPU_CHECK(cudaMemcpy(mo, s->o.d_adam_m, so, cudaMemcpyDeviceToHost));
+    BGPU_CHECK(cudaMemcpy(vo, s->o.d_adam_v, so, cudaMemcpyDeviceToHost));
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -459,6 +468,38 @@ static void resident_backward_qkv(
  * dY=d_ffn_out [S×D], X=ffn_h [S×INTER]
  * dW stays on device. dX (d_h) downloaded for SwiGLU backward.
  * ═══════════════════════════════════════════════════════ */
+
+/* ═══════════════════════════════════════════════════════
+ * Resident backward for O projection (single)
+ *
+ * dY=d_o_proj_all [S×D], X=attn_out [S×D]
+ * dW stays on device. dX downloaded for attn backward.
+ * ═══════════════════════════════════════════════════════ */
+
+static void resident_backward_o(
+    const float *h_dY,              /* [S × D] host — d_o_proj_all */
+    const float *h_X,               /* [S × D] host — attn_out */
+    const BinaryWeightsGPU *W_o,
+    ResidentAttnState *rs,
+    float *h_dX,                    /* [S × D] host — ACCUMULATE */
+    int S, int D
+) {
+    /* Upload inputs — reuse attn staging buffers */
+    BGPU_CHECK(cudaMemcpy(rs->d_X, h_X, (size_t)S * D * sizeof(float), cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemset(rs->d_dX, 0, (size_t)S * D * sizeof(float)));
+
+    resident_backward_helper(h_dY, S, D, D, W_o, &rs->o, rs->d_X, rs->d_dX);
+
+    BGPU_CHECK(cudaDeviceSynchronize());
+
+    /* Download dX */
+    {
+        float *h_buf = (float*)malloc((size_t)S * D * sizeof(float));
+        BGPU_CHECK(cudaMemcpy(h_buf, rs->d_dX, (size_t)S * D * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < S * D; i++) h_dX[i] += h_buf[i];
+        free(h_buf);
+    }
+}
 
 static void resident_backward_down(
     const float *h_dY,              /* [S × D] host — d_ffn_out */
