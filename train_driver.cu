@@ -433,11 +433,19 @@ int main(int argc, char **argv) {
                 float avg_loss = epoch_loss / steps_so_far;
                 float accuracy = (float)epoch_correct / (float)(epoch_total > 0 ? epoch_total : 1);
 
+#ifdef TWO3_BINARY_RESIDENT
+                printf("  [epoch %d/%d  step %d]  loss=%.4f  acc=%.3f  "
+                       "grad=n/a  flips=%d/%d  %.0fms/step\n",
+                       epoch + 1, cfg.epochs, global_step,
+                       r.loss, accuracy,
+                       flips, fc.total_flips, step_ms);
+#else
                 printf("  [epoch %d/%d  step %d]  loss=%.4f  acc=%.3f  "
                        "grad=%.4f  flips=%d/%d  %.0fms/step\n",
                        epoch + 1, cfg.epochs, global_step,
                        r.loss, accuracy, r.max_grad,
                        flips, fc.total_flips, step_ms);
+#endif
 
                 /* Instrument #4: gain projection alignment (Lévy check) */
                 if (_gain_cos_count > 0) {
