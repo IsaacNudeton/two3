@@ -240,9 +240,9 @@ static void binary_project_batch_gpu_ws(
     /* Quantize: host → device */
     binary_workspace_quantize(ws, h_input, S, K);
     
-    /* Matmul on GPU — signed two-mask */
+    /* Matmul on GPU — signed two-mask or Tensor Core path */
     BGPU_CHECK(cudaMemset(ws->d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-    binary_matmul_gpu(W->d_packed_plus, W->d_packed_neg, ws->d_x_q, ws->d_acc, S, M, K);
+    binary_matmul_gpu_auto(W, ws->d_x_q, ws->d_acc, S, K);
 
     /* Dequantize: device → host */
     binary_workspace_dequant(ws, h_output, S, M, binary_gpu_active_density(W), K);
@@ -298,8 +298,7 @@ static void binary_project_multi_gpu_ws(
         int M = W_list[i]->rows;
 
         BGPU_CHECK(cudaMemset(ws->d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-        binary_matmul_gpu(W_list[i]->d_packed_plus, W_list[i]->d_packed_neg,
-                          ws->d_x_q, ws->d_acc, S, M, K);
+        binary_matmul_gpu_auto(W_list[i], ws->d_x_q, ws->d_acc, S, K);
 
         /* D2H and dequantize */
         BGPU_CHECK(cudaMemcpy(ws->h_acc, ws->d_acc, (size_t)S * M * sizeof(int32_t),
@@ -381,9 +380,9 @@ static void binary_project_batch_gpu_resident(
     kernel_quantize_acts_device<<<S, threads, 0, NULL>>>(
         ws->d_x_q, ws->d_scales, d_input, S, K);
 
-    /* Matmul on GPU — signed two-mask */
+    /* Matmul on GPU — signed two-mask or Tensor Core path */
     BGPU_CHECK(cudaMemset(ws->d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-    binary_matmul_gpu(W->d_packed_plus, W->d_packed_neg, ws->d_x_q, ws->d_acc, S, M, K);
+    binary_matmul_gpu_auto(W, ws->d_x_q, ws->d_acc, S, K);
 
     /* Dequantize on device */
     int blocks = (S * M + threads - 1) / threads;
@@ -423,8 +422,7 @@ static void binary_project_multi_gpu_resident(
         int M = W_list[i]->rows;
 
         BGPU_CHECK(cudaMemset(ws->d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-        binary_matmul_gpu(W_list[i]->d_packed_plus, W_list[i]->d_packed_neg,
-                          ws->d_x_q, ws->d_acc, S, M, K);
+        binary_matmul_gpu_auto(W_list[i], ws->d_x_q, ws->d_acc, S, K);
 
         int blocks = (S * M + threads - 1) / threads;
         kernel_dequant_acts_device<<<blocks, threads>>>(

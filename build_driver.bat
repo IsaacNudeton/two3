@@ -27,6 +27,8 @@ if "%1"=="gpu-sixq" goto gpu_sixq
 if "%1"=="fp-embed" goto fp_embed
 if "%1"=="binary" goto binary
 if "%1"=="binary-workspace" goto binary_workspace
+if "%1"=="binary-tc" goto binary_tc
+if "%1"=="infer-duo" goto infer_duo
 if "%1"=="verify-moon" goto verify_moon
 if "%1"=="hadamard" goto hadamard
 if "%1"=="hadamard-ablation" goto hadamard
@@ -52,6 +54,16 @@ goto end
 :binary_workspace
 echo  Building BINARY-WORKSPACE (legacy workspace-backed path, no device-resident optimizer)
 nvcc -O3 -arch=sm_75 -DTWO3_BINARY -o train_driver.exe train_driver.cu two3.cu
+goto end
+
+:binary_tc
+echo  Building BINARY-TC (resident + Tensor Core forward matmul)
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -DTWO3_TENSOR_CORE -o train_driver.exe train_driver.cu two3.cu
+goto end
+
+:infer_duo
+echo  Building INFER-DUO (prompt-based inference tool)
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -o infer_duo.exe infer_duo.cu two3.cu
 goto end
 
 :fp_embed

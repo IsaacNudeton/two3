@@ -21,6 +21,9 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
+#ifdef TWO3_TENSOR_CORE
+#include <mma.h>
+#endif
 
 /* ═══════════════════════════════════════════════════════
  * Tile dimensions — tuned for SM 7.5 (RTX 2080 Super)
@@ -62,10 +65,12 @@
  * ═══════════════════════════════════════════════════════ */
 
 typedef struct {
-    uint32_t *d_packed_plus;  /* device: +1 mask */
+    uint32_t *d_packed_plus;  /* device: +1 mask (bitmask, for backward dX transpose) */
     uint32_t *d_packed_neg;   /* device: -1 mask */
     uint32_t *h_packed_plus;  /* host: +1 mask */
     uint32_t *h_packed_neg;   /* host: -1 mask */
+    int8_t   *d_W_tc;         /* device: INT8 dense {-1,0,+1} for WMMA forward (row-major [rows × cols]) */
+    int8_t   *h_W_tc;         /* host mirror */
     float    *d_W_latent;     /* device: float latent weights (for backward STE) */
     float     density_plus;
     float     density_neg;
@@ -365,9 +370,11 @@ static BinaryWeightsGPU binary_pack_weights_gpu(const float *w_float, int rows, 
 
     int packed_cols = (cols + 31) / 32;
     size_t packed_bytes = (size_t)rows * packed_cols * sizeof(uint32_t);
+    size_t tc_bytes     = (size_t)rows * cols * sizeof(int8_t);
 
     result.h_packed_plus = (uint32_t*)calloc(rows * packed_cols, sizeof(uint32_t));
     result.h_packed_neg  = (uint32_t*)calloc(rows * packed_cols, sizeof(uint32_t));
+    result.h_W_tc        = (int8_t*)  calloc(rows * cols,        sizeof(int8_t));
 
     int count_plus = 0;
     int count_neg  = 0;
@@ -378,11 +385,14 @@ static BinaryWeightsGPU binary_pack_weights_gpu(const float *w_float, int rows, 
             int bit  = k % 32;
             if (w >= TWO3_T_HIGH) {
                 result.h_packed_plus[m * packed_cols + word] |= (1u << bit);
+                result.h_W_tc[m * cols + k] = (int8_t)+1;
                 count_plus++;
             } else if (w < TWO3_T_LOW) {
                 result.h_packed_neg[m * packed_cols + word] |= (1u << bit);
+                result.h_W_tc[m * cols + k] = (int8_t)-1;
                 count_neg++;
             }
+            /* else: substrate, h_W_tc stays 0 from calloc */
         }
     }
     result.density_plus = (float)count_plus / (float)(rows * cols);
@@ -390,8 +400,10 @@ static BinaryWeightsGPU binary_pack_weights_gpu(const float *w_float, int rows, 
 
     BGPU_CHECK(cudaMalloc(&result.d_packed_plus, packed_bytes));
     BGPU_CHECK(cudaMalloc(&result.d_packed_neg,  packed_bytes));
+    BGPU_CHECK(cudaMalloc(&result.d_W_tc,        tc_bytes));
     BGPU_CHECK(cudaMemcpy(result.d_packed_plus, result.h_packed_plus, packed_bytes, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(result.d_packed_neg,  result.h_packed_neg,  packed_bytes, cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(result.d_W_tc,        result.h_W_tc,        tc_bytes,     cudaMemcpyHostToDevice));
 
     return result;
 }
@@ -399,22 +411,28 @@ static BinaryWeightsGPU binary_pack_weights_gpu(const float *w_float, int rows, 
 static void binary_free_weights_gpu(BinaryWeightsGPU *w) {
     if (w->d_packed_plus) cudaFree(w->d_packed_plus);
     if (w->d_packed_neg)  cudaFree(w->d_packed_neg);
+    if (w->d_W_tc)        cudaFree(w->d_W_tc);
     if (w->h_packed_plus) free(w->h_packed_plus);
     if (w->h_packed_neg)  free(w->h_packed_neg);
+    if (w->h_W_tc)        free(w->h_W_tc);
     if (w->d_W_latent)    cudaFree(w->d_W_latent);
     w->d_packed_plus = NULL;
     w->d_packed_neg  = NULL;
+    w->d_W_tc        = NULL;
     w->h_packed_plus = NULL;
     w->h_packed_neg  = NULL;
+    w->h_W_tc        = NULL;
     w->d_W_latent    = NULL;
 }
 
-/* Re-upload both masks after a requantize on host. */
+/* Re-upload all weight formats after a requantize on host. */
 static void binary_sync_to_device(BinaryWeightsGPU *w) {
     int packed_cols = (w->cols + 31) / 32;
     size_t packed_bytes = (size_t)w->rows * packed_cols * sizeof(uint32_t);
+    size_t tc_bytes     = (size_t)w->rows * w->cols * sizeof(int8_t);
     BGPU_CHECK(cudaMemcpy(w->d_packed_plus, w->h_packed_plus, packed_bytes, cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(w->d_packed_neg,  w->h_packed_neg,  packed_bytes, cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(w->d_W_tc,        w->h_W_tc,        tc_bytes,     cudaMemcpyHostToDevice));
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -432,6 +450,91 @@ static void binary_matmul_gpu(
     dim3 grid((M + BTILE_M - 1) / BTILE_M,
               (S + BTILE_N - 1) / BTILE_N);
     binary_matmul_tiled<<<grid, block>>>(d_W_plus, d_W_neg, d_x_q, d_acc, S, M, K);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Tensor Core forward path (TWO3_TENSOR_CORE)
+ *
+ * Turing INT8 WMMA: 16×16×16 fragments, one wmma.mma.sync per fragment,
+ * 4096 MACs per instruction. Fragment layout:
+ *   a_frag:  matrix_a, row_major — X[s_tile, k_tile] row-major [S×K], ld=K
+ *   b_frag:  matrix_b, col_major — W[m_tile, k_tile] row-major [M×K] is
+ *                                  equivalent to col-major B of shape [K×M]
+ *                                  with ld=K
+ *   c_frag:  accumulator, int32
+ * Launch: one warp per 16×16 output tile.
+ * Alignment requirement: M, S, K all multiples of 16.
+ * ═══════════════════════════════════════════════════════════════ */
+
+#ifdef TWO3_TENSOR_CORE
+
+#define TC_WMMA_M 16
+#define TC_WMMA_N 16
+#define TC_WMMA_K 16
+
+static __global__ void binary_matmul_wmma(
+    const int8_t*  __restrict__ X,   /* [S, K] row-major */
+    const int8_t*  __restrict__ W,   /* [M, K] row-major (= col-major [K, M]) */
+    int32_t*       __restrict__ Y,   /* [S, M] row-major */
+    int S, int M, int K
+) {
+    using namespace nvcuda::wmma;
+
+    int tile_m = blockIdx.x;
+    int tile_s = blockIdx.y;
+
+    int s_base = tile_s * TC_WMMA_M;
+    int m_base = tile_m * TC_WMMA_N;
+
+    fragment<matrix_a,    TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, signed char, row_major> a_frag;
+    fragment<matrix_b,    TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, signed char, col_major> b_frag;
+    fragment<accumulator, TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, int32_t>                c_frag;
+
+    fill_fragment(c_frag, 0);
+
+    for (int k_tile = 0; k_tile < K; k_tile += TC_WMMA_K) {
+        const signed char *a_ptr = (const signed char*)(X + s_base * K + k_tile);
+        const signed char *b_ptr = (const signed char*)(W + m_base * K + k_tile);
+        load_matrix_sync(a_frag, a_ptr, K);
+        load_matrix_sync(b_frag, b_ptr, K);
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    int32_t *c_ptr = Y + s_base * M + m_base;
+    store_matrix_sync(c_ptr, c_frag, M, mem_row_major);
+}
+
+static inline bool binary_wmma_eligible(int S, int M, int K) {
+    return (S % TC_WMMA_M == 0) && (M % TC_WMMA_N == 0) && (K % TC_WMMA_K == 0);
+}
+
+static bool binary_matmul_gpu_wmma(
+    const int8_t *d_W_tc,
+    const int8_t *d_x_q,
+    int32_t *d_acc,
+    int S, int M, int K
+) {
+    if (!binary_wmma_eligible(S, M, K)) return false;
+    dim3 block(32);
+    dim3 grid(M / TC_WMMA_N, S / TC_WMMA_M);
+    binary_matmul_wmma<<<grid, block>>>(d_x_q, d_W_tc, d_acc, S, M, K);
+    return true;
+}
+
+#endif /* TWO3_TENSOR_CORE */
+
+/* Auto launcher: Tensor Core path if eligible + flag, otherwise bitmask kernel. */
+static void binary_matmul_gpu_auto(
+    const BinaryWeightsGPU *W,
+    const int8_t *d_x_q,
+    int32_t *d_acc,
+    int S, int K
+) {
+    int M = W->rows;
+#ifdef TWO3_TENSOR_CORE
+    if (binary_matmul_gpu_wmma(W->d_W_tc, d_x_q, d_acc, S, M, K)) return;
+#endif
+    binary_matmul_gpu(W->d_packed_plus, W->d_packed_neg, d_x_q, d_acc, S, M, K);
 }
 
 /* Full forward: float input → quantize → tiled signed matmul → dequant → float output. */
@@ -472,7 +575,7 @@ static void binary_project_batch_gpu(
                           cudaMemcpyHostToDevice));
 
     BGPU_CHECK(cudaMemset(d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-    binary_matmul_gpu(W->d_packed_plus, W->d_packed_neg, d_x_q, d_acc, S, M, K);
+    binary_matmul_gpu_auto(W, d_x_q, d_acc, S, K);
 
     int32_t *h_acc = (int32_t*)malloc((size_t)S * M * sizeof(int32_t));
     BGPU_CHECK(cudaMemcpy(h_acc, d_acc, (size_t)S * M * sizeof(int32_t),
@@ -532,8 +635,7 @@ static void binary_project_multi_gpu(
         BGPU_CHECK(cudaMalloc(&d_acc, (size_t)S * M * sizeof(int32_t)));
         BGPU_CHECK(cudaMemset(d_acc, 0, (size_t)S * M * sizeof(int32_t)));
 
-        binary_matmul_gpu(W_list[n]->d_packed_plus, W_list[n]->d_packed_neg,
-                          d_x_q, d_acc, S, M, K);
+        binary_matmul_gpu_auto(W_list[n], d_x_q, d_acc, S, K);
 
         int32_t *h_acc = (int32_t*)malloc((size_t)S * M * sizeof(int32_t));
         BGPU_CHECK(cudaMemcpy(h_acc, d_acc, (size_t)S * M * sizeof(int32_t),

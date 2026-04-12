@@ -979,6 +979,7 @@ static void meter_flips(float *latent, const int8_t *old_ternary, int size, int 
 static void binary_gpu_sync(BinaryWeightsGPU *gpu, const BinaryWeights *cpu) {
     int packed_cols = (cpu->cols + 31) / 32;
     size_t packed_bytes = (size_t)cpu->rows * packed_cols * sizeof(uint32_t);
+    size_t tc_bytes     = (size_t)cpu->rows * cpu->cols * sizeof(int8_t);
 
     if (gpu->d_packed_plus == NULL) {
         /* First time: full init */
@@ -986,14 +987,36 @@ static void binary_gpu_sync(BinaryWeightsGPU *gpu, const BinaryWeights *cpu) {
         gpu->cols = cpu->cols;
         BGPU_CHECK(cudaMalloc(&gpu->d_packed_plus, packed_bytes));
         BGPU_CHECK(cudaMalloc(&gpu->d_packed_neg,  packed_bytes));
+        BGPU_CHECK(cudaMalloc(&gpu->d_W_tc,        tc_bytes));
+        gpu->h_W_tc = (int8_t*)malloc(tc_bytes);
     }
     gpu->density_plus = cpu->density_plus;
     gpu->density_neg  = cpu->density_neg;
     gpu->h_packed_plus = cpu->packed_plus;  /* point to same host data */
     gpu->h_packed_neg  = cpu->packed_neg;
+
+    /* Derive the INT8 representation from the host bit masks.
+     * Per-layer requantize writes to the CPU BinaryWeights struct; this
+     * function propagates all three formats to the GPU. */
+    {
+        int pc = packed_cols;
+        for (int m = 0; m < cpu->rows; m++) {
+            for (int k = 0; k < cpu->cols; k++) {
+                int word = k / 32;
+                uint32_t bit = 1u << (k % 32);
+                int8_t v = 0;
+                if (cpu->packed_plus[m * pc + word] & bit) v = +1;
+                else if (cpu->packed_neg[m * pc + word] & bit) v = -1;
+                gpu->h_W_tc[m * cpu->cols + k] = v;
+            }
+        }
+    }
+
     BGPU_CHECK(cudaMemcpy(gpu->d_packed_plus, cpu->packed_plus, packed_bytes,
                           cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(gpu->d_packed_neg,  cpu->packed_neg,  packed_bytes,
+                          cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(gpu->d_W_tc,        gpu->h_W_tc,      tc_bytes,
                           cudaMemcpyHostToDevice));
 }
 
