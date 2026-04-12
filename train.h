@@ -592,14 +592,22 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         tw->W_o = (float*)malloc(D * D * sizeof(float));
 
 #ifdef TWO3_BINARY
-        /* Binary latent init in [0, 1] — matches headroom kernel domain.
-         * L_MIN=0, L_MAX=1, L_WIRE=0.5. Latents at 0.25 (binary 0) or
-         * 0.75 (binary 1), with headroom to flip in ~50-100 steps.
-         * From MetabolicAge_v3.lean: L must stay in [L_MIN, L_MAX]. */
+        /* {2,3} trimodal latent init — equal split across -1, 0, +1.
+         * Centers at 1/6, 1/2, 5/6 (midpoints of the three thirds in [0,1]).
+         * With noise ±0.05, latents land deep in each attractor region:
+         *   1/6 ± 0.05 = [0.117, 0.217] → all < 1/3 → packs as -1
+         *   1/2 ± 0.05 = [0.45, 0.55]   → all in [1/3, 2/3] → packs as 0
+         *   5/6 ± 0.05 = [0.783, 0.883] → all > 2/3 → packs as +1
+         * Starts with substrate weights present — gives training room to
+         * coordinate inhibition and excitation without starting from max
+         * polarization (which biases the model toward aggressive suppression). */
         #define INIT_BINARY_LATENT(arr, sz) do { \
             for (int _i = 0; _i < (sz); _i++) { \
                 float r = (float)rand() / (float)RAND_MAX; \
-                float center = (r < 0.625f) ? 0.25f : 0.75f; \
+                float center; \
+                if (r < 1.0f / 3.0f)       center = 1.0f / 6.0f; \
+                else if (r < 2.0f / 3.0f)  center = 0.5f; \
+                else                       center = 5.0f / 6.0f; \
                 (arr)[_i] = center + noise * (2.0f * (float)rand() / RAND_MAX - 1.0f); \
             } \
         } while(0)
@@ -651,11 +659,14 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
         tw->W_up   = (float*)malloc(INTER * D * sizeof(float));
         tw->W_down = (float*)malloc(D * INTER * sizeof(float));
 #ifdef TWO3_BINARY
-        /* Binary init in [0, 1] — same as attention weights */
+        /* {2,3} trimodal init — same as attention weights */
         #define INIT_BINARY_LATENT_FFN(arr, sz) do { \
             for (int _i = 0; _i < (sz); _i++) { \
                 float r = (float)rand() / (float)RAND_MAX; \
-                float center = (r < 0.625f) ? 0.25f : 0.75f; \
+                float center; \
+                if (r < 1.0f / 3.0f)       center = 1.0f / 6.0f; \
+                else if (r < 2.0f / 3.0f)  center = 0.5f; \
+                else                       center = 5.0f / 6.0f; \
                 (arr)[_i] = center + noise * (2.0f * (float)rand() / RAND_MAX - 1.0f); \
             } \
         } while(0)
