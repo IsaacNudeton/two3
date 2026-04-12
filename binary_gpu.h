@@ -1,21 +1,16 @@
 /*
- * binary_gpu.h — Tiled Binary Matmul Kernel for {2,3}
+ * binary_gpu.h — Tiled {2,3} matmul kernel
  *
- * GPU acceleration for binary {0,1} weight matrices.
- * Adapted from two3_tiled.h (ternary tiled kernel) and OB1 reduce
- * kernel patterns (326 GB/s on RTX 2080 Super).
+ * GPU acceleration for ternary-at-readout weights. Two parallel bit masks:
+ *   packed_plus  — bit set iff weight = +1
+ *   packed_neg   — bit set iff weight = -1
+ *   neither      — weight = 0 (substrate)
  *
- * Key differences from ternary tiled kernel:
- *   - 1 bit per weight (32 per uint32) vs 2 bits (4 per byte)
- *   - No sign decode — just bit test and add
- *   - 8× denser packing: 32 weights per memory load vs 4
- *   - Shared memory for weights is 4× smaller
+ * Latent float in [0,1]; thresholds at 1/3 and 2/3 (binary.h).
+ * Signed matmul: Y[s,m] = sum_{k: W[m,k]=+1} X[s,k] - sum_{k: W[m,k]=-1} X[s,k]
  *
- * Patterns from OB1 reduce kernel (326 GB/s):
- *   - Shared memory reduction
- *   - 256-thread blocks (tuned for SM 7.5 / Turing)
- *   - Coalesced global reads
- *   - No warp divergence (fully unrolled, no __ffs loop)
+ * The tiled kernel loads BOTH masks into shared memory and does one fused
+ * sum per output element — avoids the two-pass approach (acc_plus - acc_neg).
  *
  * Isaac & Claude — April 2026
  */
@@ -33,20 +28,17 @@
  * BTILE_M × BTILE_N = 16 × 16 = 256 threads per block
  * BTILE_K = 128 features per tile
  *
- * Shared memory per tile:
- *   activations: BTILE_N × BTILE_K × sizeof(int8_t) = 16 × 128 = 2048 bytes
- *   weights:     BTILE_M × (BTILE_K/32) × sizeof(uint32_t) = 16 × 4 × 4 = 256 bytes
- *   Total: 2304 bytes (vs 2560 for ternary — denser packing)
- *
- * 48 KB / 2304 = 21 tiles can coexist per SM.
- * Occupancy limited by warps (64/SM), not shared memory.
+ * Shared memory per tile (two-mask version):
+ *   activations:  BTILE_N × BTILE_K × sizeof(int8_t) = 16 × 128 = 2048 bytes
+ *   plus weights: BTILE_M × (BTILE_K/32) × sizeof(uint32_t) = 256 bytes
+ *   neg weights:  same = 256 bytes
+ *   Total: 2560 bytes (same as old ternary path)
  * ═══════════════════════════════════════════════════════ */
 
-#define BTILE_M 16    /* output features per block */
-#define BTILE_N 16    /* tokens per block */
-#define BTILE_K 128   /* input features per tile */
+#define BTILE_M 16
+#define BTILE_N 16
+#define BTILE_K 128
 
-/* Error check macro */
 #ifndef BGPU_CHECK
 #define BGPU_CHECK(call) do { \
     cudaError_t err = (call); \
@@ -56,47 +48,60 @@
 } while(0)
 #endif
 
-/* Dual-storage binary weights: host copy + device copy.
- * Forward declaration — functions defined after kernels. */
+/* Two-threshold quantization constants (mirror binary.h) */
+#ifndef TWO3_T_LOW
+#define TWO3_T_LOW  (1.0f / 3.0f)
+#endif
+#ifndef TWO3_T_HIGH
+#define TWO3_T_HIGH (2.0f / 3.0f)
+#endif
+
+/* ═══════════════════════════════════════════════════════
+ * {2,3} GPU weight state: host + device copies of both masks,
+ * plus the latent weights for backward STE.
+ * ═══════════════════════════════════════════════════════ */
+
 typedef struct {
-    uint32_t *d_packed;   /* device copy */
-    uint32_t *h_packed;   /* host copy */
-    float    *d_W_latent; /* device copy of float latent weights (for backward STE) */
-    float     density;
+    uint32_t *d_packed_plus;  /* device: +1 mask */
+    uint32_t *d_packed_neg;   /* device: -1 mask */
+    uint32_t *h_packed_plus;  /* host: +1 mask */
+    uint32_t *h_packed_neg;   /* host: -1 mask */
+    float    *d_W_latent;     /* device: float latent weights (for backward STE) */
+    float     density_plus;
+    float     density_neg;
     int       rows;
     int       cols;
 } BinaryWeightsGPU;
 
+static inline float binary_gpu_active_density(const BinaryWeightsGPU *w) {
+    return w->density_plus + w->density_neg;
+}
+
 /* ═══════════════════════════════════════════════════════
- * Tiled binary matmul kernel
+ * Tiled signed matmul: loads both masks, fused plus-minus
  *
- * Y[s][m] = sum_{k where W[m,k]=1} X[s][k]
- *
- * Grid: (ceil(M/BTILE_M), ceil(S/BTILE_N))
- * Block: (BTILE_M, BTILE_N)
- *
- * No __ffs loop — fully unrolled bit tests.
- * No warp divergence. Predictable control flow.
+ * Y[s][m] = sum_{k: W_plus[m,k]} X[s][k] - sum_{k: W_neg[m,k]} X[s][k]
  * ═══════════════════════════════════════════════════════ */
 
 static __global__ void binary_matmul_tiled(
-    const uint32_t* __restrict__ W,   /* [M, packed_cols] binary packed */
-    const int8_t*   __restrict__ X,   /* [S, K] quantized int8 */
-    int32_t*        __restrict__ Y,   /* [S, M] output accumulators */
+    const uint32_t* __restrict__ W_plus,
+    const uint32_t* __restrict__ W_neg,
+    const int8_t*   __restrict__ X,
+    int32_t*        __restrict__ Y,
     int S, int M, int K
 ) {
-    int tx = threadIdx.x;  /* output feature within tile */
-    int ty = threadIdx.y;  /* token within tile */
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
 
     int m = blockIdx.x * BTILE_M + tx;
     int s = blockIdx.y * BTILE_N + ty;
 
     int packed_cols = (K + 31) / 32;
-    int TK32 = BTILE_K / 32;  /* uint32s per weight row per tile = 4 */
+    int TK32 = BTILE_K / 32;
 
-    /* Shared memory tiles */
-    __shared__ int8_t   sX[BTILE_N][BTILE_K];          /* [16][128] = 2048 bytes */
-    __shared__ uint32_t sW[BTILE_M][BTILE_K / 32];     /* [16][4]   = 256 bytes  */
+    __shared__ int8_t   sX[BTILE_N][BTILE_K];
+    __shared__ uint32_t sWp[BTILE_M][BTILE_K / 32];
+    __shared__ uint32_t sWn[BTILE_M][BTILE_K / 32];
 
     int32_t acc = 0;
     int n_tiles = (K + BTILE_K - 1) / BTILE_K;
@@ -104,22 +109,16 @@ static __global__ void binary_matmul_tiled(
     for (int tile = 0; tile < n_tiles; tile++) {
         int k_base = tile * BTILE_K;
 
-        /* ── Cooperative load: activations ──
-         * Total elements = BTILE_N × BTILE_K = 16 × 128 = 2048
-         * Threads = 256. Each thread loads 2048/256 = 8 elements.
-         * Coalesced: consecutive threads read consecutive bytes. */
+        /* Load activations tile (cooperative). */
         {
             int tid = ty * BTILE_M + tx;
-
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 int idx = tid * 8 + i;
                 int load_n = idx / BTILE_K;
                 int load_k = idx % BTILE_K;
-
                 int global_s = blockIdx.y * BTILE_N + load_n;
                 int global_k = k_base + load_k;
-
                 if (global_s < S && global_k < K)
                     sX[load_n][load_k] = X[global_s * K + global_k];
                 else
@@ -127,49 +126,41 @@ static __global__ void binary_matmul_tiled(
             }
         }
 
-        /* ── Cooperative load: weights ──
-         * Total elements = BTILE_M × TK32 = 16 × 4 = 64 uint32s
-         * Threads = 256. Only 64 loads needed — first 64 threads load.
-         * Each uint32 is 4 bytes, coalesced within warp. */
+        /* Load both mask tiles (cooperative). */
         {
             int tid = ty * BTILE_M + tx;
-
             if (tid < BTILE_M * TK32) {
                 int load_m = tid / TK32;
                 int load_w = tid % TK32;
-
                 int global_m = blockIdx.x * BTILE_M + load_m;
                 int global_w = (k_base / 32) + load_w;
-
-                if (global_m < M && global_w < packed_cols)
-                    sW[load_m][load_w] = W[global_m * packed_cols + global_w];
-                else
-                    sW[load_m][load_w] = 0;
+                if (global_m < M && global_w < packed_cols) {
+                    sWp[load_m][load_w] = W_plus[global_m * packed_cols + global_w];
+                    sWn[load_m][load_w] = W_neg [global_m * packed_cols + global_w];
+                } else {
+                    sWp[load_m][load_w] = 0;
+                    sWn[load_m][load_w] = 0;
+                }
             }
         }
 
         __syncthreads();
 
-        /* ── Compute: masked sum from this tile ──
-         * For each uint32 of packed weights (4 words per tile):
-         *   For each of 32 bits: if set, add corresponding activation.
-         *
-         * Fully unrolled inner loop. No __ffs. No while.
-         * Every thread does the same number of operations. */
+        /* Compute: signed masked sum from this tile. */
         if (m < M && s < S) {
             #pragma unroll
             for (int w = 0; w < TK32; w++) {
-                uint32_t bits = sW[tx][w];
+                uint32_t bp = sWp[tx][w];
+                uint32_t bn = sWn[tx][w];
                 int base_k = w * 32;
-
-                /* Unroll 32 bit tests — no divergence.
-                 * Compiler can use predicated adds (no branch). */
                 #pragma unroll
                 for (int b = 0; b < 32; b++) {
-                    if (bits & (1u << b)) {
-                        int k = base_k + b;
-                        if (k < BTILE_K)  /* only needed at boundary tile */
-                            acc += (int32_t)sX[ty][k];
+                    uint32_t mask = 1u << b;
+                    int k = base_k + b;
+                    if (k < BTILE_K) {
+                        int8_t xv = sX[ty][k];
+                        if (bp & mask) acc += (int32_t)xv;
+                        if (bn & mask) acc -= (int32_t)xv;
                     }
                 }
             }
@@ -178,40 +169,39 @@ static __global__ void binary_matmul_tiled(
         __syncthreads();
     }
 
-    /* Write result */
     if (m < M && s < S) {
         Y[s * M + m] = acc;
     }
 }
 
 /* ═══════════════════════════════════════════════════════
- * Tiled backward dX kernel
+ * Tiled backward dX: signed transpose masked sum
  *
- * dX[s][k] = sum_{m where W[m,k]=1} dY[s][m]
+ * dX[s][k] = sum_{m: W_plus[m,k]} dY[s][m] - sum_{m: W_neg[m,k]} dY[s][m]
  *
- * Transpose of the forward: iterate over M in tiles.
- * Includes 1/sqrt(density*M) scaling for gradient balance.
+ * Scaled by 1/sqrt(active_density × M) for CLT gradient balance.
+ * active_density = density_plus + density_neg.
  * ═══════════════════════════════════════════════════════ */
 
-#define BTILE_M_BW 64  /* M dimension tile for backward */
+#define BTILE_M_BW 64
 
 static __global__ void binary_backward_dx_tiled(
-    const float*    __restrict__ dY,      /* [S, M] */
-    const uint32_t* __restrict__ W,       /* [M, packed_cols] */
-    float*          __restrict__ dX,      /* [S, K] output */
+    const float*    __restrict__ dY,
+    const uint32_t* __restrict__ W_plus,
+    const uint32_t* __restrict__ W_neg,
+    float*          __restrict__ dX,
     int S, int M, int K,
-    float bwd_scale  /* 1/sqrt(density*M) */
+    float bwd_scale
 ) {
-    int tx = threadIdx.x;  /* k within tile */
-    int ty = threadIdx.y;  /* s within tile */
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
 
-    int k = blockIdx.x * BTILE_M + tx;   /* using BTILE_M=16 for K dim */
+    int k = blockIdx.x * BTILE_M + tx;
     int s = blockIdx.y * BTILE_N + ty;
 
     int packed_cols = (K + 31) / 32;
 
-    __shared__ float    sdY[BTILE_N][BTILE_M_BW];   /* [16][64] = 4096 bytes */
-    __shared__ uint32_t sW_col[BTILE_M_BW];          /* [64] = 256 bytes */
+    __shared__ float sdY[BTILE_N][BTILE_M_BW];
 
     float sum = 0.0f;
     int n_tiles_m = (M + BTILE_M_BW - 1) / BTILE_M_BW;
@@ -219,7 +209,6 @@ static __global__ void binary_backward_dx_tiled(
     for (int tile = 0; tile < n_tiles_m; tile++) {
         int m_base = tile * BTILE_M_BW;
 
-        /* Load dY tile */
         {
             int tid = ty * BTILE_M + tx;
             #pragma unroll
@@ -227,10 +216,8 @@ static __global__ void binary_backward_dx_tiled(
                 int idx = tid * ((BTILE_N * BTILE_M_BW) / (BTILE_M * BTILE_N)) + i;
                 int load_n = idx / BTILE_M_BW;
                 int load_m = idx % BTILE_M_BW;
-
                 int global_s = blockIdx.y * BTILE_N + load_n;
                 int global_m = m_base + load_m;
-
                 if (global_s < S && global_m < M)
                     sdY[load_n][load_m] = dY[global_s * M + global_m];
                 else
@@ -240,7 +227,6 @@ static __global__ void binary_backward_dx_tiled(
 
         __syncthreads();
 
-        /* For this k, check which m's are connected and sum their dY */
         if (k < K && s < S) {
             int word = k / 32;
             uint32_t mask = 1u << (k % 32);
@@ -249,9 +235,11 @@ static __global__ void binary_backward_dx_tiled(
             for (int mi = 0; mi < BTILE_M_BW; mi++) {
                 int global_m = m_base + mi;
                 if (global_m < M) {
-                    uint32_t w_word = W[global_m * packed_cols + word];
-                    if (w_word & mask)
-                        sum += sdY[ty][mi];
+                    uint32_t wp = W_plus[global_m * packed_cols + word];
+                    uint32_t wn = W_neg [global_m * packed_cols + word];
+                    float dyv = sdY[ty][mi];
+                    if (wp & mask) sum += dyv;
+                    if (wn & mask) sum -= dyv;
                 }
             }
         }
@@ -265,24 +253,24 @@ static __global__ void binary_backward_dx_tiled(
 }
 
 /* ═══════════════════════════════════════════════════════
- * dW kernel: outer product dY^T @ X with STE clip
+ * dW kernel — outer product dY^T @ X with STE clip.
  *
- * Produces FLOAT gradients for latent weights (not packed binary).
- * Latent weights go through Adam → requantize to produce new packed binary.
- * STE clip: zero gradient if latent weight is outside [-clip, 1+clip].
+ * Latent lives in [0,1], clipped outside [-BINARY_STE_CLIP, 1+BINARY_STE_CLIP].
+ * The ternary quantization thresholds at {1/3, 2/3} don't affect this kernel —
+ * gradient flows to the latent, not to the packed form.
  * ═══════════════════════════════════════════════════════ */
 
 #ifndef BINARY_STE_CLIP
 #define BINARY_STE_CLIP 1.5f
 #endif
 
-#define BDWK_BLOCK 16  /* 16×16 = 256 threads */
+#define BDWK_BLOCK 16
 
 static __global__ void binary_backward_dw_tiled(
-    const float* __restrict__ dY,         /* [S, M] */
-    const float* __restrict__ X,          /* [S, K] */
-    const float* __restrict__ W_latent,   /* [M, K] float latent weights */
-    float*       __restrict__ dW,         /* [M, K] ACCUMULATE */
+    const float* __restrict__ dY,
+    const float* __restrict__ X,
+    const float* __restrict__ W_latent,
+    float*       __restrict__ dW,
     int S, int M, int K,
     float ste_clip
 ) {
@@ -291,11 +279,9 @@ static __global__ void binary_backward_dw_tiled(
 
     if (m >= M || k >= K) return;
 
-    /* STE gate: zero gradient if latent too far from binary threshold */
     float w = W_latent[m * K + k];
     if (w < -ste_clip || w > 1.0f + ste_clip) return;
 
-    /* dW[m,k] += sum_s dY[s,m] * X[s,k] */
     float sum = 0.0f;
     for (int s = 0; s < S; s++)
         sum += dY[s * M + m] * X[s * K + k];
@@ -304,24 +290,18 @@ static __global__ void binary_backward_dw_tiled(
 }
 
 /* ═══════════════════════════════════════════════════════
- * GPU backward: dX (tiled) + dW (outer product + STE)
- *
- * Matches binary_backward_batch_cpu interface.
- * All H2D/D2H per call — not device-resident.
+ * Single-shot backward (host alloc, reference path — not the fast path).
  * ═══════════════════════════════════════════════════════ */
 
 static void binary_backward_batch_gpu(
-    const float *dY,             /* [S × M] host */
-    const float *X,              /* [S × K] host */
-    const float *W_latent,       /* [M × K] host, float latent weights */
-    const BinaryWeightsGPU *W,   /* packed binary (device) */
-    float *dX,                   /* [S × K] host, ACCUMULATE */
-    float *dW_latent,            /* [M × K] host, ACCUMULATE */
+    const float *dY,
+    const float *X,
+    const float *W_latent,
+    const BinaryWeightsGPU *W,
+    float *dX,
+    float *dW_latent,
     int S, int M, int K
 ) {
-    int packed_cols = (K + 31) / 32;
-
-    /* Device buffers */
     float *d_dY, *d_X, *d_dX, *d_W_latent, *d_dW;
 
     BGPU_CHECK(cudaMalloc(&d_dY, (size_t)S * M * sizeof(float)));
@@ -330,25 +310,23 @@ static void binary_backward_batch_gpu(
     BGPU_CHECK(cudaMalloc(&d_W_latent, (size_t)M * K * sizeof(float)));
     BGPU_CHECK(cudaMalloc(&d_dW, (size_t)M * K * sizeof(float)));
 
-    /* H2D */
     BGPU_CHECK(cudaMemcpy(d_dY, dY, (size_t)S * M * sizeof(float), cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(d_X, X, (size_t)S * K * sizeof(float), cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemset(d_dX, 0, (size_t)S * K * sizeof(float)));
     BGPU_CHECK(cudaMemcpy(d_W_latent, W_latent, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemcpy(d_dW, dW_latent, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
 
-    /* Kernel 1: dX = W^T @ dY (tiled, with backward scale) */
     {
-        float bwd_scale = 1.0f / sqrtf(W->density * (float)M + 1e-6f);
+        float active = binary_gpu_active_density(W);
+        float bwd_scale = 1.0f / sqrtf(fmaxf(active, 1e-6f) * (float)M);
         dim3 block(BTILE_M, BTILE_N);
         dim3 grid((K + BTILE_M - 1) / BTILE_M,
                   (S + BTILE_N - 1) / BTILE_N);
         binary_backward_dx_tiled<<<grid, block>>>(
-            d_dY, W->d_packed, d_dX, S, M, K, bwd_scale);
+            d_dY, W->d_packed_plus, W->d_packed_neg, d_dX, S, M, K, bwd_scale);
         BGPU_CHECK(cudaGetLastError());
     }
 
-    /* Kernel 2: dW = dY^T @ X with STE clip */
     {
         dim3 block(BDWK_BLOCK, BDWK_BLOCK);
         dim3 grid((K + BDWK_BLOCK - 1) / BDWK_BLOCK,
@@ -360,7 +338,6 @@ static void binary_backward_batch_gpu(
 
     BGPU_CHECK(cudaDeviceSynchronize());
 
-    /* D2H — accumulate into host buffers */
     {
         float *h_dX = (float*)malloc((size_t)S * K * sizeof(float));
         float *h_dW = (float*)malloc((size_t)M * K * sizeof(float));
@@ -377,60 +354,67 @@ static void binary_backward_batch_gpu(
 }
 
 /* ═══════════════════════════════════════════════════════
- * GPU forward path: quantize → tiled matmul → dequantize
- *
- * Replaces binary_project_batch_cpu with GPU kernel.
- * Uses existing Two3Activations quantize path for input,
- * then calls binary_matmul_tiled instead of two3_forward.
+ * Pack float weights → two device masks.
  * ═══════════════════════════════════════════════════════ */
 
 static BinaryWeightsGPU binary_pack_weights_gpu(const float *w_float, int rows, int cols) {
     BinaryWeightsGPU result;
+    memset(&result, 0, sizeof(result));
     result.rows = rows;
     result.cols = cols;
 
     int packed_cols = (cols + 31) / 32;
     size_t packed_bytes = (size_t)rows * packed_cols * sizeof(uint32_t);
 
-    /* Pack on host */
-    result.h_packed = (uint32_t*)calloc(rows * packed_cols, sizeof(uint32_t));
-    int count_ones = 0;
+    result.h_packed_plus = (uint32_t*)calloc(rows * packed_cols, sizeof(uint32_t));
+    result.h_packed_neg  = (uint32_t*)calloc(rows * packed_cols, sizeof(uint32_t));
 
+    int count_plus = 0;
+    int count_neg  = 0;
     for (int m = 0; m < rows; m++) {
         for (int k = 0; k < cols; k++) {
-            if (w_float[m * cols + k] > 0.5f) {
-                int word = k / 32;
-                int bit = k % 32;
-                result.h_packed[m * packed_cols + word] |= (1u << bit);
-                count_ones++;
+            float w = w_float[m * cols + k];
+            int word = k / 32;
+            int bit  = k % 32;
+            if (w >= TWO3_T_HIGH) {
+                result.h_packed_plus[m * packed_cols + word] |= (1u << bit);
+                count_plus++;
+            } else if (w < TWO3_T_LOW) {
+                result.h_packed_neg[m * packed_cols + word] |= (1u << bit);
+                count_neg++;
             }
         }
     }
-    result.density = (float)count_ones / (float)(rows * cols);
+    result.density_plus = (float)count_plus / (float)(rows * cols);
+    result.density_neg  = (float)count_neg  / (float)(rows * cols);
 
-    /* Copy to device */
-    BGPU_CHECK(cudaMalloc(&result.d_packed, packed_bytes));
-    BGPU_CHECK(cudaMemcpy(result.d_packed, result.h_packed, packed_bytes,
-                           cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMalloc(&result.d_packed_plus, packed_bytes));
+    BGPU_CHECK(cudaMalloc(&result.d_packed_neg,  packed_bytes));
+    BGPU_CHECK(cudaMemcpy(result.d_packed_plus, result.h_packed_plus, packed_bytes, cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(result.d_packed_neg,  result.h_packed_neg,  packed_bytes, cudaMemcpyHostToDevice));
 
     return result;
 }
 
 static void binary_free_weights_gpu(BinaryWeightsGPU *w) {
-    if (w->d_packed) cudaFree(w->d_packed);
-    if (w->h_packed) free(w->h_packed);
-    if (w->d_W_latent) cudaFree(w->d_W_latent);
-    w->d_packed = NULL;
-    w->h_packed = NULL;
-    w->d_W_latent = NULL;
+    if (w->d_packed_plus) cudaFree(w->d_packed_plus);
+    if (w->d_packed_neg)  cudaFree(w->d_packed_neg);
+    if (w->h_packed_plus) free(w->h_packed_plus);
+    if (w->h_packed_neg)  free(w->h_packed_neg);
+    if (w->d_W_latent)    cudaFree(w->d_W_latent);
+    w->d_packed_plus = NULL;
+    w->d_packed_neg  = NULL;
+    w->h_packed_plus = NULL;
+    w->h_packed_neg  = NULL;
+    w->d_W_latent    = NULL;
 }
 
-/* Update device copy after requantize (host weights changed) */
+/* Re-upload both masks after a requantize on host. */
 static void binary_sync_to_device(BinaryWeightsGPU *w) {
     int packed_cols = (w->cols + 31) / 32;
     size_t packed_bytes = (size_t)w->rows * packed_cols * sizeof(uint32_t);
-    BGPU_CHECK(cudaMemcpy(w->d_packed, w->h_packed, packed_bytes,
-                           cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(w->d_packed_plus, w->h_packed_plus, packed_bytes, cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(w->d_packed_neg,  w->h_packed_neg,  packed_bytes, cudaMemcpyHostToDevice));
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -438,41 +422,33 @@ static void binary_sync_to_device(BinaryWeightsGPU *w) {
  * ═══════════════════════════════════════════════════════ */
 
 static void binary_matmul_gpu(
-    const uint32_t *d_packed_W,   /* [M, packed_cols] device */
-    const int8_t *d_x_q,         /* [S, K] device */
-    int32_t *d_acc,               /* [S, M] device */
+    const uint32_t *d_W_plus,
+    const uint32_t *d_W_neg,
+    const int8_t *d_x_q,
+    int32_t *d_acc,
     int S, int M, int K
 ) {
-    dim3 block(BTILE_M, BTILE_N);  /* 16 × 16 = 256 threads */
+    dim3 block(BTILE_M, BTILE_N);
     dim3 grid((M + BTILE_M - 1) / BTILE_M,
               (S + BTILE_N - 1) / BTILE_N);
-
-    binary_matmul_tiled<<<grid, block>>>(d_packed_W, d_x_q, d_acc, S, M, K);
+    binary_matmul_tiled<<<grid, block>>>(d_W_plus, d_W_neg, d_x_q, d_acc, S, M, K);
 }
 
-/* Full forward: float input → quantize → tiled matmul → dequantize → float output.
- * Same interface as binary_project_batch_cpu but uses GPU. */
+/* Full forward: float input → quantize → tiled signed matmul → dequant → float output. */
 static void binary_project_batch_gpu(
     const BinaryWeightsGPU *W,
-    const float *input,      /* [S, K] host */
-    float *output,           /* [S, M] host */
+    const float *input,
+    float *output,
     int S, int K
 ) {
     int M = W->rows;
-    int packed_cols = (K + 31) / 32;
 
-    /* Quantize input to int8 on device (reuse two3 quantize path) */
-    /* Allocate device buffers */
     int8_t *d_x_q;
-    float *d_scales;
     int32_t *d_acc;
-    float *d_output;
 
     BGPU_CHECK(cudaMalloc(&d_x_q, (size_t)S * K * sizeof(int8_t)));
-    BGPU_CHECK(cudaMalloc(&d_scales, S * sizeof(float)));
     BGPU_CHECK(cudaMalloc(&d_acc, (size_t)S * M * sizeof(int32_t)));
 
-    /* Quantize on host, copy to device (simple path — GPU quantize is an optimization) */
     int8_t *h_x_q = (int8_t*)malloc((size_t)S * K * sizeof(int8_t));
     float *h_scales = (float*)malloc(S * sizeof(float));
 
@@ -493,46 +469,39 @@ static void binary_project_batch_gpu(
     }
 
     BGPU_CHECK(cudaMemcpy(d_x_q, h_x_q, (size_t)S * K * sizeof(int8_t),
-                           cudaMemcpyHostToDevice));
-    BGPU_CHECK(cudaMemcpy(d_scales, h_scales, S * sizeof(float),
-                           cudaMemcpyHostToDevice));
+                          cudaMemcpyHostToDevice));
 
-    /* Tiled matmul on GPU */
     BGPU_CHECK(cudaMemset(d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-    binary_matmul_gpu(W->d_packed, d_x_q, d_acc, S, M, K);
+    binary_matmul_gpu(W->d_packed_plus, W->d_packed_neg, d_x_q, d_acc, S, M, K);
 
-    /* Dequantize on host (read back acc + scales) */
     int32_t *h_acc = (int32_t*)malloc((size_t)S * M * sizeof(int32_t));
     BGPU_CHECK(cudaMemcpy(h_acc, d_acc, (size_t)S * M * sizeof(int32_t),
-                           cudaMemcpyDeviceToHost));
+                          cudaMemcpyDeviceToHost));
 
+    float active = binary_gpu_active_density(W);
+    float active_norm = 1.0f / sqrtf(fmaxf(active, 1e-6f) * (float)K);
     for (int s = 0; s < S; s++) {
         float a_scale = h_scales[s] / 127.0f;
-        /* Theorem 69a: CLT variance of masked sum → scale by 1/sqrt(density*K) */
-        float combined = a_scale / sqrtf(W->density * (float)K);
+        float combined = a_scale * active_norm;
         for (int m = 0; m < M; m++) {
             output[s * M + m] = (float)h_acc[s * M + m] * combined;
         }
     }
 
-    /* Cleanup */
     cudaFree(d_x_q);
-    cudaFree(d_scales);
     cudaFree(d_acc);
     free(h_x_q);
     free(h_scales);
     free(h_acc);
 }
 
-/* Multi-output forward: quantize input ONCE, project through N weight matrices.
- * Used for QKV (N=3) and gate+up (N=2). Saves N-1 quantizations. */
+/* Multi-output forward: quantize input ONCE, project through N weight matrices. */
 static void binary_project_multi_gpu(
-    const BinaryWeightsGPU *W_list[],  /* [N] weight matrices (all share K=cols) */
-    float *output_list[],              /* [N] output buffers, each [S × M_n] */
-    const float *input,                /* [S × K] host */
+    const BinaryWeightsGPU *W_list[],
+    float *output_list[],
+    const float *input,
     int N, int S, int K
 ) {
-    /* Quantize input once on host */
     int8_t *h_x_q = (int8_t*)malloc((size_t)S * K * sizeof(int8_t));
     float *h_scales = (float*)malloc(S * sizeof(float));
 
@@ -552,29 +521,29 @@ static void binary_project_multi_gpu(
         }
     }
 
-    /* Copy quantized input to device once */
     int8_t *d_x_q;
     BGPU_CHECK(cudaMalloc(&d_x_q, (size_t)S * K * sizeof(int8_t)));
     BGPU_CHECK(cudaMemcpy(d_x_q, h_x_q, (size_t)S * K * sizeof(int8_t),
-                           cudaMemcpyHostToDevice));
+                          cudaMemcpyHostToDevice));
 
-    /* Project through each weight matrix */
     for (int n = 0; n < N; n++) {
         int M = W_list[n]->rows;
         int32_t *d_acc;
         BGPU_CHECK(cudaMalloc(&d_acc, (size_t)S * M * sizeof(int32_t)));
         BGPU_CHECK(cudaMemset(d_acc, 0, (size_t)S * M * sizeof(int32_t)));
 
-        binary_matmul_gpu(W_list[n]->d_packed, d_x_q, d_acc, S, M, K);
+        binary_matmul_gpu(W_list[n]->d_packed_plus, W_list[n]->d_packed_neg,
+                          d_x_q, d_acc, S, M, K);
 
-        /* Dequantize on host */
         int32_t *h_acc = (int32_t*)malloc((size_t)S * M * sizeof(int32_t));
         BGPU_CHECK(cudaMemcpy(h_acc, d_acc, (size_t)S * M * sizeof(int32_t),
-                               cudaMemcpyDeviceToHost));
+                              cudaMemcpyDeviceToHost));
 
+        float active = binary_gpu_active_density(W_list[n]);
+        float active_norm = 1.0f / sqrtf(fmaxf(active, 1e-6f) * (float)K);
         for (int s = 0; s < S; s++) {
             float a_scale = h_scales[s] / 127.0f;
-            float combined = a_scale / sqrtf(W_list[n]->density * (float)K);
+            float combined = a_scale * active_norm;
             float *yv = output_list[n] + s * M;
             for (int m = 0; m < M; m++)
                 yv[m] = (float)h_acc[s * M + m] * combined;

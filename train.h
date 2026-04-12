@@ -391,23 +391,19 @@ static void adam_update_headroom(
         if (update >  0.1f) update =  0.1f;
         if (update < -0.1f) update = -0.1f;
 
-        /* Headroom modulation (MetabolicAge_v3.lean, Theorem 68) */
+        /* {2,3} headroom: distance to nearest ternary boundary at 1/3 or 2/3.
+         * Peaks (h=2) AT the flip surfaces, troughs (h=0.1) at the attractors
+         * {0, 1/2, 1}. Note: w=0.5 is now an ATTRACTOR (min mobility), not a
+         * boundary — inverted from old binary behavior. */
         float w = params[i];
         float wc = fmaxf(0.0f, fminf(1.0f, w));
-        float h;
-        if (update > 0.0f) {
-            /* Pushing toward 0 (weakening): h_w = 2(1-L) */
-            h = fmaxf(0.1f, 2.0f * (1.0f - wc));
-        } else {
-            /* Pushing toward 1 (strengthening): h_s = 2L */
-            h = fmaxf(0.1f, 2.0f * wc);
-        }
+        float d1 = fabsf(wc - (1.0f / 3.0f));
+        float d2 = fabsf(wc - (2.0f / 3.0f));
+        float min_d = fminf(d1, d2);
+        float h = fmaxf(0.1f, 2.0f * (1.0f - 6.0f * min_d));
         params[i] -= update * h;
 
-        /* Hard clamp — needed while magnitudes are uncorrected.
-         * Clamp removal was premature: FFN outputs are O(3000), not O(1),
-         * and projection cos=0.70 means gradients are structured.
-         * TODO: revisit once magnitude chain is fixed end-to-end. */
+        /* Hard clamp [0,1] */
         if (params[i] < 0.0f) params[i] = 0.0f;
         if (params[i] > 1.0f) params[i] = 1.0f;
     }
@@ -973,19 +969,21 @@ static void binary_gpu_sync(BinaryWeightsGPU *gpu, const BinaryWeights *cpu) {
     int packed_cols = (cpu->cols + 31) / 32;
     size_t packed_bytes = (size_t)cpu->rows * packed_cols * sizeof(uint32_t);
 
-    if (gpu->d_packed == NULL) {
+    if (gpu->d_packed_plus == NULL) {
         /* First time: full init */
         gpu->rows = cpu->rows;
         gpu->cols = cpu->cols;
-        gpu->density = cpu->density;
-        gpu->h_packed = cpu->packed;  /* point to same host data */
-        BGPU_CHECK(cudaMalloc(&gpu->d_packed, packed_bytes));
-    } else {
-        gpu->density = cpu->density;
-        gpu->h_packed = cpu->packed;
+        BGPU_CHECK(cudaMalloc(&gpu->d_packed_plus, packed_bytes));
+        BGPU_CHECK(cudaMalloc(&gpu->d_packed_neg,  packed_bytes));
     }
-    BGPU_CHECK(cudaMemcpy(gpu->d_packed, cpu->packed, packed_bytes,
-                           cudaMemcpyHostToDevice));
+    gpu->density_plus = cpu->density_plus;
+    gpu->density_neg  = cpu->density_neg;
+    gpu->h_packed_plus = cpu->packed_plus;  /* point to same host data */
+    gpu->h_packed_neg  = cpu->packed_neg;
+    BGPU_CHECK(cudaMemcpy(gpu->d_packed_plus, cpu->packed_plus, packed_bytes,
+                          cudaMemcpyHostToDevice));
+    BGPU_CHECK(cudaMemcpy(gpu->d_packed_neg,  cpu->packed_neg,  packed_bytes,
+                          cudaMemcpyHostToDevice));
 }
 
 static void binary_gpu_sync_all(TrainableModel *tm) {
@@ -2002,17 +2000,29 @@ static void trainable_dump_diagnostics(TrainableModel *tm, int step) {
     /* (MoE routing diagnostics removed — dense FFN has no router) */
 
     /* Ternary weight entropy per layer (sample W_q):
-     * count {-1, 0, +1} fractions, compute H = -sum(p*log2(p)) */
+     * count {-1, 0, +1} fractions via the {2,3} thresholds (1/3 and 2/3).
+     * Matches binary_pack_weights semantics. */
     for (int l = 0; l < L; l++) {
         TrainableLayerWeights *tw = &tm->layer_weights[l];
         int size = D * D;
         int cnt[3] = {0, 0, 0};  /* -1, 0, +1 */
+#ifdef TWO3_BINARY
+        const float t_low  = 1.0f / 3.0f;
+        const float t_high = 2.0f / 3.0f;
+        for (int i = 0; i < size; i++) {
+            float w = tw->W_q[i];
+            if (w >= t_high)      cnt[2]++;  /* +1 */
+            else if (w < t_low)   cnt[0]++;  /* -1 */
+            else                  cnt[1]++;  /* 0 (substrate) */
+        }
+#else
         for (int i = 0; i < size; i++) {
             float w = tw->W_q[i];
             if (w > 0.5f) cnt[2]++;
             else if (w < -0.5f) cnt[0]++;
             else cnt[1]++;
         }
+#endif
         float H = 0.f;
         for (int k = 0; k < 3; k++) {
             float p = (float)cnt[k] / (float)size;
@@ -2353,7 +2363,8 @@ static TrainResult trainable_forward_backward(
             printf("  [var] L%d: attn_rms=%.4f  ffn_rms=%.4f  ratio=%.2f"
                    "  Wo_d=%.3f  down_d=%.3f\n",
                    l, attn_rms, ffn_rms, ratio,
-                   ly->W_o.density, ly->ffn.down.density);
+                   binary_active_density(&ly->W_o),
+                   binary_active_density(&ly->ffn.down));
 #else
             printf("  [var] L%d: attn_rms=%.4f  ffn_rms=%.4f  ratio=%.2f\n",
                    l, attn_rms, ffn_rms, ratio);

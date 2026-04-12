@@ -275,7 +275,24 @@ __global__ void resident_kernel_scale_if(float *data, const float *norm_sq, floa
         data[i] *= max_norm / norm;
 }
 
-/* Adam with headroom modulation — direct port of CPU adam_update_headroom */
+/* Adam with {2,3} headroom modulation.
+ *
+ * Ternary quantization boundaries at 1/3 and 2/3 define the flip surfaces.
+ * Attractors at {0, 1/2, 1} — midpoints of the three ternary regions.
+ *
+ * Symmetric headroom = distance-to-nearest-boundary.
+ *   d = min(|w - 1/3|, |w - 2/3|)
+ *   h = max(0.1, 2 * (1 - 6*d))        // peaks at d=0, drops to 0 at d=1/6
+ *
+ * Verification:
+ *   w=0    (d=1/3) → h=0.1   (committed to -1)
+ *   w=1/6  (d=1/6) → h=0.1   (midpoint of -1 region)
+ *   w=1/3  (d=0)   → h=2.0   (flip boundary -1↔0, MAX mobility)
+ *   w=1/2  (d=1/6) → h=0.1   (midpoint of substrate — was max in old binary)
+ *   w=2/3  (d=0)   → h=2.0   (flip boundary 0↔+1, MAX mobility)
+ *   w=5/6  (d=1/6) → h=0.1   (midpoint of +1 region)
+ *   w=1    (d=1/3) → h=0.1   (committed to +1)
+ */
 __global__ void resident_kernel_adam_headroom(
     float *params, const float *grads, float *m, float *v,
     int n, float lr, float beta1, float beta2, float eps,
@@ -295,14 +312,13 @@ __global__ void resident_kernel_adam_headroom(
     if (update >  0.1f) update =  0.1f;
     if (update < -0.1f) update = -0.1f;
 
-    /* Headroom modulation */
+    /* {2,3} headroom: symmetric distance to nearest ternary boundary */
     float w = params[i];
     float wc = fmaxf(0.0f, fminf(1.0f, w));
-    float h;
-    if (update > 0.0f)
-        h = fmaxf(0.1f, 2.0f * (1.0f - wc));
-    else
-        h = fmaxf(0.1f, 2.0f * wc);
+    float d1 = fabsf(wc - (1.0f / 3.0f));
+    float d2 = fabsf(wc - (2.0f / 3.0f));
+    float min_d = fminf(d1, d2);
+    float h = fmaxf(0.1f, 2.0f * (1.0f - 6.0f * min_d));
     params[i] -= update * h;
 
     /* Hard clamp [0, 1] */
@@ -364,11 +380,13 @@ static void resident_backward_gate_up(
 
     /* Backward for gate */
     {
-        float bwd_scale = 1.0f / sqrtf(W_gate->density * (float)M + 1e-6f);
+        float active = binary_gpu_active_density(W_gate);
+        float bwd_scale = 1.0f / sqrtf(fmaxf(active, 1e-6f) * (float)M);
         dim3 b1(BTILE_M, BTILE_N);
         dim3 g1((K + BTILE_M - 1) / BTILE_M, (S + BTILE_N - 1) / BTILE_N);
         binary_backward_dx_tiled<<<g1, b1>>>(
-            rs->d_dY_gate, W_gate->d_packed, rs->d_dX, S, M, K, bwd_scale);
+            rs->d_dY_gate, W_gate->d_packed_plus, W_gate->d_packed_neg,
+            rs->d_dX, S, M, K, bwd_scale);
 
         dim3 b2(BDWK_BLOCK, BDWK_BLOCK);
         dim3 g2((K + BDWK_BLOCK - 1) / BDWK_BLOCK, (M + BDWK_BLOCK - 1) / BDWK_BLOCK);
@@ -378,11 +396,13 @@ static void resident_backward_gate_up(
 
     /* Backward for up (dX accumulates into same buffer) */
     {
-        float bwd_scale = 1.0f / sqrtf(W_up->density * (float)M + 1e-6f);
+        float active = binary_gpu_active_density(W_up);
+        float bwd_scale = 1.0f / sqrtf(fmaxf(active, 1e-6f) * (float)M);
         dim3 b1(BTILE_M, BTILE_N);
         dim3 g1((K + BTILE_M - 1) / BTILE_M, (S + BTILE_N - 1) / BTILE_N);
         binary_backward_dx_tiled<<<g1, b1>>>(
-            rs->d_dY_up, W_up->d_packed, rs->d_dX, S, M, K, bwd_scale);
+            rs->d_dY_up, W_up->d_packed_plus, W_up->d_packed_neg,
+            rs->d_dX, S, M, K, bwd_scale);
 
         dim3 b2(BDWK_BLOCK, BDWK_BLOCK);
         dim3 g2((K + BDWK_BLOCK - 1) / BDWK_BLOCK, (M + BDWK_BLOCK - 1) / BDWK_BLOCK);
@@ -418,11 +438,13 @@ static void resident_backward_helper(
     BGPU_CHECK(cudaMemcpy(wb->d_dY, h_dY, (size_t)S * M * sizeof(float), cudaMemcpyHostToDevice));
     BGPU_CHECK(cudaMemset(wb->d_grad, 0, (size_t)M * K * sizeof(float)));
 
-    /* Kernel 1: dX += W^T @ dY */
-    float bwd_scale = 1.0f / sqrtf(W->density * (float)M + 1e-6f);
+    /* Kernel 1: dX += W^T @ dY (signed) */
+    float active = binary_gpu_active_density(W);
+    float bwd_scale = 1.0f / sqrtf(fmaxf(active, 1e-6f) * (float)M);
     dim3 b1(BTILE_M, BTILE_N);
     dim3 g1((K + BTILE_M - 1) / BTILE_M, (S + BTILE_N - 1) / BTILE_N);
-    binary_backward_dx_tiled<<<g1, b1>>>(wb->d_dY, W->d_packed, d_dX, S, M, K, bwd_scale);
+    binary_backward_dx_tiled<<<g1, b1>>>(
+        wb->d_dY, W->d_packed_plus, W->d_packed_neg, d_dX, S, M, K, bwd_scale);
 
     /* Kernel 2: dW = dY^T @ X with STE clip */
     dim3 b2(BDWK_BLOCK, BDWK_BLOCK);
@@ -519,12 +541,14 @@ static void resident_backward_down(
     BGPU_CHECK(cudaMemset(rs->d_dX_down, 0, (size_t)S * K * sizeof(float)));
     BGPU_CHECK(cudaMemset(rs->d_grad_down, 0, (size_t)M * K * sizeof(float)));
 
-    /* Kernel 1: dX = W^T @ dY */
-    float bwd_scale = 1.0f / sqrtf(W_down->density * (float)M + 1e-6f);
+    /* Kernel 1: dX = W^T @ dY (signed) */
+    float active_dn = binary_gpu_active_density(W_down);
+    float bwd_scale = 1.0f / sqrtf(fmaxf(active_dn, 1e-6f) * (float)M);
     dim3 b1(BTILE_M, BTILE_N);
     dim3 g1((K + BTILE_M - 1) / BTILE_M, (S + BTILE_N - 1) / BTILE_N);
     binary_backward_dx_tiled<<<g1, b1>>>(
-        rs->d_dY_down, W_down->d_packed, rs->d_dX_down, S, M, K, bwd_scale);
+        rs->d_dY_down, W_down->d_packed_plus, W_down->d_packed_neg,
+        rs->d_dX_down, S, M, K, bwd_scale);
 
     /* Kernel 2: dW = dY^T @ X with STE clip */
     dim3 b2(BDWK_BLOCK, BDWK_BLOCK);

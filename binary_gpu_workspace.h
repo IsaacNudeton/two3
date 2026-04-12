@@ -204,15 +204,16 @@ static void binary_workspace_quantize(BinaryGPUWorkspace *ws,
 static void binary_workspace_dequant(BinaryGPUWorkspace *ws,
                                       float *h_output,  /* [S × M] host */
                                       int S, int M,
-                                      float density, int K) {
+                                      float active_density, int K) {
     /* D2H transfer */
     BGPU_CHECK(cudaMemcpy(ws->h_acc, ws->d_acc, (size_t)S * M * sizeof(int32_t),
                           cudaMemcpyDeviceToHost));
-    
-    /* Dequantize on host */
+
+    /* Dequantize on host — active_density is P(+1)+P(-1) for signed matmul */
+    float norm = 1.0f / sqrtf(fmaxf(active_density, 1e-6f) * (float)K);
     for (int s = 0; s < S; s++) {
         float a_scale = ws->h_scales[s] / 127.0f;
-        float combined = a_scale / sqrtf(density * (float)K);
+        float combined = a_scale * norm;
         for (int m = 0; m < M; m++) {
             h_output[s * M + m] = (float)ws->h_acc[s * M + m] * combined;
         }
@@ -239,12 +240,12 @@ static void binary_project_batch_gpu_ws(
     /* Quantize: host → device */
     binary_workspace_quantize(ws, h_input, S, K);
     
-    /* Matmul on GPU */
+    /* Matmul on GPU — signed two-mask */
     BGPU_CHECK(cudaMemset(ws->d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-    binary_matmul_gpu(W->d_packed, ws->d_x_q, ws->d_acc, S, M, K);
-    
+    binary_matmul_gpu(W->d_packed_plus, W->d_packed_neg, ws->d_x_q, ws->d_acc, S, M, K);
+
     /* Dequantize: device → host */
-    binary_workspace_dequant(ws, h_output, S, M, W->density, K);
+    binary_workspace_dequant(ws, h_output, S, M, binary_gpu_active_density(W), K);
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -297,15 +298,18 @@ static void binary_project_multi_gpu_ws(
         int M = W_list[i]->rows;
 
         BGPU_CHECK(cudaMemset(ws->d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-        binary_matmul_gpu(W_list[i]->d_packed, ws->d_x_q, ws->d_acc, S, M, K);
+        binary_matmul_gpu(W_list[i]->d_packed_plus, W_list[i]->d_packed_neg,
+                          ws->d_x_q, ws->d_acc, S, M, K);
 
         /* D2H and dequantize */
         BGPU_CHECK(cudaMemcpy(ws->h_acc, ws->d_acc, (size_t)S * M * sizeof(int32_t),
                               cudaMemcpyDeviceToHost));
 
+        float active = binary_gpu_active_density(W_list[i]);
+        float active_norm = 1.0f / sqrtf(fmaxf(active, 1e-6f) * (float)K);
         for (int s = 0; s < S; s++) {
             float a_scale = ws->h_scales[s] / 127.0f;
-            float combined = a_scale / sqrtf(W_list[i]->density * (float)K);
+            float combined = a_scale * active_norm;
             for (int m = 0; m < M; m++) {
                 h_output_list[i][s * M + m] = (float)ws->h_acc[s * M + m] * combined;
             }
@@ -346,7 +350,7 @@ __global__ void kernel_quantize_acts_device(
 
 __global__ void kernel_dequant_acts_device(
     float *d_output, const int32_t *d_acc, const float *d_scales,
-    int S, int M, float density, int K
+    int S, int M, float active_density, int K
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = S * M;
@@ -356,7 +360,7 @@ __global__ void kernel_dequant_acts_device(
     int m = idx % M;
 
     float a_scale = d_scales[s] / 127.0f;
-    float combined = a_scale / sqrtf(density * (float)K);
+    float combined = a_scale / sqrtf(fmaxf(active_density, 1e-6f) * (float)K);
     d_output[s * M + m] = (float)d_acc[s * M + m] * combined;
 }
 
@@ -377,14 +381,14 @@ static void binary_project_batch_gpu_resident(
     kernel_quantize_acts_device<<<S, threads, 0, NULL>>>(
         ws->d_x_q, ws->d_scales, d_input, S, K);
 
-    /* Matmul on GPU */
+    /* Matmul on GPU — signed two-mask */
     BGPU_CHECK(cudaMemset(ws->d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-    binary_matmul_gpu(W->d_packed, ws->d_x_q, ws->d_acc, S, M, K);
+    binary_matmul_gpu(W->d_packed_plus, W->d_packed_neg, ws->d_x_q, ws->d_acc, S, M, K);
 
     /* Dequantize on device */
     int blocks = (S * M + threads - 1) / threads;
     kernel_dequant_acts_device<<<blocks, threads>>>(
-        d_output, ws->d_acc, ws->d_scales, S, M, W->density, K);
+        d_output, ws->d_acc, ws->d_scales, S, M, binary_gpu_active_density(W), K);
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -419,12 +423,13 @@ static void binary_project_multi_gpu_resident(
         int M = W_list[i]->rows;
 
         BGPU_CHECK(cudaMemset(ws->d_acc, 0, (size_t)S * M * sizeof(int32_t)));
-        binary_matmul_gpu(W_list[i]->d_packed, ws->d_x_q, ws->d_acc, S, M, K);
+        binary_matmul_gpu(W_list[i]->d_packed_plus, W_list[i]->d_packed_neg,
+                          ws->d_x_q, ws->d_acc, S, M, K);
 
         int blocks = (S * M + threads - 1) / threads;
         kernel_dequant_acts_device<<<blocks, threads>>>(
             d_output_list[i], ws->d_acc, ws->d_scales, S, M,
-            W_list[i]->density, K);
+            binary_gpu_active_density(W_list[i]), K);
     }
 }
 
@@ -451,14 +456,16 @@ static void binary_backward_batch_gpu_ws(
     BGPU_CHECK(cudaMemset(ws->d_dX_bw, 0, (size_t)S * K * sizeof(float)));
     BGPU_CHECK(cudaMemset(ws->d_dW_bw, 0, (size_t)M * K * sizeof(float)));
 
-    /* Kernel 1: dX = W^T @ dY (tiled, with backward scale) */
+    /* Kernel 1: dX = W^T @ dY (tiled signed, with backward scale) */
     {
-        float bwd_scale = 1.0f / sqrtf(W->density * (float)M + 1e-6f);
+        float active = binary_gpu_active_density(W);
+        float bwd_scale = 1.0f / sqrtf(fmaxf(active, 1e-6f) * (float)M);
         dim3 block(BTILE_M, BTILE_N);
         dim3 grid((K + BTILE_M - 1) / BTILE_M,
                   (S + BTILE_N - 1) / BTILE_N);
         binary_backward_dx_tiled<<<grid, block>>>(
-            ws->d_dY_bw, W->d_packed, ws->d_dX_bw, S, M, K, bwd_scale);
+            ws->d_dY_bw, W->d_packed_plus, W->d_packed_neg,
+            ws->d_dX_bw, S, M, K, bwd_scale);
         BGPU_CHECK(cudaGetLastError());
     }
 
@@ -514,19 +521,21 @@ static void binary_backward_multi_gpu_ws(
 
     for (int i = 0; i < N; i++) {
         int M = W_list[i]->rows;
-        float bwd_scale = 1.0f / sqrtf(W_list[i]->density * (float)M + 1e-6f);
+        float active = binary_gpu_active_density(W_list[i]);
+        float bwd_scale = 1.0f / sqrtf(fmaxf(active, 1e-6f) * (float)M);
 
         /* Upload per-projection: only dY (W_latent already on device) */
         BGPU_CHECK(cudaMemcpy(ws->d_dY_bw, dY_list[i], (size_t)S * M * sizeof(float), cudaMemcpyHostToDevice));
         BGPU_CHECK(cudaMemset(ws->d_dW_bw, 0, (size_t)M * K * sizeof(float)));
 
-        /* Kernel 1: dX += W^T @ dY (accumulates across projections) */
+        /* Kernel 1: dX += W^T @ dY (signed, accumulates across projections) */
         {
             dim3 block(BTILE_M, BTILE_N);
             dim3 grid((K + BTILE_M - 1) / BTILE_M,
                       (S + BTILE_N - 1) / BTILE_N);
             binary_backward_dx_tiled<<<grid, block>>>(
-                ws->d_dY_bw, W_list[i]->d_packed, ws->d_dX_bw, S, M, K, bwd_scale);
+                ws->d_dY_bw, W_list[i]->d_packed_plus, W_list[i]->d_packed_neg,
+                ws->d_dX_bw, S, M, K, bwd_scale);
             BGPU_CHECK(cudaGetLastError());
         }
 
