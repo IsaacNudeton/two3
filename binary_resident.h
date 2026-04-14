@@ -296,7 +296,7 @@ __global__ void resident_kernel_scale_if(float *data, const float *norm_sq, floa
 __global__ void resident_kernel_adam_headroom(
     float *params, const float *grads, float *m, float *v,
     int n, float lr, float beta1, float beta2, float eps,
-    float b1_corr, float b2_corr
+    float b1_corr, float b2_corr, float headroom_peak
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -312,13 +312,16 @@ __global__ void resident_kernel_adam_headroom(
     if (update >  0.1f) update =  0.1f;
     if (update < -0.1f) update = -0.1f;
 
-    /* {2,3} headroom: symmetric distance to nearest ternary boundary */
+    /* {2,3} headroom: symmetric distance to nearest ternary boundary.
+     * headroom_peak controls boundary mobility:
+     *   peak=1.0 → plain Adam (no headroom modulation)
+     *   peak=10.0 → boundary weights move 10× faster than committed */
     float w = params[i];
     float wc = fmaxf(0.0f, fminf(1.0f, w));
     float d1 = fabsf(wc - (1.0f / 3.0f));
     float d2 = fabsf(wc - (2.0f / 3.0f));
     float min_d = fminf(d1, d2);
-    float h = fmaxf(0.1f, 2.0f * (1.0f - 6.0f * min_d));
+    float h = fmaxf(0.1f, headroom_peak * (1.0f - 6.0f * min_d));
     params[i] -= update * h;
 
     /* Hard clamp [0, 1] */
@@ -326,11 +329,12 @@ __global__ void resident_kernel_adam_headroom(
     if (params[i] > 1.0f) params[i] = 1.0f;
 }
 
-/* Orchestrator: grad clip + Adam headroom on one tensor */
+/* Orchestrator: grad clip + Adam headroom on one tensor.
+ * headroom_peak: 10.0 for boundary mobility, 1.0 for plain Adam. */
 static void resident_grad_clip_adam(
     float *d_W_latent, float *d_grad, float *d_m, float *d_v,
     int size, float max_norm, float lr, float beta1, float beta2, float eps,
-    int step, float *d_norm_buf
+    int step, float *d_norm_buf, float headroom_peak
 ) {
     float b1_corr = 1.0f / (1.0f - powf(beta1, (float)step));
     float b2_corr = 1.0f / (1.0f - powf(beta2, (float)step));
@@ -346,7 +350,7 @@ static void resident_grad_clip_adam(
     /* Adam headroom */
     resident_kernel_adam_headroom<<<blocks, threads>>>(
         d_W_latent, d_grad, d_m, d_v, size,
-        lr, beta1, beta2, eps, b1_corr, b2_corr);
+        lr, beta1, beta2, eps, b1_corr, b2_corr, headroom_peak);
 }
 
 /* ═══════════════════════════════════════════════════════

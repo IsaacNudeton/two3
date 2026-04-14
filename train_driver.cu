@@ -48,6 +48,7 @@ typedef struct {
     /* Data */
     char  data_path[256]; /* path to text file or directory */
     char  resume[256];    /* checkpoint to resume from, or empty */
+    int   override_layers; /* if > 0, override n_layers in model config */
 } TrainConfig;
 
 static TrainConfig default_config(void) {
@@ -63,6 +64,7 @@ static TrainConfig default_config(void) {
     c.log_every = 10;
     c.data_path[0] = 0;
     c.resume[0] = 0;
+    c.override_layers = 0;
     return c;
 }
 
@@ -123,6 +125,8 @@ static void parse_args(TrainConfig *cfg, int argc, char **argv) {
             cfg->seq_len = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
             cfg->batch_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) {
+            cfg->override_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ckpt-every") == 0 && i + 1 < argc) {
             cfg->ckpt_every = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--log-every") == 0 && i + 1 < argc) {
@@ -234,6 +238,11 @@ int main(int argc, char **argv) {
                      : cfg.use_large ? model_config_large()
                      : cfg.use_medium ? model_config_medium()
                      : model_config_default();
+    /* Override layer count if requested */
+    if (cfg.override_layers > 0) {
+        mcfg.n_layers = cfg.override_layers;
+    }
+
     /* Clamp max_seq to training seq_len — no need to allocate scratch for
      * sequences longer than we'll actually train on. */
     mcfg.max_seq = cfg.seq_len;
@@ -563,10 +572,68 @@ int main(int argc, char **argv) {
     }
 
     /* ═══════════════════════════════════════════════════════
-     * DONE
+     * DONE — dump zero_fraction per input column for scatter plot
      * ═══════════════════════════════════════════════════════ */
 
     double total_sec = (double)(clock() - t_start) / CLOCKS_PER_SEC;
+
+    /* Weight dump: for each layer, for each projection, compute
+     * zero_fraction[k] = fraction of output weights that quantize to 0
+     * for input dimension k. Write as binary floats. */
+    {
+        int D = mcfg.dim;
+        int KV = mcfg.n_kv_heads * mcfg.head_dim;
+        int INTER = mcfg.intermediate;
+        int L = mcfg.n_layers;
+
+        FILE *wdf = fopen("weight_dump.bin", "wb");
+        if (wdf) {
+            /* Header: D, KV, INTER, L */
+            fwrite(&D, sizeof(int), 1, wdf);
+            fwrite(&KV, sizeof(int), 1, wdf);
+            fwrite(&INTER, sizeof(int), 1, wdf);
+            fwrite(&L, sizeof(int), 1, wdf);
+
+            for (int l = 0; l < L; l++) {
+                TrainableLayerWeights *tw = &tm.layer_weights[l];
+
+                /* For each weight matrix W[M, K], compute zero_fraction[k] */
+                struct { float *latent; int M; int K; const char *name; } projs[] = {
+                    { tw->W_q,    D,     D,  "W_q"    },
+                    { tw->W_k,    KV,    D,  "W_k"    },
+                    { tw->W_v,    KV,    D,  "W_v"    },
+                    { tw->W_o,    D,     D,  "W_o"    },
+                    { tw->W_gate, INTER, D,  "W_gate" },
+                    { tw->W_up,   INTER, D,  "W_up"   },
+                    { tw->W_down, D,     INTER, "W_down" },
+                };
+
+                for (int p = 0; p < 7; p++) {
+                    int M = projs[p].M;
+                    int K = projs[p].K;
+                    float *latent = projs[p].latent;
+                    float *zf = (float*)calloc(K, sizeof(float));
+
+                    for (int k = 0; k < K; k++) {
+                        int zeros = 0;
+                        for (int m = 0; m < M; m++) {
+                            float w = latent[m * K + k];
+                            /* Quantizes to 0 if in [1/3, 2/3] */
+                            if (w >= (1.0f / 3.0f) && w <= (2.0f / 3.0f))
+                                zeros++;
+                        }
+                        zf[k] = (float)zeros / (float)M;
+                    }
+
+                    fwrite(&K, sizeof(int), 1, wdf);
+                    fwrite(zf, sizeof(float), K, wdf);
+                    free(zf);
+                }
+            }
+            fclose(wdf);
+            printf("  Weight dump: weight_dump.bin\n");
+        }
+    }
 
     /* Save final model */
     trainable_save(&tm, "final.t2l4");

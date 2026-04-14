@@ -46,13 +46,16 @@ typedef struct {
     int    dim;
 } GainState;
 
-/* Initialize: reservoir starts full (R = C), capacity learnable from 1.0 */
+/* Initialize: reservoir starts full (R = C), capacity = sqrt(dim/3).
+ * C = sqrt(dim/3) sets the reservoir scale to match the ternary substrate:
+ * three states, dim features, geometric mean of the partition. */
 static void gain_init(GainState *g, int dim) {
     g->dim = dim;
     g->R = (float*)calloc(dim, sizeof(float));
     g->C = (float*)malloc(dim * sizeof(float));
+    float c_init = sqrtf((float)dim / 3.0f);
     for (int i = 0; i < dim; i++) {
-        g->C[i] = 1.0f;   /* initial capacity — gets trained */
+        g->C[i] = c_init;
         g->R[i] = g->C[i]; /* reservoir starts at capacity */
     }
 }

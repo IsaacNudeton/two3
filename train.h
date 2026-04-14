@@ -374,7 +374,8 @@ static void adam_update_headroom(
     const float *grads,
     AdamState *s,
     int step,
-    float lr, float beta1, float beta2, float eps
+    float lr, float beta1, float beta2, float eps,
+    float headroom_peak
 ) {
     float b1_corr = 1.0f / (1.0f - powf(beta1, (float)step));
     float b2_corr = 1.0f / (1.0f - powf(beta2, (float)step));
@@ -400,7 +401,7 @@ static void adam_update_headroom(
         float d1 = fabsf(wc - (1.0f / 3.0f));
         float d2 = fabsf(wc - (2.0f / 3.0f));
         float min_d = fminf(d1, d2);
-        float h = fmaxf(0.1f, 2.0f * (1.0f - 6.0f * min_d));
+        float h = fmaxf(0.1f, headroom_peak * (1.0f - 6.0f * min_d));
         params[i] -= update * h;
 
         /* Hard clamp [0,1] */
@@ -1823,26 +1824,30 @@ static void trainable_optimizer_step(TrainableModel *tm) {
 #else
 #ifdef TWO3_BINARY
         /* Headroom-modulated Adam (MetabolicAge_v3, Theorem 68).
-         * h_s(L) = 2L, h_w(L) = 2(1-L) for L ∈ [0,1], L_WIRE = 0.5.
-         * Committed weights resist flipping, boundary weights move freely.
-         * No external gate — headroom IS the self-regulation mechanism. */
+         * headroom = 3/2 everywhere. This is Z²_ratio = Z_in/Z_out squared,
+         * the impedance mismatch at the ternary/binary boundary.
+         * Same as Koide Q, sin²θ at cube diagonal, committed fraction at
+         * equilibrium. The distinction between layers comes from the signal
+         * (L0 sees clean gradients → more commitment; L1/L2 see mixed →
+         * more zeros), not from per-layer mobility knobs. */
+        float layer_headroom = 1.5f;
 #ifdef TWO3_BINARY_RESIDENT
         /* QKV: optimizer on device */
         resident_grad_clip_adam(tm->gpu_weights[l].W_q.d_W_latent,
             tm->resident_attn[l].q.d_grad, tm->resident_attn[l].q.d_adam_m,
             tm->resident_attn[l].q.d_adam_v,
             D * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
-            tm->step, tm->resident_attn[l].d_norm);
+            tm->step, tm->resident_attn[l].d_norm, layer_headroom);
         resident_grad_clip_adam(tm->gpu_weights[l].W_k.d_W_latent,
             tm->resident_attn[l].k.d_grad, tm->resident_attn[l].k.d_adam_m,
             tm->resident_attn[l].k.d_adam_v,
             KV * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
-            tm->step, tm->resident_attn[l].d_norm);
+            tm->step, tm->resident_attn[l].d_norm, layer_headroom);
         resident_grad_clip_adam(tm->gpu_weights[l].W_v.d_W_latent,
             tm->resident_attn[l].v.d_grad, tm->resident_attn[l].v.d_adam_m,
             tm->resident_attn[l].v.d_adam_v,
             KV * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
-            tm->step, tm->resident_attn[l].d_norm);
+            tm->step, tm->resident_attn[l].d_norm, layer_headroom);
         BGPU_CHECK(cudaDeviceSynchronize());
         /* D2H: latent weights (QKV + O) */
         BGPU_CHECK(cudaMemcpy(tw->W_q, tm->gpu_weights[l].W_q.d_W_latent,
@@ -1858,9 +1863,9 @@ static void trainable_optimizer_step(TrainableModel *tm) {
             tw->adam_Wq.m, tw->adam_Wq.v, tw->adam_Wk.m, tw->adam_Wk.v,
             tw->adam_Wv.m, tw->adam_Wv.v, tw->adam_Wo.m, tw->adam_Wo.v);
 #else
-        adam_update_headroom(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        adam_update_headroom(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        adam_update_headroom(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update_headroom(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps, layer_headroom);
+        adam_update_headroom(tw->W_k, tw->grad_Wk, &tw->adam_Wk, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps, layer_headroom);
+        adam_update_headroom(tw->W_v, tw->grad_Wv, &tw->adam_Wv, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps, layer_headroom);
 #endif
 #ifdef TWO3_BINARY_RESIDENT
         /* O: optimizer on device */
@@ -1868,9 +1873,9 @@ static void trainable_optimizer_step(TrainableModel *tm) {
             tm->resident_attn[l].o.d_grad, tm->resident_attn[l].o.d_adam_m,
             tm->resident_attn[l].o.d_adam_v,
             D * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
-            tm->step, tm->resident_attn[l].d_norm);
+            tm->step, tm->resident_attn[l].d_norm, layer_headroom);
 #else
-        adam_update_headroom(tw->W_o, tw->grad_Wo, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update_headroom(tw->W_o, tw->grad_Wo, &tw->adam_Wo, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps, layer_headroom);
 #endif
 #ifdef TWO3_BINARY_RESIDENT
         /* gate+up: optimizer on device, then sync latent weights back to host */
@@ -1878,19 +1883,19 @@ static void trainable_optimizer_step(TrainableModel *tm) {
             tm->resident_ffn[l].d_grad_gate, tm->resident_ffn[l].d_adam_m_gate,
             tm->resident_ffn[l].d_adam_v_gate,
             INTER * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
-            tm->step, tm->resident_ffn[l].d_norm);
+            tm->step, tm->resident_ffn[l].d_norm, layer_headroom);
         resident_grad_clip_adam(tm->gpu_weights[l].up.d_W_latent,
             tm->resident_ffn[l].d_grad_up, tm->resident_ffn[l].d_adam_m_up,
             tm->resident_ffn[l].d_adam_v_up,
             INTER * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
-            tm->step, tm->resident_ffn[l].d_norm);
+            tm->step, tm->resident_ffn[l].d_norm, layer_headroom);
         BGPU_CHECK(cudaDeviceSynchronize());
         /* down: optimizer on device */
         resident_grad_clip_adam(tm->gpu_weights[l].down.d_W_latent,
             tm->resident_ffn[l].d_grad_down, tm->resident_ffn[l].d_adam_m_down,
             tm->resident_ffn[l].d_adam_v_down,
             D * INTER, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
-            tm->step, tm->resident_ffn[l].d_norm);
+            tm->step, tm->resident_ffn[l].d_norm, layer_headroom);
         BGPU_CHECK(cudaDeviceSynchronize());
         /* D2H: latent weights for checkpointing/requantize */
         BGPU_CHECK(cudaMemcpy(tw->W_gate, tm->gpu_weights[l].gate.d_W_latent,
@@ -1905,9 +1910,9 @@ static void trainable_optimizer_step(TrainableModel *tm) {
             tw->adam_up.m, tw->adam_up.v,
             tw->adam_down.m, tw->adam_down.v);
 #else
-        adam_update_headroom(tw->W_gate, tw->grad_gate, &tw->adam_gate, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        adam_update_headroom(tw->W_up, tw->grad_up, &tw->adam_up, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-        adam_update_headroom(tw->W_down, tw->grad_down, &tw->adam_down, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+        adam_update_headroom(tw->W_gate, tw->grad_gate, &tw->adam_gate, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps, layer_headroom);
+        adam_update_headroom(tw->W_up, tw->grad_up, &tw->adam_up, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps, layer_headroom);
+        adam_update_headroom(tw->W_down, tw->grad_down, &tw->adam_down, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps, layer_headroom);
 #endif
 #else
         adam_update(tw->W_q, tw->grad_Wq, &tw->adam_Wq, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
