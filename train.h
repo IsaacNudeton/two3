@@ -537,6 +537,19 @@ typedef struct {
     LayerSkipState layer_skip;
 #endif
 
+#ifdef TWO3_LEX_EMBED
+    int lex_corpus_offset;  /* set by caller before forward_backward */
+    /* Latent weights for lex embeddings */
+    float *latent_lex_class;   /* [16 * dim] */
+    float *latent_lex_brace;   /* [16 * dim] */
+    float *latent_lex_paren;   /* [16 * dim] */
+    float *latent_lex_mode;    /* [3 * dim] */
+    /* Gradient accumulators */
+    float *grad_lex_class, *grad_lex_brace, *grad_lex_paren, *grad_lex_mode;
+    /* Adam states */
+    AdamState adam_lex_class, adam_lex_brace, adam_lex_paren, adam_lex_mode;
+#endif
+
 #ifdef TWO3_FP_EMBED
     int fp_corpus_offset;  /* set by caller before forward_backward */
     /* Latent weights for fp projections (trainable) */
@@ -574,6 +587,27 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     memcpy(tm->latent_embed, tm->model.embed, 256 * D * sizeof(float));
     adam_init(&tm->adam_embed, 256 * D);
     tm->grad_embed = (float*)calloc(256 * D, sizeof(float));
+
+#ifdef TWO3_LEX_EMBED
+    /* Lex embedding latents — copy from model init, set up Adam */
+    tm->latent_lex_class = (float*)malloc(16 * D * sizeof(float));
+    tm->latent_lex_brace = (float*)malloc(16 * D * sizeof(float));
+    tm->latent_lex_paren = (float*)malloc(16 * D * sizeof(float));
+    tm->latent_lex_mode  = (float*)malloc(3 * D * sizeof(float));
+    memcpy(tm->latent_lex_class, tm->model.lex_class_embed, 16 * D * sizeof(float));
+    memcpy(tm->latent_lex_brace, tm->model.lex_brace_embed, 16 * D * sizeof(float));
+    memcpy(tm->latent_lex_paren, tm->model.lex_paren_embed, 16 * D * sizeof(float));
+    memcpy(tm->latent_lex_mode,  tm->model.lex_mode_embed,  3 * D * sizeof(float));
+    adam_init(&tm->adam_lex_class, 16 * D);
+    adam_init(&tm->adam_lex_brace, 16 * D);
+    adam_init(&tm->adam_lex_paren, 16 * D);
+    adam_init(&tm->adam_lex_mode,  3 * D);
+    tm->grad_lex_class = (float*)calloc(16 * D, sizeof(float));
+    tm->grad_lex_brace = (float*)calloc(16 * D, sizeof(float));
+    tm->grad_lex_paren = (float*)calloc(16 * D, sizeof(float));
+    tm->grad_lex_mode  = (float*)calloc(3 * D, sizeof(float));
+    tm->lex_corpus_offset = 0;
+#endif
 
     /* Per-layer latent weights and Adam states */
     tm->layer_weights = (TrainableLayerWeights*)calloc(L, sizeof(TrainableLayerWeights));
@@ -1275,6 +1309,15 @@ static void trainable_model_free(TrainableModel *tm) {
     adam_free(&tm->adam_embed);
     free(tm->grad_embed);
 
+#ifdef TWO3_LEX_EMBED
+    free(tm->latent_lex_class); free(tm->latent_lex_brace);
+    free(tm->latent_lex_paren); free(tm->latent_lex_mode);
+    free(tm->grad_lex_class); free(tm->grad_lex_brace);
+    free(tm->grad_lex_paren); free(tm->grad_lex_mode);
+    adam_free(&tm->adam_lex_class); adam_free(&tm->adam_lex_brace);
+    adam_free(&tm->adam_lex_paren); adam_free(&tm->adam_lex_mode);
+#endif
+
     for (int l = 0; l < L; l++) {
         TrainableLayerWeights *tw = &tm->layer_weights[l];
         free(tw->W_q); free(tw->W_k); free(tw->W_v); free(tw->W_o);
@@ -1648,6 +1691,12 @@ static void trainable_zero_grads(TrainableModel *tm) {
     int L = tm->cfg.n_layers;
 
     memset(tm->grad_embed, 0, 256 * D * sizeof(float));
+#ifdef TWO3_LEX_EMBED
+    memset(tm->grad_lex_class, 0, 16 * D * sizeof(float));
+    memset(tm->grad_lex_brace, 0, 16 * D * sizeof(float));
+    memset(tm->grad_lex_paren, 0, 16 * D * sizeof(float));
+    memset(tm->grad_lex_mode,  0, 3 * D * sizeof(float));
+#endif
     memset(tm->grad_gain_C_final, 0, D * sizeof(float));
 
     for (int l = 0; l < L; l++) {
@@ -1959,13 +2008,36 @@ static void trainable_optimizer_step(TrainableModel *tm) {
 #endif
 
     /* Embedding and final gain — Adam */
-    clip_grad_norm(tm->grad_embed, 256 * D, GRAD_CLIP_NORM);
     clip_grad_norm(tm->grad_gain_C_final, D, GRAD_CLIP_NORM);
+#ifdef TWO3_TERNARY_CODEBOOK
+    /* Codebook is frozen — gradients flow through but don't update.
+     * The ternary codebook IS the interface; learning happens in the
+     * projection weights, not the byte representation. */
+#else
+    clip_grad_norm(tm->grad_embed, 256 * D, GRAD_CLIP_NORM);
     adam_update(tm->latent_embed, tm->grad_embed, &tm->adam_embed, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
-    /* gain_final.C also frozen — same reasoning as per-layer C. */
 
     /* Sync embedding */
     memcpy(tm->model.embed, tm->latent_embed, 256 * D * sizeof(float));
+#endif
+
+#ifdef TWO3_LEX_EMBED
+    /* Lex embedding optimizer — standard Adam, no headroom */
+    clip_grad_norm(tm->grad_lex_class, 16 * D, GRAD_CLIP_NORM);
+    adam_update(tm->latent_lex_class, tm->grad_lex_class, &tm->adam_lex_class, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+    memcpy(tm->model.lex_class_embed, tm->latent_lex_class, 16 * D * sizeof(float));
+#ifndef TWO3_LEX_CLASS_ONLY
+    clip_grad_norm(tm->grad_lex_brace, 16 * D, GRAD_CLIP_NORM);
+    clip_grad_norm(tm->grad_lex_paren, 16 * D, GRAD_CLIP_NORM);
+    clip_grad_norm(tm->grad_lex_mode,  3 * D, GRAD_CLIP_NORM);
+    adam_update(tm->latent_lex_brace, tm->grad_lex_brace, &tm->adam_lex_brace, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+    adam_update(tm->latent_lex_paren, tm->grad_lex_paren, &tm->adam_lex_paren, tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+    adam_update(tm->latent_lex_mode,  tm->grad_lex_mode,  &tm->adam_lex_mode,  tm->step, tm->lr, tm->beta1, tm->beta2, tm->eps);
+    memcpy(tm->model.lex_brace_embed, tm->latent_lex_brace, 16 * D * sizeof(float));
+    memcpy(tm->model.lex_paren_embed, tm->latent_lex_paren, 16 * D * sizeof(float));
+    memcpy(tm->model.lex_mode_embed,  tm->latent_lex_mode,  3 * D * sizeof(float));
+#endif
+#endif
 
     /* Requantize is now called externally at REQUANT_INTERVAL
      * for temporal staggering (Yee CFL). See train_driver.cu. */
@@ -2146,6 +2218,42 @@ static TrainResult trainable_forward_backward(
     /* Byte embedding: index lookup */
     for (int t = 0; t < seq_len; t++)
         byte_embed_cpu(hidden + t * D, tm->model.embed, bytes[t], D);
+#endif
+
+#ifdef TWO3_LEX_EMBED
+    /* Additive structural embeddings: class + brace_depth + paren_depth + mode */
+    {
+        int lex_off = tm->lex_corpus_offset;
+        for (int t = 0; t < seq_len; t++) {
+            int pos = lex_off + t;
+            if (pos < 0 || pos >= tm->model.lex_corpus_size) continue;
+
+            uint8_t cls   = tm->model.lex_classes[pos];
+            uint8_t bd    = tm->model.lex_brace_depths[pos];
+            uint8_t pd    = tm->model.lex_paren_depths[pos];
+            uint8_t mode  = tm->model.lex_modes[pos];
+
+            /* Clamp indices */
+            if (cls >= 16) cls = 15;
+            if (bd >= 16)  bd = 15;
+            if (pd >= 16)  pd = 15;
+            if (mode >= 3) mode = 2;
+
+            float *h = hidden + t * D;
+#ifndef TWO3_LEX_CLASS_ONLY
+            const float *be = tm->model.lex_brace_embed + bd * D;
+            const float *pe = tm->model.lex_paren_embed + pd * D;
+            const float *me = tm->model.lex_mode_embed + mode * D;
+#endif
+            const float *ce = tm->model.lex_class_embed + cls * D;
+            for (int d = 0; d < D; d++) {
+                h[d] += ce[d];
+#ifndef TWO3_LEX_CLASS_ONLY
+                h[d] += be[d] + pe[d] + me[d];
+#endif
+            }
+        }
+    }
 #endif
 
     /* Saved activations per layer (for backprop) */
@@ -2852,6 +2960,37 @@ static TrainResult trainable_forward_backward(
         int b = bytes[t];
         for (int d = 0; d < D; d++)
             tm->grad_embed[b * D + d] += d_hidden[t * D + d];
+    }
+#endif
+
+#ifdef TWO3_LEX_EMBED
+    /* Lex embedding gradients: same pattern as byte embed — additive,
+     * so d_lex_table[id] += d_hidden[t] for each position with that id */
+    {
+        int lex_off = tm->lex_corpus_offset;
+        for (int t = 0; t < seq_len; t++) {
+            int pos = lex_off + t;
+            if (pos < 0 || pos >= tm->model.lex_corpus_size) continue;
+
+            uint8_t cls  = tm->model.lex_classes[pos];
+            uint8_t bd   = tm->model.lex_brace_depths[pos];
+            uint8_t pd   = tm->model.lex_paren_depths[pos];
+            uint8_t mode = tm->model.lex_modes[pos];
+            if (cls >= 16) cls = 15;
+            if (bd >= 16)  bd = 15;
+            if (pd >= 16)  pd = 15;
+            if (mode >= 3) mode = 2;
+
+            const float *dh = d_hidden + t * D;
+            for (int d = 0; d < D; d++) {
+                tm->grad_lex_class[cls * D + d] += dh[d];
+#ifndef TWO3_LEX_CLASS_ONLY
+                tm->grad_lex_brace[bd * D + d]  += dh[d];
+                tm->grad_lex_paren[pd * D + d]  += dh[d];
+                tm->grad_lex_mode[mode * D + d] += dh[d];
+#endif
+            }
+        }
     }
 #endif
 

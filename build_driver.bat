@@ -28,6 +28,9 @@ if "%1"=="fp-embed" goto fp_embed
 if "%1"=="binary" goto binary
 if "%1"=="binary-workspace" goto binary_workspace
 if "%1"=="binary-tc" goto binary_tc
+if "%1"=="binary-tc-cb" goto binary_tc_cb
+if "%1"=="lex-class" goto lex_class
+if "%1"=="lex-full" goto lex_full
 if "%1"=="infer-duo" goto infer_duo
 if "%1"=="verify-moon" goto verify_moon
 if "%1"=="hadamard" goto hadamard
@@ -59,6 +62,21 @@ goto end
 :binary_tc
 echo  Building BINARY-TC (resident + Tensor Core forward matmul)
 nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -DTWO3_TENSOR_CORE -o train_driver.exe train_driver.cu two3.cu
+goto end
+
+:binary_tc_cb
+echo  Building BINARY-TC-CB (full stack + ternary codebook embedding)
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -DTWO3_TENSOR_CORE -DTWO3_TERNARY_CODEBOOK -o train_driver.exe train_driver.cu two3.cu
+goto end
+
+:lex_class
+echo  Building LEX-CLASS (TC + identity + character class embedding)
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -DTWO3_TENSOR_CORE -DTWO3_LEX_EMBED -DTWO3_LEX_CLASS_ONLY -o train_driver.exe train_driver.cu two3.cu
+goto end
+
+:lex_full
+echo  Building LEX-FULL (TC + identity + class + depth + mode embedding)
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -DTWO3_TENSOR_CORE -DTWO3_LEX_EMBED -o train_driver.exe train_driver.cu two3.cu
 goto end
 
 :infer_duo

@@ -29,6 +29,9 @@
 #ifdef TWO3_BINARY
 #include "binary.h"
 #endif
+#if defined(TWO3_FP_EMBED) && defined(TWO3_LEX_EMBED)
+#error "TWO3_FP_EMBED and TWO3_LEX_EMBED are mutually exclusive"
+#endif
 #ifdef TWO3_IBC
 #include "ibc.h"
 #endif
@@ -129,6 +132,24 @@ typedef struct {
     /* Pre-computed fingerprints (mmap'd from .fp file) */
     uint8_t     *fp_data;       /* packed [corpus_size × 512 bytes] — 1 bit per fp element */
     int          fp_corpus_size;
+#endif
+
+#ifdef TWO3_LEX_EMBED
+    /* Structural context embeddings — additive on top of byte identity.
+     * v1: class + brace_depth + paren_depth + mode (normal/string/comment).
+     * Initialized at 0.1/sqrt(dim) scale — 10× smaller than identity embed
+     * to avoid swamping the byte signal early in training. */
+    float       *lex_class_embed;       /* [16 × dim] character class */
+    float       *lex_brace_embed;       /* [16 × dim] brace nesting depth */
+    float       *lex_paren_embed;       /* [16 × dim] paren nesting depth */
+    float       *lex_mode_embed;        /* [3 × dim] 0=normal, 1=string/char, 2=comment */
+
+    /* Pre-computed lex annotations (loaded from .lex file) */
+    uint8_t     *lex_classes;           /* [corpus_size] byte class per position */
+    uint8_t     *lex_brace_depths;      /* [corpus_size] brace depth per position */
+    uint8_t     *lex_paren_depths;      /* [corpus_size] paren depth per position */
+    uint8_t     *lex_modes;             /* [corpus_size] mode per position */
+    int          lex_corpus_size;
 #endif
 
     /* Layers */
@@ -342,6 +363,61 @@ static int fp_load(Model *m, const char *fp_path) {
 }
 #endif /* TWO3_FP_EMBED */
 
+#ifdef TWO3_LEX_EMBED
+#include "lexer.h"
+
+/* Load pre-computed .lex annotations and unpack into per-signal arrays.
+ * The model owns the memory — freed in model_free. */
+static int lex_load(Model *m, const char *lex_path) {
+    FILE *f = fopen(lex_path, "rb");
+    if (!f) return -1;
+
+    LexFileHeader hdr;
+    fread(&hdr, sizeof(hdr), 1, f);
+    if (hdr.magic != LEX_MAGIC) { fclose(f); return -2; }
+
+    int n = (int)hdr.corpus_size;
+    LexToken *tokens = (LexToken*)malloc(n * sizeof(LexToken));
+    fread(tokens, sizeof(LexToken), n, f);
+    fclose(f);
+
+    /* Unpack into separate arrays for fast indexed access during training */
+    m->lex_classes      = (uint8_t*)malloc(n);
+    m->lex_brace_depths = (uint8_t*)malloc(n);
+    m->lex_paren_depths = (uint8_t*)malloc(n);
+    m->lex_modes        = (uint8_t*)malloc(n);
+
+    for (int i = 0; i < n; i++) {
+        m->lex_classes[i]      = tokens[i].byte_class;
+        m->lex_brace_depths[i] = tokens[i].depth_id / 16;   /* brace depth */
+        m->lex_paren_depths[i] = tokens[i].depth_id % 16;   /* paren depth */
+
+        /* Mode: 0=normal, 1=string/char, 2=comment */
+        uint8_t fl = tokens[i].flags;
+        if (fl & (LEX_FLAG_IN_LINE_COMMENT | LEX_FLAG_IN_BLOCK_COMMENT))
+            m->lex_modes[i] = 2;
+        else if (fl & (LEX_FLAG_IN_STRING | LEX_FLAG_IN_CHAR))
+            m->lex_modes[i] = 1;
+        else
+            m->lex_modes[i] = 0;
+    }
+    m->lex_corpus_size = n;
+
+    free(tokens);
+    printf("[lex] loaded %s: %d positions, %d classes\n", lex_path, n, (int)hdr.n_classes);
+
+    /* Print mode distribution */
+    int mode_counts[3] = {0, 0, 0};
+    for (int i = 0; i < n; i++) mode_counts[m->lex_modes[i]]++;
+    printf("[lex] modes: normal=%d (%.1f%%), string/char=%d (%.1f%%), comment=%d (%.1f%%)\n",
+           mode_counts[0], 100.0*mode_counts[0]/n,
+           mode_counts[1], 100.0*mode_counts[1]/n,
+           mode_counts[2], 100.0*mode_counts[2]/n);
+
+    return 0;
+}
+#endif /* TWO3_LEX_EMBED */
+
 /* ═══════════════════════════════════════════════════════
  * Causal attention — the real thing
  *
@@ -442,12 +518,58 @@ static void model_init(Model *m, ModelConfig cfg) {
         for (int b = 0; b < 256; b++)
             ibc_to_float(cb.vectors[b], m->embed + b * D, D);
     }
+#elif defined(TWO3_TERNARY_CODEBOOK)
+    /* Ternary codebook: impedance-matched to the substrate.
+     * 256 × dim entries of {-1, 0, +1}, trimodal (1/3 each).
+     * Fixed forever — not learned. Random ternary vectors in dim=128
+     * are nearly orthogonal (Johnson-Lindenstrauss): expected dot = 0,
+     * std = sqrt(dim/3) ≈ 6.5, max = dim. 5% cross-talk.
+     * The codebook has the same impedance as the weight matrices,
+     * so signal enters L0 without format conversion. */
+    m->embed = (float*)malloc(256 * D * sizeof(float));
+    {
+        /* Deterministic seed for reproducibility */
+        uint32_t rng = 0x23CB00C;  /* "23 codebook" */
+        for (int i = 0; i < 256 * D; i++) {
+            rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+            float r = (float)(rng & 0xFFFF) / 65536.0f;
+            if (r < 1.0f / 3.0f)      m->embed[i] = -1.0f;
+            else if (r < 2.0f / 3.0f) m->embed[i] =  0.0f;
+            else                      m->embed[i] =  1.0f;
+        }
+    }
+    printf("[init] ternary codebook: 256 × %d, trimodal {-1,0,+1}, frozen\n", D);
 #else
     /* Byte embedding: tiny — 256 × dim */
     m->embed = (float*)malloc(256 * D * sizeof(float));
     float scale = 1.0f / sqrtf((float)D);
     for (int i = 0; i < 256 * D; i++)
         m->embed[i] = scale * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+#endif
+
+#ifdef TWO3_LEX_EMBED
+    /* Lex embedding tables — small random init, 10× smaller than identity.
+     * Additive: hidden[t] = embed[byte] + class_embed[class] + ... */
+    {
+        float lex_scale = 0.1f / sqrtf((float)D);
+        m->lex_class_embed = (float*)malloc(16 * D * sizeof(float));
+        m->lex_brace_embed = (float*)malloc(16 * D * sizeof(float));
+        m->lex_paren_embed = (float*)malloc(16 * D * sizeof(float));
+        m->lex_mode_embed  = (float*)malloc(3 * D * sizeof(float));
+        for (int i = 0; i < 16 * D; i++)
+            m->lex_class_embed[i] = lex_scale * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+        for (int i = 0; i < 16 * D; i++)
+            m->lex_brace_embed[i] = lex_scale * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+        for (int i = 0; i < 16 * D; i++)
+            m->lex_paren_embed[i] = lex_scale * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+        for (int i = 0; i < 3 * D; i++)
+            m->lex_mode_embed[i] = lex_scale * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+        m->lex_classes = NULL;
+        m->lex_brace_depths = NULL;
+        m->lex_paren_depths = NULL;
+        m->lex_modes = NULL;
+        m->lex_corpus_size = 0;
+    }
 #endif
 
     /* RoPE */
@@ -543,6 +665,16 @@ static void model_init(Model *m, ModelConfig cfg) {
 
 static void model_free(Model *m) {
     free(m->embed);
+#ifdef TWO3_LEX_EMBED
+    free(m->lex_class_embed);
+    free(m->lex_brace_embed);
+    free(m->lex_paren_embed);
+    free(m->lex_mode_embed);
+    if (m->lex_classes) free(m->lex_classes);
+    if (m->lex_brace_depths) free(m->lex_brace_depths);
+    if (m->lex_paren_depths) free(m->lex_paren_depths);
+    if (m->lex_modes) free(m->lex_modes);
+#endif
 #ifdef TWO3_FP_EMBED
     two3_free_weights(&m->fp_Wx);
     two3_free_weights(&m->fp_Wy);

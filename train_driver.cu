@@ -307,6 +307,26 @@ int main(int argc, char **argv) {
     }
 #endif
 
+#ifdef TWO3_LEX_EMBED
+    {
+        /* Derive .lex path from corpus path */
+        char lex_path[256];
+        strncpy(lex_path, cfg.data_path, sizeof(lex_path) - 5);
+        char *dot = strrchr(lex_path, '.');
+        if (dot) strcpy(dot, ".lex");
+        else strcat(lex_path, ".lex");
+
+        printf("[init] loading lex annotations from %s...\n", lex_path); fflush(stdout);
+        int r = lex_load(&tm.model, lex_path);
+        if (r != 0) {
+            printf("  Failed to load lex annotations: %s (error %d)\n", lex_path, r);
+            printf("  Run: lex_precompute %s %s\n", cfg.data_path, lex_path);
+            return 1;
+        }
+        fflush(stdout);
+    }
+#endif
+
     /* Flip counter on W_q of first layer (representative) */
     int D = mcfg.dim;
     printf("[init] D=%d, W_q=%p\n", D, (void*)tm.layer_weights[0].W_q); fflush(stdout);
@@ -375,6 +395,9 @@ int main(int argc, char **argv) {
                 uint8_t *seq = dataset_get(&ds, chunk + b);
 #ifdef TWO3_FP_EMBED
                 tm.fp_corpus_offset = ds.chunk_offsets[chunk + b];
+#endif
+#ifdef TWO3_LEX_EMBED
+                tm.lex_corpus_offset = ds.chunk_offsets[chunk + b];
 #endif
                 TrainResult r = trainable_forward_backward(&tm, seq, cfg.seq_len);
                 batch_loss += r.loss;
