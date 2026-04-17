@@ -88,10 +88,18 @@ Root-level `.lean` files (`GainKernel.lean`, `Two3Gaps.lean`, `SignalProtocol.le
 
 ## What's next
 
-1. Evaluate peak checkpoint (step 16,800-16,900) vs final on held-out data
-2. Add save-best checkpoint logic and LR decay
-3. Crystallization C prototype on parity-N (toy validation per HANDOFF.md)
-4. Port crystallization into two3 training loop if prototype validates
+**Priority: training discipline (all in CUDA, in the existing loop)**
+
+1. **LR decay** — model overshoots past its peak without a schedule. Cosine or linear decay to stabilize late training
+2. **Save-best checkpoint** — track best accuracy, save `best.t2l4` on new peak so you stop losing your best weights
+3. **Held-out eval** — eval mode that loads a checkpoint, runs forward on unseen data, reports loss/accuracy without training. Need this before any result is trustworthy
+
+**Then: crystallization (directly in CUDA, not a CPU prototype)**
+
+4. Add per-weight crystallization to the backward pass in `train.h` — ring buffer, variance, plasticity decay, gradient mask. ~50 lines, stays on GPU
+5. Measure whether crystallization actually helps with eval discipline in place
+
+The Lean proofs (`proofs/Crystallization.lean`) validated the mechanism is coherent. The C prototype on parity-N from HANDOFF.md is skipped — the mechanism is simple enough to test directly in the real architecture where we have eval infrastructure
 
 ## Files
 
