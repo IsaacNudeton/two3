@@ -1,0 +1,37 @@
+{
+  "dialogue": {
+    "path": "corpus_dialogue.jsonl",
+    "total_samples": 2437,
+    "total_bytes": 5854813,
+    "projects": {
+      "C--Users-isaac-Desktop": 77,
+      "C--Users-Public-Documents": 7,
+      "E--dev-testing": 98,
+      "E--dev-tools-Claude-s-tools-engine": 1155,
+      "E--dev-tools-trench": 52,
+      "E--dev-tools-two3": 316,
+      "E--dev-val-optimize": 43,
+      "E--dev-work-AZHealthGroup": 86,
+      "E--dev-xyzt-hardware-pc": 554,
+      "E--Scratch": 49
+    },
+    "train_projects": [
+      "C--Users-isaac-Desktop",
+      "C--Users-Public-Documents",
+      "E--dev-testing",
+      "E--dev-tools-Claude-s-tools-engine",
+      "E--dev-tools-trench",
+      "E--dev-tools-two3",
+      "E--dev-val-optimize",
+      "E--dev-work-AZHealthGroup",
+      "E--dev-xyzt-hardware-pc",
+      "E--Scratch"
+    ],
+    "val_projects": []
+  },
+  "methodology": {
+    "path": "corpus_methodology.jsonl",
+    "total_samples": 12,
+    "total_bytes": 16617
+  }
+}

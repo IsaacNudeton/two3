@@ -1,0 +1,57 @@
+ISAAC: [Image: source: C:\Users\isaac\.claude\image-cache\17f5f435-7b30-4a10-9823-ed88fb26e98f\1.png]
+CC: Those `_830fd` suffixed services are **per-user service instances** — Windows 11 spawns them automatically with a hex suffix tied to your user session. They're not malicious, but most are pointless on a local account.
+
+**Actually needed:**
+- **Security Center** / **Windows Security Health Service** / **Microsoft Network Realtime Inspection Service** — Defender. Leave these.
+- **Windows License Manager Service** — activation. Leave it.
+- **DevicesFlowUserSvc** — device pairing (Bluetooth, Cast). Harmless.
+- **COM Surrogate** — normal Windows shell host.
+- **RiotClientCrashHandler.exe** — Riot/Valorant telemetry crash reporter. Runs whenever Riot client is open.
+
+**Useless on your local account (the Unistack group):**
+- **UserDataSvc** — contacts/calendar data for Microsoft Account
+- **UnistoreSvc** — unified store for mail/contacts
+- **PimIndexMaintenanceSvc** — indexes contacts/calendar
+- **OneSyncSvc** — syncs mail/calendar/contacts to Microsoft cloud
+- **NPSMSvc** — notification platform (Microsoft Account push)
+- **cbdhsvc** — clipboard sync across devices
+
+All six of those exist to sync data with a Microsoft Account you don't use. Want me to disable them? They'll stop spawning on login and free up a bit of memory.
+
+ISAAC: device pairing with what? i have bluetooth off... im SO TIRED OF THIS
+CC: Yeah, if Bluetooth is off it's doing nothing. Let's kill the useless ones:
+
+```
+DevicesFlowUserSvc    — device pairing you don't use
+UserDataSvc           — MS Account contacts
+UnistoreSvc           — MS Account mail store
+PimIndexMaintenanceSvc — indexes contacts you don't have
+OneSyncSvc            — MS cloud sync you don't use
+NPSMSvc               — MS push notifications
+cbdhsvc                — clipboard cloud sync
+```
+
+Want me to disable all 7 via registry so they stop spawning on boot? It's `reg add ... /v Start /t REG_DWORD /d 4` per service (4 = disabled). Reversible if you ever need one back.
+
+ISAAC: well will it break my shit?
+CC: No. Here's why each is safe:
+
+- **DevicesFlowUserSvc** — Bluetooth/Cast pairing. Your BT is off. No effect.
+- **UserDataSvc / UnistoreSvc / PimIndexMaintenanceSvc / OneSyncSvc** — All Microsoft Account sync (contacts, mail, calendar). You're on a local account. Nothing to sync.
+- **NPSMSvc** — MS push notifications. Not using MS apps that need push.
+- **cbdhsvc** — Clipboard sync across devices (Win+V cloud history). Local clipboard (Ctrl+C/V) still works fine — that's handled by the kernel, not this service.
+
+None of these touch gaming, audio, networking, GPU, or anything in your input pipeline. If you ever need one back (like you get a Bluetooth headset), it's just changing that registry value from 4 back to 3.
+
+Want me to go ahead?
+
+ISAAC: oh wait im on bluetooth headset
+CC: Then keep **DevicesFlowUserSvc** — that one stays.
+
+The other 6 are still safe to kill. None of them have anything to do with Bluetooth audio. Your headset connection goes through the Bluetooth Support Service (`bthserv`) and the Windows Audio stack, which we're not touching.
+
+Want me to disable just the 6?
+
+ISAAC: [Image: source: C:\Users\isaac\.claude\image-cache\1ee0569e-e316-47c4-8275-2639fc42491a\1.png]
+CC: 7 pwsh processes. Let me check what each is doing.
+

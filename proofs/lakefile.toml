@@ -1,0 +1,15 @@
+name = "Two3Proofs"
+version = "0.1.0"
+keywords = ["math"]
+defaultTargets = ["Two3Proofs"]
+
+[leanOptions]
+pp.unicode.fun = true
+autoImplicit = false
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
+
+[[lean_lib]]
+name = "Two3Proofs"
