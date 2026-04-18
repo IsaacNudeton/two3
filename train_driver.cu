@@ -175,6 +175,29 @@ static void flip_counter_free(FlipCounter *fc) {
     free(fc->prev_ternary);
 }
 
+/* ═══════════════════════════════════════════════════════
+ * LR schedule — engineering T3, not derived.
+ *
+ * Two3Gaps.lean Theorem 69f: adiabatic ratio = 1/2, lr-independent.
+ * So LR does NOT control tracking quality (that's structural).
+ * LR controls per-step displacement, which determines whether
+ * plastic weights can reach low variance for crystallization to fire.
+ *
+ * Firing condition (T1): displacement < bin_width = 1/3.
+ *   Satisfied trivially: base_lr * grad_clamp << 1/3.
+ * Persistence condition (open): displacement must stay low for M
+ *   consecutive steps so crystallization locks in.
+ *
+ * Linear warmup (10%) then linear decay to 0.1×.  Safe envelope.
+ * See proofs/LR_Schedule.lean.todo for the theorems we owe.
+ * ═══════════════════════════════════════════════════════ */
+
+static float lr_scale(int step, int total) {
+    float t = (float)step / (float)total;
+    if (t < 0.1f) return t / 0.1f;               /* linear warmup */
+    return 1.0f - 0.9f * (t - 0.1f) / 0.9f;      /* linear decay to 0.1× */
+}
+
 /* ═══════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv) {
@@ -233,6 +256,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Held-out split: last 10% of chunks reserved for eval.
+     * Split BEFORE shuffle so held-out is a contiguous tail of the corpus,
+     * not random samples — tests generalization, not interpolation. */
+    int eval_n_chunks = ds.n_chunks / 10;
+    if (eval_n_chunks < 1) eval_n_chunks = 1;
+    int train_n_chunks = ds.n_chunks - eval_n_chunks;
+    /* Save eval chunk offsets before training shuffles corrupt them */
+    int *eval_offsets = (int*)malloc(eval_n_chunks * sizeof(int));
+    memcpy(eval_offsets, ds.chunk_offsets + train_n_chunks, eval_n_chunks * sizeof(int));
+    ds.n_chunks = train_n_chunks;  /* training only sees train split */
+    printf("[data] train: %d chunks, eval: %d chunks (%.1f%% held out)\n",
+           train_n_chunks, eval_n_chunks,
+           100.0f * eval_n_chunks / (train_n_chunks + eval_n_chunks));
+
     /* Init model */
     ModelConfig mcfg = cfg.use_wide  ? model_config_wide()
                      : cfg.use_large ? model_config_large()
@@ -259,17 +296,24 @@ int main(int argc, char **argv) {
     printf("  Batch size: %d\n", cfg.batch_size);
     printf("  Chunks per epoch: %d\n", ds.n_chunks);
     int steps_per_epoch = (ds.n_chunks + cfg.batch_size - 1) / cfg.batch_size;
+    int total_steps = cfg.epochs * steps_per_epoch;
     printf("  Steps per epoch: %d\n", steps_per_epoch);
-    printf("  Total steps: %d\n\n", cfg.epochs * steps_per_epoch);
+    printf("  Total steps: %d\n\n", total_steps);
 
     TrainableModel tm;
     trainable_model_init(&tm, mcfg);
     /* LR is not width-scaled — the 1/sqrt(K) is baked into weight_scale
      * in the dequant, not in the signal path. Backward gradients flow
      * at natural scale. The substrate carries the impedance, not the signal. */
-    tm.lr = cfg.lr;
-    printf("  LR: %.6f\n", tm.lr);
+    float base_lr = cfg.lr;
+    tm.lr = base_lr;
+    printf("  LR: %.6f (warmup→decay to %.6f)\n", base_lr, base_lr * 0.1f);
     fflush(stdout);
+
+    /* T3 proxy: replace with crystal_fraction_held_out once
+     * crystallization is CUDA-native (Stage 1b) */
+    float best_eval_acc = 0.0f;
+    int   best_eval_step = 0;
 
     if (cfg.resume[0]) {
         int r = trainable_load(&tm, cfg.resume);
@@ -406,6 +450,9 @@ int main(int argc, char **argv) {
                 actual_batch++;
             }
 
+            /* LR schedule: T3 engineering, see lr_scale() comment */
+            tm.lr = base_lr * lr_scale(global_step, total_steps);
+
             /* Engine-style optimizer: always update latent floats, but
              * the multiplicative update in adam_update handles commitment.
              * Headroom-modulated Adam replaces match gating (theorem 68). */
@@ -467,16 +514,16 @@ int main(int argc, char **argv) {
 
 #ifdef TWO3_BINARY_RESIDENT
                 printf("  [epoch %d/%d  step %d]  loss=%.4f  acc=%.3f  "
-                       "grad=n/a  flips=%d/%d  %.0fms/step\n",
+                       "grad=n/a  flips=%d/%d  lr=%.6f  %.0fms/step\n",
                        epoch + 1, cfg.epochs, global_step,
                        r.loss, accuracy,
-                       flips, fc.total_flips, step_ms);
+                       flips, fc.total_flips, tm.lr, step_ms);
 #else
                 printf("  [epoch %d/%d  step %d]  loss=%.4f  acc=%.3f  "
-                       "grad=%.4f  flips=%d/%d  %.0fms/step\n",
+                       "grad=%.4f  flips=%d/%d  lr=%.6f  %.0fms/step\n",
                        epoch + 1, cfg.epochs, global_step,
                        r.loss, accuracy, r.max_grad,
-                       flips, fc.total_flips, step_ms);
+                       flips, fc.total_flips, tm.lr, step_ms);
 #endif
 
                 /* Instrument #4: gain projection alignment (Lévy check) */
@@ -575,12 +622,73 @@ int main(int argc, char **argv) {
                     printf("  >> checkpoint: %s\n", ckpt_path);
             }
 
+            /* Held-out eval every 1000 steps — forward-only, no backward.
+             * T3 proxy: held-out accuracy. Replace with crystal_fraction_held_out
+             * once crystallization is CUDA-native (Stage 1b). */
+            if (global_step % 1000 == 0 && eval_n_chunks > 0) {
+                float eval_loss_sum = 0;
+                int eval_correct = 0;
+                int eval_total = 0;
+                float *eval_logits = (float*)malloc(cfg.seq_len * 256 * sizeof(float));
+
+                for (int ec = 0; ec < eval_n_chunks; ec++) {
+                    uint8_t *seq = ds.data + eval_offsets[ec];
+                    model_forward_sequence_cpu(&tm.model, seq, cfg.seq_len,
+                                               eval_logits, MODEL_FWD_FLAGS_DEFAULT);
+                    /* Score each position: predict next byte */
+                    for (int pos = 0; pos < cfg.seq_len - 1; pos++) {
+                        int target = seq[pos + 1];
+                        float *logits_pos = eval_logits + pos * 256;
+
+                        /* Stable softmax + cross-entropy (no gradient) */
+                        float max_l = logits_pos[0];
+                        for (int b = 1; b < 256; b++)
+                            if (logits_pos[b] > max_l) max_l = logits_pos[b];
+                        float sum_exp = 0;
+                        for (int b = 0; b < 256; b++)
+                            sum_exp += expf(logits_pos[b] - max_l);
+                        eval_loss_sum += -logf(expf(logits_pos[target] - max_l) / sum_exp + 1e-10f);
+
+                        /* Argmax accuracy */
+                        int best = 0;
+                        for (int b = 1; b < 256; b++)
+                            if (logits_pos[b] > logits_pos[best]) best = b;
+                        if (best == target) eval_correct++;
+                        eval_total++;
+                    }
+                }
+                free(eval_logits);
+
+                float eval_acc = (float)eval_correct / (float)(eval_total > 0 ? eval_total : 1);
+                float eval_loss = eval_loss_sum / (float)(eval_total > 0 ? eval_total : 1);
+                float train_acc = (float)epoch_correct / (float)(epoch_total > 0 ? epoch_total : 1);
+                printf("  [eval  step %d]  loss=%.4f  acc=%.3f  train_acc=%.3f  gap=%.3f  lr=%.6f\n",
+                       global_step, eval_loss, eval_acc, train_acc,
+                       train_acc - eval_acc, tm.lr);
+
+                if (logf) {
+                    fprintf(logf, "# eval %d  loss=%.6f  acc=%.4f  train_acc=%.4f  gap=%.4f\n",
+                            global_step, eval_loss, eval_acc, train_acc, train_acc - eval_acc);
+                    fflush(logf);
+                }
+
+                /* Save-best on held-out accuracy */
+                if (eval_acc > best_eval_acc) {
+                    best_eval_acc = eval_acc;
+                    best_eval_step = global_step;
+                    if (trainable_save(&tm, "best.t2l4") == 0)
+                        printf("  >> new best: %.3f at step %d → best.t2l4\n",
+                               eval_acc, global_step);
+                }
+            }
+
             /* NaN guard */
             if (r.loss != r.loss) {
                 printf("\n  !! NaN loss at step %d. Saving emergency checkpoint.\n", global_step);
                 trainable_save(&tm, "emergency.t2l4");
                 if (logf) fclose(logf);
                 flip_counter_free(&fc);
+                free(eval_offsets);
                 trainable_model_free(&tm);
                 dataset_free(&ds);
                 return 1;
@@ -676,12 +784,16 @@ int main(int argc, char **argv) {
     printf("  Steps: %d\n", global_step);
     printf("  Total ternary flips (W_q layer 0): %d / %d\n",
            fc.total_flips, D * D);
+    if (best_eval_step > 0)
+        printf("  Best eval: %.3f at step %d → best.t2l4\n",
+               best_eval_acc, best_eval_step);
     printf("  Time: %.1f seconds (%.1f ms/step)\n",
            total_sec, total_sec * 1000.0 / (global_step > 0 ? global_step : 1));
     printf("============================================\n\n");
 
     if (logf) fclose(logf);
     flip_counter_free(&fc);
+    free(eval_offsets);
     trainable_model_free(&tm);
     dataset_free(&ds);
 
