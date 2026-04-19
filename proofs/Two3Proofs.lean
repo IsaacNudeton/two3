@@ -1,3 +1,6 @@
 import Two3Proofs.GainKernel
 import Two3Proofs.Crystallization
 import Two3Proofs.LRFiring
+import Two3Proofs.Persistence
+import Two3Proofs.Concentration
+import Two3Proofs.CondHoeffding
