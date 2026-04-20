@@ -50,8 +50,8 @@ nvcc -O2 -o hadamard_ablation.exe hadamard_ablation.cu
 goto end_hadamard
 
 :binary
-echo  Building BINARY (device-resident backward+optimizer, default fast path)
-nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -o train_driver.exe train_driver.cu two3.cu
+echo  Building BINARY (device-resident backward+optimizer + GPU attention, default fast path)
+nvcc -O3 -arch=sm_75 -DTWO3_BINARY -DTWO3_BINARY_RESIDENT -DTWO3_ATTN_GPU -o train_driver.exe train_driver.cu two3.cu
 goto end
 
 :binary_workspace

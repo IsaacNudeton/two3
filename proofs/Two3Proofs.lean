@@ -4,3 +4,4 @@ import Two3Proofs.LRFiring
 import Two3Proofs.Persistence
 import Two3Proofs.Concentration
 import Two3Proofs.CondHoeffding
+import Two3Proofs.DecayNoFlip

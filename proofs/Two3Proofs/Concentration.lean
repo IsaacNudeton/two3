@@ -188,7 +188,7 @@ end AzumaApplication
     Persistence
       Link 3a-c      ── T1 ✓ (Persistence.lean)
       Link 2         ── T1 ✓ (this file + CondHoeffding.lean)
-      Link 1         ── T3 open (stochastic ODE on variance under decaying LR)
+      Link 1         ── T1 ✓ (DecayNoFlip.lean)
 -/
 
 end Crystallization

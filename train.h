@@ -35,6 +35,7 @@
 #include "binary_gpu_workspace.h"
 #ifdef TWO3_BINARY_RESIDENT
 #include "binary_resident.h"
+#include "attention_gpu.h"
 #endif
 #endif
 #include <math.h>
@@ -581,6 +582,11 @@ static void trainable_model_init(TrainableModel *tm, ModelConfig cfg) {
     /* Initialize the base model with random weights */
     srand(42);
     model_init(&tm->model, cfg);
+
+#ifdef TWO3_ATTN_GPU
+    /* Upload RoPE cos/sin tables to device — one-time cost */
+    rope_upload_tables(&tm->model.rope);
+#endif
 
     /* Copy embedding as latent (it's already float) */
     tm->latent_embed = (float*)malloc(256 * D * sizeof(float));
@@ -1277,6 +1283,50 @@ static void trainable_requantize_layer(TrainableModel *tm, int l) {
     requantize_gpu(&tm->backward_ctx, tw->W_up, &ly->ffn.up, INTER, D, STE_THRESHOLD, NULL);
     requantize_gpu(&tm->backward_ctx, tw->W_down, &ly->ffn.down, D, INTER, STE_THRESHOLD, NULL);
 #endif
+
+#ifdef TWO3_BINARY_RESIDENT
+    /* Crystallization update: compare current latent ternary to snapshot,
+     * update stable_count, set crystallized mask.
+     * Uses STE_THRESHOLD (0.33) for ternary boundary — matches ternary_quantize(). */
+    {
+        /* Attn: Q, K, V, O */
+        resident_cryst_update(&tm->resident_attn[l].q,
+            tm->gpu_weights[l].W_q.d_W_latent, STE_THRESHOLD);
+        resident_cryst_update(&tm->resident_attn[l].k,
+            tm->gpu_weights[l].W_k.d_W_latent, STE_THRESHOLD);
+        resident_cryst_update(&tm->resident_attn[l].v,
+            tm->gpu_weights[l].W_v.d_W_latent, STE_THRESHOLD);
+        resident_cryst_update(&tm->resident_attn[l].o,
+            tm->gpu_weights[l].W_o.d_W_latent, STE_THRESHOLD);
+
+        /* FFN: gate, up, down — use flat crystallization arrays */
+        {
+            int n_gate = INTER * D;
+            int n_down = D * INTER;
+            int threads = 256;
+            int blocks_g = (n_gate + threads - 1) / threads;
+            int blocks_d = (n_down + threads - 1) / threads;
+            kernel_cryst_update<<<blocks_g, threads>>>(
+                tm->gpu_weights[l].gate.d_W_latent,
+                tm->resident_ffn[l].d_old_t_gate,
+                tm->resident_ffn[l].d_stable_gate,
+                tm->resident_ffn[l].d_cryst_gate,
+                n_gate, STE_THRESHOLD, CRYST_STABLE_THRESHOLD);
+            kernel_cryst_update<<<blocks_g, threads>>>(
+                tm->gpu_weights[l].up.d_W_latent,
+                tm->resident_ffn[l].d_old_t_up,
+                tm->resident_ffn[l].d_stable_up,
+                tm->resident_ffn[l].d_cryst_up,
+                n_gate, STE_THRESHOLD, CRYST_STABLE_THRESHOLD);
+            kernel_cryst_update<<<blocks_d, threads>>>(
+                tm->gpu_weights[l].down.d_W_latent,
+                tm->resident_ffn[l].d_old_t_down,
+                tm->resident_ffn[l].d_stable_down,
+                tm->resident_ffn[l].d_cryst_down,
+                n_down, STE_THRESHOLD, CRYST_STABLE_THRESHOLD);
+        }
+    }
+#endif
 }
 
 /* Per-layer momentum reset */
@@ -1884,17 +1934,17 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         /* QKV: optimizer on device */
         resident_grad_clip_adam(tm->gpu_weights[l].W_q.d_W_latent,
             tm->resident_attn[l].q.d_grad, tm->resident_attn[l].q.d_adam_m,
-            tm->resident_attn[l].q.d_adam_v,
+            tm->resident_attn[l].q.d_adam_v, tm->resident_attn[l].q.d_crystallized,
             D * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
             tm->step, tm->resident_attn[l].d_norm, layer_headroom);
         resident_grad_clip_adam(tm->gpu_weights[l].W_k.d_W_latent,
             tm->resident_attn[l].k.d_grad, tm->resident_attn[l].k.d_adam_m,
-            tm->resident_attn[l].k.d_adam_v,
+            tm->resident_attn[l].k.d_adam_v, tm->resident_attn[l].k.d_crystallized,
             KV * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
             tm->step, tm->resident_attn[l].d_norm, layer_headroom);
         resident_grad_clip_adam(tm->gpu_weights[l].W_v.d_W_latent,
             tm->resident_attn[l].v.d_grad, tm->resident_attn[l].v.d_adam_m,
-            tm->resident_attn[l].v.d_adam_v,
+            tm->resident_attn[l].v.d_adam_v, tm->resident_attn[l].v.d_crystallized,
             KV * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
             tm->step, tm->resident_attn[l].d_norm, layer_headroom);
         BGPU_CHECK(cudaDeviceSynchronize());
@@ -1920,7 +1970,7 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         /* O: optimizer on device */
         resident_grad_clip_adam(tm->gpu_weights[l].W_o.d_W_latent,
             tm->resident_attn[l].o.d_grad, tm->resident_attn[l].o.d_adam_m,
-            tm->resident_attn[l].o.d_adam_v,
+            tm->resident_attn[l].o.d_adam_v, tm->resident_attn[l].o.d_crystallized,
             D * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
             tm->step, tm->resident_attn[l].d_norm, layer_headroom);
 #else
@@ -1930,19 +1980,19 @@ static void trainable_optimizer_step(TrainableModel *tm) {
         /* gate+up: optimizer on device, then sync latent weights back to host */
         resident_grad_clip_adam(tm->gpu_weights[l].gate.d_W_latent,
             tm->resident_ffn[l].d_grad_gate, tm->resident_ffn[l].d_adam_m_gate,
-            tm->resident_ffn[l].d_adam_v_gate,
+            tm->resident_ffn[l].d_adam_v_gate, tm->resident_ffn[l].d_cryst_gate,
             INTER * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
             tm->step, tm->resident_ffn[l].d_norm, layer_headroom);
         resident_grad_clip_adam(tm->gpu_weights[l].up.d_W_latent,
             tm->resident_ffn[l].d_grad_up, tm->resident_ffn[l].d_adam_m_up,
-            tm->resident_ffn[l].d_adam_v_up,
+            tm->resident_ffn[l].d_adam_v_up, tm->resident_ffn[l].d_cryst_up,
             INTER * D, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
             tm->step, tm->resident_ffn[l].d_norm, layer_headroom);
         BGPU_CHECK(cudaDeviceSynchronize());
         /* down: optimizer on device */
         resident_grad_clip_adam(tm->gpu_weights[l].down.d_W_latent,
             tm->resident_ffn[l].d_grad_down, tm->resident_ffn[l].d_adam_m_down,
-            tm->resident_ffn[l].d_adam_v_down,
+            tm->resident_ffn[l].d_adam_v_down, tm->resident_ffn[l].d_cryst_down,
             D * INTER, GRAD_CLIP_NORM, tm->lr, tm->beta1, tm->beta2, tm->eps,
             tm->step, tm->resident_ffn[l].d_norm, layer_headroom);
         BGPU_CHECK(cudaDeviceSynchronize());
@@ -2358,16 +2408,42 @@ static TrainResult trainable_forward_backward(
 
         T_ACC(_ms_qkv_proj);
 
-        /* Phase 3: RoPE all positions (CPU, cheap) */
+        /* Phase 3+4: RoPE + causal attention */
         T_START();
+#ifdef TWO3_ATTN_GPU
+        {
+            /* Upload Q/K/V to device, apply RoPE on GPU, run attention, download.
+             * Zero CPU sync barriers in the hot path. */
+            cudaMemcpy(tm->backward_ctx.d_attn_Q, sv->q_all,
+                       seq_len * D * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(tm->backward_ctx.d_attn_K, sv->k_store,
+                       seq_len * KV * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(tm->backward_ctx.d_attn_V, sv->v_store,
+                       seq_len * KV * sizeof(float), cudaMemcpyHostToDevice);
+            /* RoPE on device — no CPU sync */
+            rope_apply_gpu(tm->backward_ctx.d_attn_Q, tm->backward_ctx.d_attn_K,
+                           seq_len, NH, NKV, HD);
+            /* Attention on device */
+            causal_attention_forward_gpu(
+                tm->backward_ctx.d_attn_Q, tm->backward_ctx.d_attn_K,
+                tm->backward_ctx.d_attn_V, tm->backward_ctx.d_attn_dout,
+                seq_len, NH, NKV, HD);
+            /* Download results — also need RoPE'd Q/K for backward */
+            cudaMemcpy(sv->attn_out, tm->backward_ctx.d_attn_dout,
+                       seq_len * D * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(sv->q_all, tm->backward_ctx.d_attn_Q,
+                       seq_len * D * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(sv->k_store, tm->backward_ctx.d_attn_K,
+                       seq_len * KV * sizeof(float), cudaMemcpyDeviceToHost);
+        }
+#else
         for (int t = 0; t < seq_len; t++)
             rope_apply_cpu(sv->q_all + t * D, sv->k_store + t * KV,
                            &tm->model.rope, t, NH, NKV);
-
-        /* Phase 4: causal attention per position (sequential) */
         for (int t = 0; t < seq_len; t++)
             causal_attention_cpu(sv->q_all + t * D, sv->k_store, sv->v_store,
                                  sv->attn_out + t * D, t, NH, NKV, HD);
+#endif
 
         T_ACC(_ms_rope_attn);
 
@@ -2844,10 +2920,26 @@ static TrainResult trainable_forward_backward(
 
         free(d_attn_out_all);
 
-        /* Phase 2.5: Inverse RoPE per position */
+        /* Phase 2.5: Inverse RoPE */
+#ifdef TWO3_ATTN_GPU
+        {
+            /* Upload dQ/dK, unapply RoPE on GPU, download */
+            cudaMemcpy(tm->backward_ctx.d_attn_dQ, dq_all,
+                       seq_len * D * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(tm->backward_ctx.d_attn_dK, dk_store,
+                       seq_len * KV * sizeof(float), cudaMemcpyHostToDevice);
+            rope_unapply_gpu(tm->backward_ctx.d_attn_dQ, tm->backward_ctx.d_attn_dK,
+                             seq_len, NH, NKV, HD);
+            cudaMemcpy(dq_all, tm->backward_ctx.d_attn_dQ,
+                       seq_len * D * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(dk_store, tm->backward_ctx.d_attn_dK,
+                       seq_len * KV * sizeof(float), cudaMemcpyDeviceToHost);
+        }
+#else
         for (int t = 0; t < seq_len; t++)
             rope_unapply_cpu(dq_all + t * D, dk_store + t * KV,
                              &tm->model.rope, t, NH, NKV);
+#endif
 
         T_ACC(_ms_bwd_attn);
 

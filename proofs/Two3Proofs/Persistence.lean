@@ -199,15 +199,13 @@ theorem sustained_low_variance_crystallizes
       is strictly below threshold.
     - `sustained_low_variance_crystallizes`: composed statement.
 
-  OWED (Links 1 and 2, still T3 open):
-    - Link 1: Stochastic ODE on variance under decaying LR.
-      "Decaying η implies expected variance tends to zero."
-    - Link 2: Concentration inequality from expected variance to
-      realized transition counts over the ring buffer window.
-      "E[variance] < ε implies P(transitions > M·ε) is small."
+  CLOSED:
+    - Link 1: DecayNoFlip.lean — decaying η → step can't cross threshold
+      → no flips → variance = 0. T1 ✓
+    - Link 2: Concentration.lean + CondHoeffding.lean — Azuma-Hoeffding
+      for bounded martingale differences. T1 ✓
 
-  When Links 1 and 2 close, they provide `h_final_plast` from the
-  schedule directly, and the full persistence theorem becomes T1.
+  All links are T1. The full persistence chain is formally proved.
 -/
 
 end Crystallization

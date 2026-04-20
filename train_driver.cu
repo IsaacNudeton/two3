@@ -379,10 +379,10 @@ int main(int argc, char **argv) {
     printf("[init] flip_counter done\n"); fflush(stdout);
 
     /* Open log file */
-    FILE *logf = fopen("train_log.txt", "a");
-    if (logf) {
-        fprintf(logf, "# step  loss  accuracy  max_grad  flips  total_flips  time_ms\n");
-        fflush(logf);
+    FILE *log_file = fopen("train_log.txt", "a");
+    if (log_file) {
+        fprintf(log_file, "# step  loss  accuracy  max_grad  flips  total_flips  time_ms\n");
+        fflush(log_file);
     }
     printf("[init] log file opened\n"); fflush(stdout);
 
@@ -478,9 +478,30 @@ int main(int argc, char **argv) {
                 /* Sync embedding */
                 memcpy(tm.model.embed, tm.latent_embed, 256 * tm.cfg.dim * sizeof(float));
 
-                /* Requantize one layer — headroom controls flip rate */
+                /* Requantize one layer — headroom controls flip rate.
+                 * Crystallization update runs inside (TWO3_BINARY_RESIDENT). */
                 trainable_requantize_layer(&tm, layer);
                 tm.last_requant_loss = batch_loss / actual_batch;
+
+#ifdef TWO3_BINARY_RESIDENT
+                /* Log crystal fraction for this layer's attn Q projection */
+                {
+                    float cf_q = resident_cryst_fraction(&tm.resident_attn[layer].q);
+                    printf("  [cryst L%d] Q=%.3f", layer, cf_q);
+                    /* Gate crystal fraction */
+                    int n_gate = tm.cfg.intermediate * tm.cfg.dim;
+                    float h_count = 0;
+                    float *d_cnt;
+                    cudaMalloc(&d_cnt, sizeof(float));
+                    cudaMemset(d_cnt, 0, sizeof(float));
+                    int thr = 256, blk = (n_gate + thr - 1) / thr;
+                    kernel_cryst_count<<<blk, thr>>>(
+                        tm.resident_ffn[layer].d_cryst_gate, d_cnt, n_gate);
+                    cudaMemcpy(&h_count, d_cnt, sizeof(float), cudaMemcpyDeviceToHost);
+                    cudaFree(d_cnt);
+                    printf("  gate=%.3f\n", h_count / (float)n_gate);
+                }
+#endif
 
 #ifdef TWO3_FP_EMBED
                 {
@@ -536,11 +557,11 @@ int main(int argc, char **argv) {
                 }
                 fflush(stdout);
 
-                if (logf) {
-                    fprintf(logf, "%d  %.6f  %.4f  %.6f  %d  %d  %.1f\n",
+                if (log_file) {
+                    fprintf(log_file, "%d  %.6f  %.4f  %.6f  %d  %d  %.1f\n",
                             global_step, r.loss, accuracy, r.max_grad,
                             flips, fc.total_flips, step_ms);
-                    fflush(logf);
+                    fflush(log_file);
                 }
 
                 /* Monitor: milestone alerts, plateau/cascade detection */
@@ -631,7 +652,11 @@ int main(int argc, char **argv) {
                 int eval_total = 0;
                 float *eval_logits = (float*)malloc(cfg.seq_len * 256 * sizeof(float));
 
-                for (int ec = 0; ec < eval_n_chunks; ec++) {
+                /* Cap eval to 500 chunks to avoid OOM from repeated allocs
+                 * in model_forward_sequence_cpu. Full eval = 7459 chunks ×
+                 * ~8MB work buffers = heap fragmentation death on Windows. */
+                int eval_cap = eval_n_chunks < 500 ? eval_n_chunks : 500;
+                for (int ec = 0; ec < eval_cap; ec++) {
                     uint8_t *seq = ds.data + eval_offsets[ec];
                     model_forward_sequence_cpu(&tm.model, seq, cfg.seq_len,
                                                eval_logits, MODEL_FWD_FLAGS_DEFAULT);
@@ -666,10 +691,10 @@ int main(int argc, char **argv) {
                        global_step, eval_loss, eval_acc, train_acc,
                        train_acc - eval_acc, tm.lr);
 
-                if (logf) {
-                    fprintf(logf, "# eval %d  loss=%.6f  acc=%.4f  train_acc=%.4f  gap=%.4f\n",
+                if (log_file) {
+                    fprintf(log_file, "# eval %d  loss=%.6f  acc=%.4f  train_acc=%.4f  gap=%.4f\n",
                             global_step, eval_loss, eval_acc, train_acc, train_acc - eval_acc);
-                    fflush(logf);
+                    fflush(log_file);
                 }
 
                 /* Save-best on held-out accuracy */
@@ -686,7 +711,7 @@ int main(int argc, char **argv) {
             if (r.loss != r.loss) {
                 printf("\n  !! NaN loss at step %d. Saving emergency checkpoint.\n", global_step);
                 trainable_save(&tm, "emergency.t2l4");
-                if (logf) fclose(logf);
+                if (log_file) fclose(log_file);
                 flip_counter_free(&fc);
                 free(eval_offsets);
                 trainable_model_free(&tm);
@@ -791,7 +816,7 @@ int main(int argc, char **argv) {
            total_sec, total_sec * 1000.0 / (global_step > 0 ? global_step : 1));
     printf("============================================\n\n");
 
-    if (logf) fclose(logf);
+    if (log_file) fclose(log_file);
     flip_counter_free(&fc);
     free(eval_offsets);
     trainable_model_free(&tm);

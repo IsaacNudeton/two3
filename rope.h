@@ -166,4 +166,117 @@ static void rope_unapply_cpu(
     }
 }
 
+/* ═══════════════════════════════════════════════════════
+ * GPU batched RoPE: all positions in one launch
+ *
+ * Grid:  (seq_len, max(n_heads, n_kv_heads))
+ * Block: head_dim/2 threads
+ *
+ * Requires device-side cos/sin tables (uploaded once at init).
+ * ═══════════════════════════════════════════════════════ */
+
+#ifdef __CUDACC__
+
+/* Device-side RoPE table pointers (set once by rope_upload_tables) */
+static float *d_rope_cos = NULL;
+static float *d_rope_sin = NULL;
+
+static void rope_upload_tables(const RoPETable *r) {
+    int n = r->max_seq * (r->head_dim / 2);
+    if (d_rope_cos) cudaFree(d_rope_cos);
+    if (d_rope_sin) cudaFree(d_rope_sin);
+    cudaMalloc(&d_rope_cos, n * sizeof(float));
+    cudaMalloc(&d_rope_sin, n * sizeof(float));
+    cudaMemcpy(d_rope_cos, r->cos_table, n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rope_sin, r->sin_table, n * sizeof(float), cudaMemcpyHostToDevice);
+}
+
+/* Batched forward RoPE: apply to all positions at once.
+ * q_all: [seq_len × n_heads × head_dim], k_store: [seq_len × n_kv_heads × head_dim]
+ * Both modified in-place on device. */
+__global__ void kernel_rope_apply_batched(
+    float *q_all, float *k_store,
+    const float *cos_tab, const float *sin_tab,
+    int seq_len, int n_heads, int n_kv_heads, int head_dim
+) {
+    int pos = blockIdx.x;
+    int h   = blockIdx.y;
+    int d   = threadIdx.x;
+    int half = head_dim / 2;
+    if (d >= half) return;
+
+    float c = cos_tab[pos * half + d];
+    float s = sin_tab[pos * half + d];
+
+    int dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    if (h < n_heads) {
+        int i = pos * dim + h * head_dim + 2 * d;
+        float q0 = q_all[i], q1 = q_all[i + 1];
+        q_all[i]     = q0 * c - q1 * s;
+        q_all[i + 1] = q0 * s + q1 * c;
+    }
+    if (h < n_kv_heads) {
+        int i = pos * kv_dim + h * head_dim + 2 * d;
+        float k0 = k_store[i], k1 = k_store[i + 1];
+        k_store[i]     = k0 * c - k1 * s;
+        k_store[i + 1] = k0 * s + k1 * c;
+    }
+}
+
+/* Batched inverse RoPE: unapply on gradients. Negate sin. */
+__global__ void kernel_rope_unapply_batched(
+    float *dq_all, float *dk_store,
+    const float *cos_tab, const float *sin_tab,
+    int seq_len, int n_heads, int n_kv_heads, int head_dim
+) {
+    int pos = blockIdx.x;
+    int h   = blockIdx.y;
+    int d   = threadIdx.x;
+    int half = head_dim / 2;
+    if (d >= half) return;
+
+    float c = cos_tab[pos * half + d];
+    float s = sin_tab[pos * half + d];
+
+    int dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    if (h < n_heads) {
+        int i = pos * dim + h * head_dim + 2 * d;
+        float g0 = dq_all[i], g1 = dq_all[i + 1];
+        dq_all[i]     =  g0 * c + g1 * s;
+        dq_all[i + 1] = -g0 * s + g1 * c;
+    }
+    if (h < n_kv_heads) {
+        int i = pos * kv_dim + h * head_dim + 2 * d;
+        float g0 = dk_store[i], g1 = dk_store[i + 1];
+        dk_store[i]     =  g0 * c + g1 * s;
+        dk_store[i + 1] = -g0 * s + g1 * c;
+    }
+}
+
+static void rope_apply_gpu(float *d_q, float *d_k, int seq_len,
+                            int n_heads, int n_kv_heads, int head_dim) {
+    int max_h = n_heads > n_kv_heads ? n_heads : n_kv_heads;
+    dim3 grid(seq_len, max_h);
+    int block = head_dim / 2;
+    kernel_rope_apply_batched<<<grid, block>>>(
+        d_q, d_k, d_rope_cos, d_rope_sin,
+        seq_len, n_heads, n_kv_heads, head_dim);
+}
+
+static void rope_unapply_gpu(float *d_dq, float *d_dk, int seq_len,
+                              int n_heads, int n_kv_heads, int head_dim) {
+    int max_h = n_heads > n_kv_heads ? n_heads : n_kv_heads;
+    dim3 grid(seq_len, max_h);
+    int block = head_dim / 2;
+    kernel_rope_unapply_batched<<<grid, block>>>(
+        d_dq, d_dk, d_rope_cos, d_rope_sin,
+        seq_len, n_heads, n_kv_heads, head_dim);
+}
+
+#endif /* __CUDACC__ */
+
 #endif /* ROPE_H */

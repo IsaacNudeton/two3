@@ -18,6 +18,16 @@
 #include "binary_gpu.h"
 
 /* ═══════════════════════════════════════════════════════
+ * Crystallization constants
+ *
+ * CRYST_STABLE_THRESHOLD: number of consecutive requantize windows
+ * where a weight's ternary value doesn't change before it crystallizes.
+ * 3 windows × REQUANT_INTERVAL=50 steps = 150 steps of stability.
+ * ═══════════════════════════════════════════════════════ */
+
+#define CRYST_STABLE_THRESHOLD 3
+
+/* ═══════════════════════════════════════════════════════
  * Per-projection device state (reusable across groups)
  * ═══════════════════════════════════════════════════════ */
 
@@ -26,6 +36,10 @@ typedef struct {
     float *d_adam_m;    /* [M × K] Adam first moment */
     float *d_adam_v;    /* [M × K] Adam second moment */
     float *d_dY;        /* [max_S × M] backward input staging */
+    /* Crystallization state */
+    uint16_t *d_stable_count;  /* [M × K] consecutive stable requantize windows */
+    uint8_t  *d_crystallized;  /* [M × K] 1 = frozen, 0 = plastic */
+    int8_t   *d_old_ternary;   /* [M × K] previous ternary snapshot (device) */
     int M, K;           /* dimensions */
 } ResidentWeightBufs;
 
@@ -38,6 +52,16 @@ static void resident_weight_init(ResidentWeightBufs *w, int max_S, int M, int K)
     BGPU_CHECK(cudaMalloc(&w->d_dY, (size_t)max_S * M * sizeof(float)));
     BGPU_CHECK(cudaMemset(w->d_adam_m, 0, mk));
     BGPU_CHECK(cudaMemset(w->d_adam_v, 0, mk));
+    /* Crystallization state */
+    size_t mk16 = (size_t)M * K * sizeof(uint16_t);
+    size_t mk8  = (size_t)M * K * sizeof(uint8_t);
+    size_t mk8s = (size_t)M * K * sizeof(int8_t);
+    BGPU_CHECK(cudaMalloc(&w->d_stable_count, mk16));
+    BGPU_CHECK(cudaMalloc(&w->d_crystallized, mk8));
+    BGPU_CHECK(cudaMalloc(&w->d_old_ternary, mk8s));
+    BGPU_CHECK(cudaMemset(w->d_stable_count, 0, mk16));
+    BGPU_CHECK(cudaMemset(w->d_crystallized, 0, mk8));
+    BGPU_CHECK(cudaMemset(w->d_old_ternary, 0, mk8s));
 }
 
 static void resident_weight_free(ResidentWeightBufs *w) {
@@ -45,6 +69,9 @@ static void resident_weight_free(ResidentWeightBufs *w) {
     if (w->d_adam_m) cudaFree(w->d_adam_m);
     if (w->d_adam_v) cudaFree(w->d_adam_v);
     if (w->d_dY) cudaFree(w->d_dY);
+    if (w->d_stable_count) cudaFree(w->d_stable_count);
+    if (w->d_crystallized) cudaFree(w->d_crystallized);
+    if (w->d_old_ternary) cudaFree(w->d_old_ternary);
     memset(w, 0, sizeof(*w));
 }
 
@@ -144,6 +171,11 @@ typedef struct {
     /* Scratch */
     float *d_norm;          /* [1] for grad norm reduction */
 
+    /* Crystallization state — per-projection */
+    uint16_t *d_stable_gate, *d_stable_up, *d_stable_down;
+    uint8_t  *d_cryst_gate,  *d_cryst_up,  *d_cryst_down;
+    int8_t   *d_old_t_gate,  *d_old_t_up,  *d_old_t_down;
+
     /* Capacity */
     int max_S, K, M;       /* K=D, M=INTER for gate+up */
 } ResidentFFNState;
@@ -191,6 +223,32 @@ static void resident_ffn_init(ResidentFFNState *s, int max_S, int K, int M) {
     BGPU_CHECK(cudaMemset(s->d_adam_v_up, 0, mk));
     BGPU_CHECK(cudaMemset(s->d_adam_m_down, 0, dk));
     BGPU_CHECK(cudaMemset(s->d_adam_v_down, 0, dk));
+
+    /* Crystallization state */
+    size_t mk16 = (size_t)M * K * sizeof(uint16_t);
+    size_t mk8  = (size_t)M * K * sizeof(uint8_t);
+    size_t mk8s = (size_t)M * K * sizeof(int8_t);
+    size_t dk16 = (size_t)K * M * sizeof(uint16_t);
+    size_t dk8  = (size_t)K * M * sizeof(uint8_t);
+    size_t dk8s = (size_t)K * M * sizeof(int8_t);
+    BGPU_CHECK(cudaMalloc(&s->d_stable_gate, mk16));
+    BGPU_CHECK(cudaMalloc(&s->d_stable_up, mk16));
+    BGPU_CHECK(cudaMalloc(&s->d_stable_down, dk16));
+    BGPU_CHECK(cudaMalloc(&s->d_cryst_gate, mk8));
+    BGPU_CHECK(cudaMalloc(&s->d_cryst_up, mk8));
+    BGPU_CHECK(cudaMalloc(&s->d_cryst_down, dk8));
+    BGPU_CHECK(cudaMalloc(&s->d_old_t_gate, mk8s));
+    BGPU_CHECK(cudaMalloc(&s->d_old_t_up, mk8s));
+    BGPU_CHECK(cudaMalloc(&s->d_old_t_down, dk8s));
+    BGPU_CHECK(cudaMemset(s->d_stable_gate, 0, mk16));
+    BGPU_CHECK(cudaMemset(s->d_stable_up, 0, mk16));
+    BGPU_CHECK(cudaMemset(s->d_stable_down, 0, dk16));
+    BGPU_CHECK(cudaMemset(s->d_cryst_gate, 0, mk8));
+    BGPU_CHECK(cudaMemset(s->d_cryst_up, 0, mk8));
+    BGPU_CHECK(cudaMemset(s->d_cryst_down, 0, dk8));
+    BGPU_CHECK(cudaMemset(s->d_old_t_gate, 0, mk8s));
+    BGPU_CHECK(cudaMemset(s->d_old_t_up, 0, mk8s));
+    BGPU_CHECK(cudaMemset(s->d_old_t_down, 0, dk8s));
 }
 
 static void resident_ffn_free(ResidentFFNState *s) {
@@ -211,6 +269,15 @@ static void resident_ffn_free(ResidentFFNState *s) {
     if (s->d_X_down) cudaFree(s->d_X_down);
     if (s->d_dX_down) cudaFree(s->d_dX_down);
     if (s->d_norm) cudaFree(s->d_norm);
+    if (s->d_stable_gate) cudaFree(s->d_stable_gate);
+    if (s->d_stable_up) cudaFree(s->d_stable_up);
+    if (s->d_stable_down) cudaFree(s->d_stable_down);
+    if (s->d_cryst_gate) cudaFree(s->d_cryst_gate);
+    if (s->d_cryst_up) cudaFree(s->d_cryst_up);
+    if (s->d_cryst_down) cudaFree(s->d_cryst_down);
+    if (s->d_old_t_gate) cudaFree(s->d_old_t_gate);
+    if (s->d_old_t_up) cudaFree(s->d_old_t_up);
+    if (s->d_old_t_down) cudaFree(s->d_old_t_down);
     memset(s, 0, sizeof(*s));
 }
 
@@ -249,6 +316,90 @@ static void resident_ffn_sync_adam_d2h(ResidentFFNState *s,
 /* ═══════════════════════════════════════════════════════
  * GPU kernels — optimizer
  * ═══════════════════════════════════════════════════════ */
+
+/* ═══════════════════════════════════════════════════════
+ * Crystallization kernel — runs at requantize time
+ *
+ * Compares current latent ternary to previous snapshot.
+ * Stable weights (same ternary value) increment stable_count.
+ * Unstable weights (flipped) reset to 0.
+ * Once stable_count >= cryst_threshold, weight is crystallized.
+ *
+ * Also updates old_ternary snapshot for next comparison.
+ * ═══════════════════════════════════════════════════════ */
+
+__global__ void kernel_cryst_update(
+    const float *latent,         /* [n] current latent weights */
+    int8_t *old_ternary,         /* [n] previous ternary snapshot (updated in-place) */
+    uint16_t *stable_count,      /* [n] consecutive stable windows */
+    uint8_t *crystallized,       /* [n] output: crystallized mask */
+    int n, float threshold, int cryst_threshold
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float w = latent[i];
+    int8_t new_t = (w > threshold) ? 1 : (w < -threshold) ? -1 : 0;
+    int8_t old_t = old_ternary[i];
+
+    /* Update stable count */
+    uint16_t count = stable_count[i];
+    count = (new_t == old_t) ? (count < 65535 ? count + 1 : count) : 0;
+    stable_count[i] = count;
+
+    /* Crystallize if stable long enough */
+    crystallized[i] = (count >= (uint16_t)cryst_threshold) ? 1 : 0;
+
+    /* Update snapshot */
+    old_ternary[i] = new_t;
+}
+
+/* Crystallization count reduction — sum crystallized flags */
+__global__ void kernel_cryst_count(
+    const uint8_t *crystallized, float *out, int n
+) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    sdata[tid] = (i < n) ? (float)crystallized[i] : 0.0f;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(out, sdata[0]);
+}
+
+/* Run crystallization update on a single projection's weight buffers */
+static void resident_cryst_update(
+    ResidentWeightBufs *w,
+    float *d_latent,    /* device pointer to latent weights */
+    float threshold     /* STE_THRESHOLD */
+) {
+    int n = w->M * w->K;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    kernel_cryst_update<<<blocks, threads>>>(
+        d_latent, w->d_old_ternary, w->d_stable_count, w->d_crystallized,
+        n, threshold, CRYST_STABLE_THRESHOLD);
+}
+
+/* Get crystal fraction for a projection (blocking — use at log time only) */
+static float resident_cryst_fraction(ResidentWeightBufs *w) {
+    int n = w->M * w->K;
+    float h_count = 0;
+    float *d_count;
+    BGPU_CHECK(cudaMalloc(&d_count, sizeof(float)));
+    BGPU_CHECK(cudaMemset(d_count, 0, sizeof(float)));
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    kernel_cryst_count<<<blocks, threads>>>(w->d_crystallized, d_count, n);
+    BGPU_CHECK(cudaMemcpy(&h_count, d_count, sizeof(float), cudaMemcpyDeviceToHost));
+    cudaFree(d_count);
+    return h_count / (float)n;
+}
 
 /* L2 norm: sum of squares (block reduction → atomicAdd) */
 __global__ void resident_kernel_sum_sq(const float *data, float *out, int n) {
@@ -295,11 +446,16 @@ __global__ void resident_kernel_scale_if(float *data, const float *norm_sq, floa
  */
 __global__ void resident_kernel_adam_headroom(
     float *params, const float *grads, float *m, float *v,
+    const uint8_t *crystallized,  /* crystallization mask: 1=frozen */
     int n, float lr, float beta1, float beta2, float eps,
     float b1_corr, float b2_corr, float headroom_peak
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+
+    /* Branch-free crystallization mask: crystallized weights get zero update.
+     * Adam m/v still accumulate (preserves state for potential unfreeze). */
+    float cryst_mask = 1.0f - (float)crystallized[i];
 
     float g = grads[i];
     m[i] = beta1 * m[i] + (1.0f - beta1) * g;
@@ -322,7 +478,7 @@ __global__ void resident_kernel_adam_headroom(
     float d2 = fabsf(wc - (2.0f / 3.0f));
     float min_d = fminf(d1, d2);
     float h = fmaxf(0.1f, headroom_peak * (1.0f - 6.0f * min_d));
-    params[i] -= update * h;
+    params[i] -= update * h * cryst_mask;
 
     /* Hard clamp [0, 1] */
     if (params[i] < 0.0f) params[i] = 0.0f;
@@ -330,9 +486,11 @@ __global__ void resident_kernel_adam_headroom(
 }
 
 /* Orchestrator: grad clip + Adam headroom on one tensor.
- * headroom_peak: 10.0 for boundary mobility, 1.0 for plain Adam. */
+ * headroom_peak: 10.0 for boundary mobility, 1.0 for plain Adam.
+ * crystallized: per-weight freeze mask (from kernel_cryst_update). */
 static void resident_grad_clip_adam(
     float *d_W_latent, float *d_grad, float *d_m, float *d_v,
+    const uint8_t *d_crystallized,
     int size, float max_norm, float lr, float beta1, float beta2, float eps,
     int step, float *d_norm_buf, float headroom_peak
 ) {
@@ -347,9 +505,9 @@ static void resident_grad_clip_adam(
     resident_kernel_sum_sq<<<blocks, threads>>>(d_grad, d_norm_buf, size);
     resident_kernel_scale_if<<<blocks, threads>>>(d_grad, d_norm_buf, max_norm, size);
 
-    /* Adam headroom */
+    /* Adam headroom with crystallization mask */
     resident_kernel_adam_headroom<<<blocks, threads>>>(
-        d_W_latent, d_grad, d_m, d_v, size,
+        d_W_latent, d_grad, d_m, d_v, d_crystallized, size,
         lr, beta1, beta2, eps, b1_corr, b2_corr, headroom_peak);
 }
 
